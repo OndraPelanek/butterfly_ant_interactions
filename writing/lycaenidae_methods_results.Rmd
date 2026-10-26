@@ -1,0 +1,2969 @@
+---
+pagetitle: "From mutualism to parasitism: ant-interaction strategy, partner breadth and range size in lycaenid butterflies"
+bibliography: lycaenidae_references.bib
+link-citations: true
+# RStudio's Knit button: render Word and HTML next to this file, then apply the Word table layout (column widths,
+# fonts, spacing) exactly as code/render_report.R does; without it Word stretches table columns unevenly.
+knit: (function(input, ...) { out <- rmarkdown::render(input, output_format = "all", envir = new.env(parent = globalenv())); source(file.path(dirname(normalizePath(input)), "..", "code", "R", "docx_layout.R")); for (f in out[grepl("[.]docx$", out)]) finalise_publication_docx(f); invisible(out) })
+output:
+  bookdown::word_document2:
+    reference_docx: docx_template.docx
+    fig_caption: true
+    global_numbering: true
+    pandoc_args: ["--lua-filter=caption_style.lua"]
+    toc: false
+  bookdown::html_document2:
+    fig_caption: true
+    global_numbering: true
+    number_sections: true
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, message = FALSE, warning = FALSE, error = FALSE,
+  out.width = if (knitr::is_html_output()) "100%" else "6.5in", dpi = 300
+)
+source(here::here("code", "R", "manuscript.R"))
+source(here::here("code", "R", "report_figures.R"))
+# report_table() widths: portrait text width until a landscape section sets 9 in (chunks of Tables S7, S11, S12)
+options(report_table_width = 6.5, report_table_layouts = list()) # layouts registered for finalise_publication_docx()
+
+# All results are read from the notebook folders in data/intermediate, written by the notebooks
+# code/s02_prepare_ranges.Rmd to code/s06_summarise_results.Rmd; figures come from results/.
+dir_s02 <- resrepo::path_resrepo("data/intermediate/s02_prepare_ranges")        # record counts, outlier-rule check
+dir_s03 <- resrepo::path_resrepo("data/intermediate/s03_build_species_tables")  # analysis species tables
+dir_s04 <- resrepo::path_resrepo("data/intermediate/s04_fit_models")            # main models and phylogenetic models
+dir_s05 <- resrepo::path_resrepo("data/intermediate/s05_check_robustness")      # robustness checks
+dir_s06 <- resrepo::path_resrepo("data/intermediate/s06_summarise_results")     # report and supplement tables
+main_models <- read_report_rds(file.path(dir_s04, "main_models.rds"))
+main <- read_report_table(file.path(dir_s04, "main_coefficients.csv"))
+contrasts <- read_report_table(file.path(dir_s04, "main_contrasts.csv"))
+main_means <- read_report_table(file.path(dir_s04, "main_estimated_means.csv"))
+main_metadata <- read_report_table(file.path(dir_s04, "main_metadata.csv"))
+dir_checks <- dir_s05
+check_table <- function(name) read_report_table(file.path(dir_checks, paste0(name, ".csv")))
+within_breadth <- check_table("breadth_within_strategy")
+rare_results <- check_table("rarefied_models")
+regional_results <- check_table("regional_and_pair_omissions")
+# one regional comparison (s05_check_robustness, Regions and genera; Table S13c)
+reg_row <- function(subset, model = "lmm", tree = NA_character_, contrast = "f-p", measure = "area") {
+  x <- regional_results
+  d <- x[x$subset == subset & x$dropped == "none" & x$model == model & x$contrast == contrast &
+    x$measure == measure & (if (is.na(tree)) is.na(x$tree) else x$tree %in% tree), ]
+  stopifnot(nrow(d) == 1L)
+  d
+}
+pair_genus <- check_table("genus_pair_omission")
+matched_checks <- check_table("matched_sample_contrasts")
+matched_checks_metadata <- check_table("matched_sample_metadata")
+# one range-area type contrast of the tree-matched sample: model "pgls" or "matched_lmm"
+mcv <- function(model, contrast, tree) {
+  d <- matched_checks[matched_checks$model == model & gsub(" ", "", matched_checks$contrast) == contrast &
+                        matched_checks$study == tree & matched_checks$measure == "area" &
+                        matched_checks$predictors == "type", ]
+  stopifnot(nrow(d) == 1L)
+  d
+}
+cleaning_results <- check_table("cleaning_contrasts")
+cleaning_expert <- check_table("cleaning_expert_validation")
+# Discussion 5.1 and Appendix S5: minimum number of origins of parasitism by parsimony on the
+# genus-grafted and matched-only trees (s05_check_robustness, Origins of parasitism); orig("schar_2018")$min_origins = "16"
+origins <- check_table("parasitism_origins")
+origin_clades <- check_table("parasitism_origin_clades")
+orig <- function(tree, tips = "grafted") {
+  x <- origins[origins$tree == tree & origins$tips == tips, ]
+  stopifnot(nrow(x) == 1L)
+  x
+}
+# "Both trees required N changes, all of them origins": on every tree the fewest and most gains among the most
+# parsimonious reconstructions equal the number of changes, so none includes a loss
+stopifnot(nrow(origins) == 4L, all(origins$min_origins == origins$changes), all(origins$max_origins == origins$changes),
+          orig("yumnam_2025")$changes == orig("schar_2018")$changes,
+          nrow(origin_clades) == 2L * orig("schar_2018")$changes)
+origin_singles <- sort(origin_clades$genera[origin_clades$tree == "schar_2018" & origin_clades$n_species == 1L])
+# Results 4.1: parasites formed "the highest proportions" of classified species in southern Africa (Fig. 1D):
+# the three cells with the highest parasite share (cells with >= 10 classified species, as mapped) lie in the
+# southern Africa region of Appendix S5 (latitude < -15, 10 < longitude < 55)
+local({
+  cells <- read_report_table(file.path(dir_s06, "interaction_cells_500km.csv"))
+  cells <- cells[cells$n_classified >= 10, ]
+  top <- head(cells[order(-cells$prop_parasitic), ], 3)
+  stopifnot(nrow(top) == 3L, all(top$cell_latitude < -15 & top$cell_longitude > 10 & top$cell_longitude < 55))
+})
+# Appendix S5, "Sample and regional concentration": each claim of the paragraph, range area
+local({
+  rp_ <- function(subset, model, tree, contrast, dropped = "none") {
+    x <- regional_results[regional_results$subset == subset & regional_results$dropped == dropped &
+      regional_results$model == model & regional_results$contrast == contrast & regional_results$measure == "area" &
+      (if (is.na(tree)) is.na(regional_results$tree) | regional_results$tree == "" else regional_results$tree %in% tree), ]
+    stopifnot(nrow(x) == 1L)
+    x$p
+  }
+  gp_ <- function(tree, contrast) {
+    x <- pair_genus[pair_genus$tree == tree & pair_genus$contrast == contrast & pair_genus$measure == "area", ]
+    stopifnot(nrow(x) == 1L)
+    x$p
+  }
+  lt <- "Lepidochrysops + Thestor"
+  # tree-matched species: f-p supported in PGLS and in the taxonomic model of the same species on both trees;
+  # n-p supported in the taxonomic model but not in PGLS
+  mc_ <- matched_checks[matched_checks$measure == "area" & matched_checks$predictors == "type" &
+                          gsub(" ", "", matched_checks$contrast) %in% c("f-p", "n-p"), ]
+  stopifnot(nrow(mc_) == 8L, all(mc_$p.value[gsub(" ", "", mc_$contrast) == "f-p"] < 0.05),
+            all(mc_$p.value[mc_$model == "matched_lmm"] < 0.05),
+            all(mc_$p.value[mc_$model == "pgls" & gsub(" ", "", mc_$contrast) == "n-p"] >= 0.05))
+  # without Lepidochrysops and Thestor: f-p supported except in species-level Yumnam PGLS
+  stopifnot(rp_("all", "lmm", NA, "f-p", lt) < 0.05, rp_("all", "pgls", "schar_2018", "f-p", lt) < 0.05,
+            rp_("all", "pgls", "yumnam_2025", "f-p", lt) >= 0.05,
+            gp_("yumnam_2025", "f-p") < 0.05, gp_("schar_2018", "f-p") < 0.05)
+  # ... n-p supported only in genus-by-type PGLS on the Schar tree
+  stopifnot(rp_("all", "lmm", NA, "n-p", lt) >= 0.05, rp_("all", "pgls", "yumnam_2025", "n-p", lt) >= 0.05,
+            rp_("all", "pgls", "schar_2018", "n-p", lt) >= 0.05, gp_("yumnam_2025", "n-p") >= 0.05,
+            gp_("schar_2018", "n-p") < 0.05)
+  # southern Africa only: f-p and n-p supported, m-p not, in all three models
+  for (m in list(c("lmm", NA), c("pgls", "yumnam_2025"), c("pgls", "schar_2018")))
+    stopifnot(rp_("southern_Africa_only", m[1], m[2], "f-p") < 0.05, rp_("southern_Africa_only", m[1], m[2], "n-p") < 0.05,
+              rp_("southern_Africa_only", m[1], m[2], "m-p") >= 0.05)
+  # ... and mutualists had smaller ranges than facultative species in all three models
+  for (m in list(c("lmm", NA), c("pgls", "yumnam_2025"), c("pgls", "schar_2018")))
+    stopifnot(rp_("southern_Africa_only", m[1], m[2], "f-m") < 0.05)
+  # outside southern Africa: f-p supported in the taxonomic model and on the Schar tree, not on the Yumnam tree;
+  # n-p supported only on the Schar tree
+  stopifnot(rp_("excluding_southern_Africa", "lmm", NA, "f-p") < 0.05,
+            rp_("excluding_southern_Africa", "pgls", "schar_2018", "f-p") < 0.05,
+            rp_("excluding_southern_Africa", "pgls", "yumnam_2025", "f-p") >= 0.05,
+            rp_("excluding_southern_Africa", "lmm", NA, "n-p") >= 0.05,
+            rp_("excluding_southern_Africa", "pgls", "yumnam_2025", "n-p") >= 0.05,
+            rp_("excluding_southern_Africa", "pgls", "schar_2018", "n-p") < 0.05)
+})
+dir_boxcox <- dir_s05
+boxcox_comparison <- read_report_table(file.path(dir_boxcox, "boxcox_comparison.csv"))
+boxcox_powers <- read_report_table(file.path(dir_boxcox, "boxcox_powers.csv"))
+bc_power_text <- function(key) {
+  value <- boxcox_powers$lambda[boxcox_powers$model == key]
+  stopifnot(length(value) == 1L, is.finite(value))
+  report_number(value, 3)
+}
+cell_ci <- function(x) sprintf("%.2f (%.2f–%.2f) %s", x$ratio, x$lower, x$upper, format_table_p(x$p))
+within_eff <- function(model, measure = "area") {
+  x <- within_breadth[within_breadth$model == model & within_breadth$measure == measure, ]
+  stopifnot(nrow(x) == 1L)
+  num <- function(v) sub("-", "−", sprintf("%.1f", v), fixed = TRUE) # true minus sign (U+2212)
+  lower <- 100 * (x$lower - 1)
+  # "to" between the bounds when the lower bound is negative
+  sprintf(
+    "%s%% (95%% CI %s%s%s%%; %s)", num(100 * (x$ratio - 1)), num(lower),
+    if (lower < 0) " to " else "–", num(100 * (x$upper - 1)), fmt_p(x$p)
+  )
+}
+robust <- read_report_table(file.path(dir_s06, "robustness.csv"))
+# Two further rows of the core results, transformed as in s06_summarise_results, Robustness table (facultative /
+# non-associated shown as f-n): rarefied ranges (ten random localities per species, s05_check_robustness, Models on rarefied ranges), a core
+# analysis of Figure 4 (s06_summarise_results, Figures 4 and S8); and PGLS + butterfly background
+# (s04_fit_models, Joint phylogenetic and spatial models).
+as_robust_rows <- function(x, analysis) {
+  x$contrast <- gsub(" ", "", x$contrast)
+  flip <- x$contrast == "n-f"
+  x[flip, c("ratio", "lower", "upper")] <- 1 / x[flip, c("ratio", "upper", "lower")]
+  x$contrast[flip] <- "f-n"
+  x$analysis <- analysis
+  x <- x[intersect(names(robust), names(x))]
+  for (column in setdiff(names(robust), names(x))) x[[column]] <- NA
+  x[names(robust)]
+}
+rare_core <- rare_results[rare_results$model == "lmm" & rare_results$sampling == "k10" &
+  rare_results$ranges == "rarefied", ]
+pgls_bg <- read_report_table(file.path(dir_s04, "phylo_geography_contrasts.csv"))
+pgls_bg <- pgls_bg[pgls_bg$model == "pgls_background", ]
+robust <- rbind(robust, as_robust_rows(rare_core, "rarefied_k10"),
+  as_robust_rows(pgls_bg, paste0("pgls_background_", pgls_bg$study)))
+stopifnot(!anyDuplicated(robust[c("analysis", "measure", "contrast")]))
+moran <- read_report_table(file.path(dir_s06, "residual_moran.csv"))
+counts <- read_report_table(file.path(dir_s06, "counts.csv"))
+pgls_metadata <- read_report_table(file.path(dir_s06, "pgls_metadata.csv"))
+daru_table <- read_report_table(file.path(dir_s03, "species_table_daru.csv"))
+
+# one verified value per call; ambiguity stops the knit
+cnt <- function(name, digits = 0L) {
+  v <- counts$value[counts$name == name]
+  stopifnot(length(v) == 1L)
+  report_number(v, digits)
+}
+rb <- function(analysis, contrast, measure = "area") {
+  d <- robust[robust$analysis == analysis & robust$contrast == contrast & robust$measure == measure, ]
+  stopifnot(nrow(d) == 1L)
+  d
+}
+fmt_p <- function(p) if (p < 0.001) "p < 0.001" else paste0("p = ", formatC(p, format = "f", digits = 3))
+# larval carnivory check (s05_check_robustness, Larval carnivory; Discussion 5.1, Appendix S6): counts in the main range-area
+# sample and plant-feeder / carnivore ratios among non-parasites (ratios below one: larger carnivore ranges)
+carn_counts <- check_table("carnivory_counts")
+carn_check <- check_table("carnivory_check")
+carn_n <- function(type = c("n", "f", "m", "p"), carnivory = c("plant", "animal", "uncoded"),
+                   basis = c("species", "genus", "none"))
+  sum(carn_counts$n[carn_counts$interaction_type %in% type & carn_counts$carnivory %in% carnivory &
+                      carn_counts$basis %in% basis])
+carn_row <- function(analysis, measure = "area") {
+  d <- carn_check[carn_check$analysis == analysis & carn_check$measure == measure, ]
+  stopifnot(nrow(d) == 1L)
+  d
+}
+carn_eff <- function(analysis, measure = "area") {
+  d <- carn_row(analysis, measure)
+  sprintf("ratio %.2f, 95%% CI %.2f–%.2f, %s", d$ratio, d$lower, d$upper, fmt_p(d$p))
+}
+local({
+  coded <- carn_row("coded")
+  # "no analysed parasite was coded as a plant feeder"; the sample is the main range-area sample
+  stopifnot(carn_n("p", "plant") == 0L, carn_n() == counts$value[counts$name == "model_area_type_total"],
+            carn_n("p") == counts$value[counts$name == "model_area_type_p"])
+  # "mostly hemipteran-feeding Miletinae"; counts agree with the model sample
+  stopifnot(coded$n_carnivore == carn_n(c("n", "f", "m"), "animal"), coded$n_carnivore_miletinae > coded$n_carnivore / 2)
+  # Appendix S6: "one subfamily, which contains no plant feeders"; "only four carnivores remained" (num_word)
+  stopifnot(coded$n_plant_miletinae == 0L, carn_row("without_miletinae")$n_carnivore <= 10L)
+  # "did not have smaller ranges than plant feeders": no supported difference and point estimates favour carnivores
+  stopifnot(all(carn_check$p >= 0.05), all(carn_check$ratio < 1))
+})
+eff <- function(analysis, contrast, measure = "area") {
+  d <- rb(analysis, contrast, measure)
+  sprintf("%.2f (95%% CI %.2f–%.2f; %s)", d$ratio, d$lower, d$upper, fmt_p(d$p))
+}
+# inside brackets: "ratio 1.55, 95% CI 0.87-2.76, p = 0.198"
+effi <- function(analysis, contrast, measure = "area") {
+  d <- rb(analysis, contrast, measure)
+  sprintf("ratio %.2f, 95%% CI %.2f–%.2f, %s", d$ratio, d$lower, d$upper, fmt_p(d$p))
+}
+# inside brackets, one decimal, no p-value (abstract): "ratio 2.4, 95% CI 1.2-4.9"
+effi_short <- function(analysis, contrast, measure = "area") {
+  d <- rb(analysis, contrast, measure)
+  stopifnot(d$lower > 1 || d$upper < 1)  # the interval alone must show the contrast is supported
+  sprintf("ratio %.1f, 95%% CI %.1f–%.1f", d$ratio, d$lower, d$upper)
+}
+# running text: "10.0-fold (95% CI 3.3-30.3; p < 0.001)"
+fold <- function(analysis, contrast, measure = "area") {
+  d <- rb(analysis, contrast, measure)
+  sprintf("%.1f-fold (95%% CI %.1f–%.1f; %s)", d$ratio, d$lower, d$upper, fmt_p(d$p))
+}
+ratio <- function(analysis, contrast, measure = "area", digits = 1L) report_number(rb(analysis, contrast, measure)$ratio, digits)
+# running text after a ratio: "95% CI 3.6–36.4; p < 0.001"
+ci_p <- function(analysis, contrast, measure = "area") {
+  d <- rb(analysis, contrast, measure)
+  sprintf("95%% CI %.1f–%.1f; %s", d$lower, d$upper, fmt_p(d$p))
+}
+pct <- function(analysis, measure = "area") {
+  d <- rb(analysis, "breadth", measure)
+  sprintf("%.1f%% (95%% CI %.1f–%.1f%%; %s)", 100 * (d$ratio - 1), 100 * (d$lower - 1), 100 * (d$upper - 1), fmt_p(d$p))
+}
+mor <- function(model, km) {
+  v <- moran$moran_i[moran$model == model & moran$distance_km == km]
+  stopifnot(length(v) == 1L)
+  sub("^-", "−", report_number(v, 2))  # typographic minus for negative Moran's I
+}
+pg <- function(column, study = "yumnam_2025", measure = "area", predictors = "type", tree_set = "grafted") {
+  v <- pgls_metadata[[column]][pgls_metadata$study == study & pgls_metadata$measure == measure &
+    pgls_metadata$predictors == predictors & pgls_metadata$tree_set == tree_set]
+  stopifnot(length(v) == 1L)
+  v
+}
+pgls_coverage <- read_report_table(file.path(dir_s04, "pgls_grafted_coverage.csv"))
+pgc <- function(column, study = "yumnam_2025") {
+  v <- pgls_coverage[[column]][pgls_coverage$study == study]
+  stopifnot(length(v) == 1L)
+  report_number(v)
+}
+daru_parasites <- sum(daru_table$interaction_type %in% "p" & is.finite(daru_table$range_area) &
+  daru_table$range_area > 0)
+# rows of the all-results table (Table S12), in the order of the report
+# (order: space; ancestry; space and ancestry; lineages; sampling and range estimation; covariate)
+analysis_labels <- c(
+  lmm = "Taxonomic mixed model (main)", spherical_gam = "Spherical spatial GAM",
+  background_500km_butterflies = "Mixed model + butterfly regional background",
+  pgls_grafted_yumnam_2025 = "PGLS, species level, Yumnam tree", pgls_grafted_schar_2018 = "PGLS, species level, Schär tree",
+  pgls_yumnam_2025 = "PGLS, matched species, Yumnam tree", pgls_schar_2018 = "PGLS, matched species, Schär tree",
+  phylo_spatial_yumnam_2025 = "Phylogenetic spatial GAM, Yumnam tree",
+  phylo_spatial_schar_2018 = "Phylogenetic spatial GAM, Schär tree",
+  pgls_background_yumnam_2025 = "PGLS + butterfly regional background, Yumnam tree",
+  pgls_background_schar_2018 = "PGLS + butterfly regional background, Schär tree",
+  pgls_genus_yumnam_2025 = "PGLS, genus level, Yumnam tree", pgls_genus_schar_2018 = "PGLS, genus level, Schär tree",
+  rarefied_k10 = "Rarefied ranges (ten localities)",
+  modelled_ranges_daru = "Modelled ranges (Daru)",
+  stability_80 = "80% range-stability subset",
+  stability_90 = "90% range-stability subset", stability_95 = "95% range-stability subset",
+  wingspan_covariate = "Wingspan as covariate"
+)
+# the core analyses of main-text Figure 4: the main model, the spatial GAM, the three phylogenetic
+# analyses on both trees, rarefied ranges and modelled ranges
+core_analyses <- c("lmm", "spherical_gam", "pgls_grafted_yumnam_2025", "pgls_grafted_schar_2018",
+  "phylo_spatial_yumnam_2025", "phylo_spatial_schar_2018", "pgls_genus_yumnam_2025", "pgls_genus_schar_2018",
+  "rarefied_k10", "modelled_ranges_daru")
+core_ratio <- function(contrast) vapply(core_analyses, function(a) rb(a, contrast)$ratio, 1)
+core_p <- function(contrast) vapply(core_analyses, function(a) rb(a, contrast)$p, 1)
+# number of core analyses with p < 0.05 for a range-area contrast: "all ten" or "nine of the ten"
+core_support <- function(contrast) {
+  k <- sum(core_p(contrast) < 0.05)
+  n <- length(core_analyses)
+  if (k == n) paste("all", num_word(n)) else paste(num_word(k), "of the", num_word(n))
+}
+# range of a range-area contrast across the core analyses, e.g. "2.4–14.5"
+span <- function(contrast = "f-p") sprintf("%.1f–%.1f", min(core_ratio(contrast)), max(core_ratio(contrast)))
+# the same range over the supporting core analyses only (Results 4.4: "nine of the ten (ratios …)")
+span_supported <- function(contrast) {
+  r <- core_ratio(contrast)[core_p(contrast) < 0.05]
+  sprintf("%.1f–%.1f", min(r), max(r))
+}
+# Abstract: breadth "supported in every core analysis that estimated it" (genus-level PGLS has no breadth)
+local({
+  b <- robust[robust$measure == "area" & robust$contrast == "breadth" & robust$analysis %in% core_analyses, ]
+  stopifnot(nrow(b) >= 7L, all(b$p < 0.05), !any(grepl("pgls_genus", b$analysis)))
+})
+# number of supporting core analyses as a word, e.g. "five"
+core_k <- function(contrast) num_word(sum(core_p(contrast) < 0.05))
+# Discussion 5.2: "Parasites had smaller estimated ranges than mutualists in every core analysis"
+stopifnot(all(core_ratio("m-p") > 1))
+# Discussion 5.3: the breadth association "held in every analysis, including spatial, phylogenetic,
+# rarefied-range and modelled-range models" (positive and p < 0.05 in every range-area analysis estimating it)
+local({
+  b <- robust[robust$contrast == "breadth" & robust$measure == "area", ]
+  stopifnot(all(c("spherical_gam", "pgls_grafted_yumnam_2025", "pgls_grafted_schar_2018", "phylo_spatial_yumnam_2025",
+    "phylo_spatial_schar_2018", "rarefied_k10", "modelled_ranges_daru") %in% b$analysis), all(b$ratio > 1), all(b$p < 0.05))
+})
+# ratio and p only (running text): "ratio 2.08, p = 0.078"
+rp <- function(analysis, contrast, measure = "area") {
+  d <- rb(analysis, contrast, measure)
+  sprintf("ratio %.2f, %s", d$ratio, fmt_p(d$p))
+}
+# genus-level PGLS (s04_fit_models, Genus-level PGLS)
+glev <- read_report_table(file.path(dir_s04, "genus_level_pgls.csv"))
+# Appendix S5: genus-by-type PGLS, range area, all genera: m-p and f-m "supported only on the Schär tree"
+gl_check <- function() {
+  g <- glev[glev$measure == "area" & glev$dropped == "none" & gsub(" ", "", glev$contrast) %in% c("m-p", "f-m"), ]
+  stopifnot(nrow(g) == 4L, all(g$p[g$tree == "schar_2018"] < 0.05), all(g$p[g$tree == "yumnam_2025"] >= 0.05))
+}
+gl_check()
+gl <- function(tree, dropped = "none", contrast = "f-p", measure = "area") {
+  d <- glev[glev$tree == tree & glev$dropped == dropped & glev$contrast == contrast & glev$measure == measure, ]
+  stopifnot(nrow(d) == 1L)
+  d
+}
+# Appendix S5: genus-level lambda "close to zero on the Schar tree" (range area, all genera)
+stopifnot(gl("schar_2018")$lambda < 0.05)
+gli <- function(tree, dropped = "none", contrast = "f-p", measure = "area") {
+  d <- gl(tree, dropped, contrast, measure)
+  sprintf("ratio %.2f, 95%% CI %.2f–%.2f, %s", d$ratio, d$lower, d$upper, fmt_p(d$p))
+}
+# leave-parasitic-genus-out check (s04_fit_models, Leave-one-genus-out)
+logo <- read_report_table(file.path(dir_s04, "leave_genus_out.csv"))
+lg <- function(dropped, model, contrast = "f-p") {
+  d <- logo[logo$dropped == dropped & logo$model == model & logo$contrast == contrast, ]
+  stopifnot(nrow(d) == 1L)
+  d
+}
+# ratio and p only (running text)
+lg_rp <- function(dropped, model, contrast = "f-p") {
+  d <- lg(dropped, model, contrast)
+  sprintf("ratio %.2f, %s", d$ratio, fmt_p(d$p))
+}
+stopifnot(!any(grepl(" + ", logo$dropped, fixed = TRUE))) # single-genus omissions only
+logo_single <- setdiff(unique(logo$dropped), "none")
+# parasites of an omitted genus in the main LMM sample = parasites of the full model minus those left
+n_par_genus <- function(g) lg("none", "lmm")$n_parasite - lg(g, "lmm")$n_parasite
+# Scientific patterns are audited against the rendered text; significance is not a render prerequisite.
+n_mp_lost <- sum(logo$p[logo$model == "lmm" & logo$contrast == "m-p" & logo$dropped %in% logo_single] >= 0.05)
+# counts up to ten as words, larger counts as digits
+num_word <- function(k) {
+  stopifnot(length(k) == 1L, k >= 0, k == round(k))
+  if (k > 10) return(as.character(k))
+  c("none", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten")[k + 1L]
+}
+# median recorded breadth by type in the area breadth model (raw counts recovered from the centred predictor, as in
+# s06_summarise_results, Figure 3; Results 4.3): "median two versus one genus" requires equal mutualist and parasite medians
+breadth_med <- local({
+  b <- model.frame(main_models$area_breadth)
+  centre <- main_metadata$partner_breadth_mean[main_metadata$measure == "area" & main_metadata$predictors == "breadth"]
+  stopifnot(length(centre) == 1L)
+  raw <- b$partner_breadth_centered + centre
+  stopifnot(all(abs(raw - round(raw)) < 1e-8))
+  med <- tapply(round(raw), b$interaction_type, median)
+  stopifnot(all(med[c("f", "m", "p")] == round(med[c("f", "m", "p")])), med[["m"]] == med[["p"]])
+  med
+})
+# the Afro-Eurasia and Australasia subset (data key Old_World_only; longitude >= -30) keeps every analysed parasite,
+# including the Australasian ones (Results 4.4)
+stopifnot(reg_row("Old_World_only")$n_parasite == counts$value[counts$name == "model_area_type_p"])
+# Abstract: the most conservative facultative-parasite estimate (smallest core ratio) is the Yumnam joint
+# model, and it is the only core analysis without support for the non-associated-parasite contrast ("all except that
+# most conservative analysis")
+stopifnot(names(which.min(core_ratio("f-p"))) == "phylo_spatial_yumnam_2025",
+          identical(unname(core_analyses[core_p("n-p") >= 0.05]), "phylo_spatial_yumnam_2025"))
+```
+
+
+<!-- Plain body paragraphs keep author information left-aligned and unbolded
+     when knitted to Word, avoiding the reference template's Author style. -->
+::: {custom-style="Title"}
+From mutualism to parasitism: ant-interaction strategy, partner breadth and
+range size in lycaenid butterflies
+:::
+
+::: {custom-style="Normal"}
+Ondrej Pelanek^1,†^, Joseph Williamson^1^, Robert Wilson^2^ and Alex Pigot^1^
+
+^1^ Centre for Biodiversity and Environment Research, Department of Genetics,
+Evolution and Environment, University College London, London, WC1E 6BT, UK.
+
+^2^ Department of Biogeography and Global Change, Museo Nacional de Ciencias
+Naturales (MNCN-CSIC), Madrid 28006, Spain.
+
+^†^ Present address: Department of Zoology, University of Cambridge, Cambridge,
+CB2 3EJ, UK.
+
+Author contacts: Ondrej Pelanek, op319@cam.ac.uk; Joseph Williamson,
+joseph.williamson@ucl.ac.uk; Robert Wilson, rjwilson@mncn.csic.es; Alex Pigot,
+a.pigot@ucl.ac.uk.
+:::
+
+&nbsp;
+
+<!-- Note for co-authors; remove before submission. -->
+**Note for authors: where to submit?**
+
+I have little experience with choosing journals and will appreciate your views. The
+draft currently follows the format of Global Ecology and Biogeography. Current
+ideas:
+
+- Global Ecology and Biogeography
+
+- Journal of Biogeography
+
+- Ecography
+
+- Ecology Letters
+
+- Proceedings of the Royal Society B
+
+The graphical abstract was made with AI assistance. All five journals appear to
+accept this with disclosure (at the editors' discretion for Proceedings B),
+but this still needs checking.
+
+\newpage
+
+<!-- Graphical abstract first, then the contents. The page breaks after them are
+     'page break before' paragraphs: unlike \newpage they cannot leave an empty page when the
+     preceding content fills its page exactly. -->
+
+```{r graphical-abstract, out.width=if (knitr::is_html_output()) "90%" else "6.5in", fig.alt="Graphical abstract. Four lycaenid interaction types, each shown as an adult butterfly above its larval system, are ordered along an arrow of increasing estimated geographic range size: obligate parasites (smallest estimates), obligate mutualists and non-associated species (intermediate) and facultative associates (usually largest estimates). A second arrow below links more recorded ant genera, shown as four ant species, to larger estimated range size."}
+knitr::include_graphics(normalizePath(file.path(
+  resrepo::path_resrepo("data/raw"), "illustrations", "lycaenidae_visual_abstract_powerpoint11.png"
+), winslash = "/"), rel_path = FALSE)
+```
+
+**Graphical abstract.** Ant associations and geographic range size in
+Lycaenidae. *Upper panel*, from left: *Phengaris arion* (obligate parasite),
+larva among *Myrmica sabuleti* workers and brood; *Jalmenus evagoras* (obligate
+mutualist), larva attended by *Iridomyrmex mayri* on *Acacia dealbata*;
+*Lycaena phlaeas* (not ant-associated), larva on *Rumex acetosella*; and
+*Plebejus* (*Lycaeides*) *melissa* (facultative associate), larva attended by *Formica aerata*
+on *Medicago sativa*. The blue arrow orders the interaction types by estimated
+range size: obligate parasites had the smallest estimates, facultative
+associates usually the largest, and obligate mutualists and non-associated
+species were intermediate and did not differ clearly from each other. The
+clearest contrast was between facultative associates and parasites, and
+contrasts involving mutualists were less consistent across analyses.
+*Lower panel:* ranges were larger in species with more recorded
+ant genera, represented by a single *M. sabuleti* worker (left) and workers of
+*Camponotus japonicus*, *Crematogaster scutellaris*, *M. sabuleti* and
+*Oecophylla smaragdina* (right), not by the partners of any one species. The
+patterns concern interaction types, not the illustrated species; arrows are
+conceptual; and apart from the four workers on the
+right, illustrations are not to a common scale. Illustrations were generated
+with ChatGPT and carefully revised against photographic and taxonomic references.
+
+```{=openxml}
+<w:p><w:pPr><w:pageBreakBefore/><w:spacing w:before="0" w:after="0" w:line="20" w:lineRule="exact"/></w:pPr></w:p>
+```
+
+<!-- Clickable contents (Word only; the HTML output has its own table of contents). A Word TOC field over
+     heading levels 1-2 with hyperlinked entries (\h); w:dirty asks Word to fill it when the file is opened. -->
+::: {custom-style="TOC Heading"}
+Contents
+:::
+
+```{=openxml}
+<w:sdt><w:sdtPr><w:docPartObj><w:docPartGallery w:val="Table of Contents"/><w:docPartUnique/></w:docPartObj></w:sdtPr><w:sdtContent><w:p><w:r><w:fldChar w:fldCharType="begin" w:dirty="true"/></w:r><w:r><w:instrText xml:space="preserve"> TOC \o "1-2" \h \z \u </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>Update this field (right-click, Update Field) to show the contents.</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p></w:sdtContent></w:sdt>
+```
+
+```{=openxml}
+<w:p><w:pPr><w:pageBreakBefore/><w:spacing w:before="0" w:after="0" w:line="20" w:lineRule="exact"/></w:pPr></w:p>
+```
+
+# Abstract
+
+**Aim.** Biotic interactions can limit or extend species distributions, but how
+interaction strategies spanning mutualism and parasitism relate to total range
+size remains poorly understood. We tested whether ant-interaction strategy and
+recorded ant-partner breadth are associated with range size across Lycaenidae.
+
+**Location.** Global.
+
+**Time period.** 1900–2026.
+
+**Major taxa studied.** Lycaenidae butterflies and associated ants
+(Formicidae).
+
+**Methods.** We compiled source-traceable interaction records, classified
+species into four interaction strategies and estimated range area and
+latitudinal and longitudinal extents from cleaned occurrences. Taxonomic mixed
+models related range size to interaction strategy and the number of recorded ant
+genera. Ten core analyses assessed robustness to spatial and phylogenetic
+non-independence, the concentration of parasites in a few genera, occurrence
+sampling and range estimation.
+
+**Results.** Across `r cnt("model_area_type_total")` species, estimated range
+area was smallest in obligate parasites, intermediate in obligate mutualists and
+largest in facultative associates and non-associated species
+(`r ratio("lmm", "f-p")` and `r ratio("lmm", "n-p")` times that of parasites),
+which did not differ clearly from each other. The facultative–parasite contrast
+was supported in `r core_support("f-p")` core analyses. Joint spatial and
+phylogenetic adjustment gave the most conservative estimate
+(`r effi_short("phylo_spatial_yumnam_2025", "f-p")`). The
+non-associated–parasite contrast was supported in `r core_k("n-p")`, all except
+that most conservative analysis. Contrasts involving mutualists depended on the
+model. Each additional recorded ant genus was associated with
+`r report_number(100 * (rb("lmm", "breadth")$ratio - 1), 0)`% greater range
+area, an association supported in every core analysis that estimated it.
+Interaction type alone explained
+`r report_number(100 * main_metadata$marginal_r2[main_metadata$measure == "area" & main_metadata$predictors == "type"], 1)`%
+of range-area variation (marginal R²).
+
+**Main conclusions.** Range size varied with how, rather than whether, species
+interact with ants, with small ranges linked to obligate parasitism. Species
+with more recorded partner genera also had larger ranges, consistent with the
+niche-breadth hypothesis, although documentation effort and geographic
+opportunity offer alternative explanations. The type of biotic interaction, not
+just its presence, merits inclusion alongside environmental and resource niches
+in comparative range-size studies.
+
+**Keywords.** Biotic interactions; biotic niche; Formicidae; geographic range
+size; Lycaenidae; macroecology; mutualism; myrmecophily; niche breadth;
+parasitism.
+
+# Introduction
+
+Geographic range size varies by several orders of magnitude among species, and
+understanding its determinants is a central goal in ecology and biogeography
+[@brown1996; @gaston2009]. Range size reflects ecological tolerances, the
+geographic availability of suitable conditions and resources, dispersal,
+evolutionary history and biotic interactions, and is closely linked to
+extinction risk [@chichorro2019; @sheth2020]. Niche breadth is among its most
+consistently supported correlates. Species with broader environmental tolerances
+or habitat and resource use generally occupy larger ranges [@brown1984;
+@slatyer2013]. Dispersal and historical opportunity further determine how much
+of the potential distribution is reached [@alzate2022]. Biotic interactions,
+however, remain much less integrated into comparative explanations of range size
+than climate, habitat and resource use [@paquette2021; @thuiller2023;
+@galiana2026].
+
+Biotic interactions—the Eltonian dimension of species' niches—can limit and
+extend distributions. Competition, predation and parasitism can prevent
+populations from persisting, whereas mutualists can allow species to occupy
+otherwise unsuitable conditions [@wisz2013; @afkhami2014; @paquette2021].
+Evidence that interactions contribute to individual range boundaries is
+substantial [@louthan2015; @paquette2021], and interactions can constrain
+range expansion over evolutionary time [@pigot2013]. Total range size, unlike
+range limits, integrates processes at multiple boundaries, across heterogeneous
+environments and over long periods of colonisation and extinction, so
+interactions are often assumed to matter less at this scale [@galiana2023]. Yet
+in gall-inducing sawflies and their parasitoids, larger ranges were associated
+with wider climatic tolerances and more trophic interactions, and diet breadth
+appeared more limiting than climatic tolerance [@galiana2023].
+Interaction types are usually studied in isolation, so little is known about
+whether contrasting interaction strategies leave predictable range-size
+signatures.
+
+Interaction strategies differ along two axes that may affect range size: how
+strongly a species depends on its partners, and whether it benefits them or
+exploits them. Facultative mutualists benefit from partners where present
+but can persist without them. Obligate mutualists gain similar benefits but also
+depend on compatible partners, which can restrict them to the geographic overlap
+of their own and their partners' environmental requirements [@fowler2022].
+Consistent with this trade-off, facultative positive interactions tend to extend
+geographic or ecological ranges, whereas obligate ones more often constrain them
+[@stephan2021]. Obligate parasites share this dependence but also exploit their hosts. They may therefore need large host colonies or dense host populations
+[@thomas1992; @tsai2010], and the harm they cause can select for host defences that make exploitation vary geographically [@nash2008].
+
+A third axis, partner breadth, may modify these constraints, extending the
+niche-breadth hypothesis to the biotic niche. Species able to use more partners should find
+suitable ones in more places. Consistent with this, legumes and ants with more
+generalised mutualisms are more likely to have established beyond their native
+ranges [@harrison2018; @nathan2023], and more host-specific fleas have smaller
+geographic ranges [@krasnov2005]. Such correlations can also run the other way,
+because wide-ranging species may encounter more potential partners simply by
+occurring in more places [@hurtado2024]. Causality therefore remains hard to
+establish.
+
+Lycaenids are particularly suitable for testing these ideas. Their
+interaction strategies span a spectrum from no ant association through
+facultative and obligate mutualism to obligate parasitism, within a single
+family, so strategies can be compared among related species with broadly similar
+life cycles.
+More than 70% of almost 5,400 species worldwide appear to be ant-associated when
+known life histories are extrapolated across close relatives [@pierce2002;
+@piercedankowicz2022a]. Mutualistically associated larvae commonly provide
+nutritive secretions and receive protection from ants, which can substantially
+increase larval survival. In *Plebejus* (*Lycaeides*) *melissa*, ant attendance
+increases survival on a suboptimal host plant [@forister2010]. Parasitic
+species instead obtain food from ant brood or through trophallaxis
+(mouth-to-mouth feeding by ants), often relying on specialised chemical or
+behavioural mechanisms to enter and persist within colonies [@pierce2002].
+
+Lycaenidae also stood out in a recent comparison of niche breadth and range size.
+Across
+European-centred butterflies, climatic niche breadth was the strongest predictor
+of range size, whereas relationships with habitat and diet breadth differed
+substantially among lineages [@hausharter2023]. In Lycaenidae, range size
+increased with climatic and habitat breadth but mostly decreased with larval
+plant-diet breadth, which the authors suggested might reflect ant associations
+as an additional niche dimension. Within the family, ant interactions are associated
+with ecological specialisation and stronger genetic structure [@schar2018]. The ant-associated niche may therefore capture range-size
+variation that climate, habitat and larval host plants do not. To our knowledge,
+however, whether ant-interaction strategy and recorded partner breadth are
+associated with range size remains untested across the family.
+
+We hypothesised that (1) facultatively
+associated species would have relatively large ranges, because they can gain
+benefits from ants without strict dependence; (2) obligate mutualists would have
+smaller ranges than facultative and non-associated species, because persistence
+additionally requires compatible ants, although mutualistic benefits could
+partly offset this constraint; (3) obligate parasites would have the smallest
+ranges, because ant dependence is combined with specialised exploitation that
+harms their hosts; and (4) range size would increase with the number of recorded
+ant genera, consistent with the niche-breadth hypothesis. We tested them with a
+new source-traceable global compilation of Lycaenidae–ant associations and
+cleaned occurrence records. Obligate associations are concentrated in particular
+regions, notably Australia and southern Africa, largely because lineages rich in
+obligate associates occur there [@pierce2002]. Because interaction
+strategies and range sizes are geographically and phylogenetically structured,
+we evaluated whether these associations were robust to spatial and phylogenetic
+non-independence, the concentration of parasites in a few genera, occurrence
+sampling and range estimation.
+
+```{r setup-supplement, include=FALSE}
+# Supporting Information inputs (s04_fit_models, Joint phylogenetic and spatial models; s06_summarise_results, Supporting Information tables)
+si <- function(name) read_report_table(file.path(dir_s06, paste0("si_", name, ".csv")))
+si_evidence <- si("evidence_basis")
+si_attrition <- si("attrition")
+si_alternative <- si("alternative_decisions")
+# facultative-parasite area ratios after inclusive cleaning (eligible and identical samples) and with species-level
+# subtype evidence only: the two decisions that "roughly halved" the main ratio (Results 4.4)
+halved_fp <- c(
+  cleaning_results$ratio[cleaning_results$measure == "area" & cleaning_results$predictors == "type" &
+    cleaning_results$contrast == "f-p" & cleaning_results$cleaning == "inclusive"],
+  si_alternative$ratio[si_alternative$measure == "area" & si_alternative$contrast == "f-p" &
+    si_alternative$decision == "species_level_subtype_only"])
+stopifnot(length(halved_fp) == 3L, all(halved_fp / rb("lmm", "f-p")$ratio > 0.4 & halved_fp / rb("lmm", "f-p")$ratio < 0.65))
+halved_fp_span <- sprintf("%.1f–%.1f", min(halved_fp), max(halved_fp))
+# Discussion opening: facultative associates are "the majority of ant-associated species"
+stopifnot(counts$value[counts$name == "model_area_type_f"] >
+  counts$value[counts$name == "model_area_type_m"] + counts$value[counts$name == "model_area_type_p"])
+# Results 4.4: f-p "supported under every alternative range estimate" and "(all supported)" in the
+# 80%, 90% and 95% stability subsets
+stopifnot(all(vapply(c("rarefied_k10", "modelled_ranges_daru", "stability_80", "stability_90", "stability_95"),
+                     function(a) rb(a, "f-p")$p < 0.05 && rb(a, "f-p")$ratio > 1, TRUE)))
+si_contamination <- si("background_contamination")
+si_expert <- si("expert_validation")
+si_overlay <- si("phylogeny_overlay_counts")
+# dataset summaries (s06_summarise_results, Supporting Information tables): ledger scale, agreement with the earlier manual
+# compilation, classification coverage by region, sample composition of the alternative codings
+si_ledger <- si("ledger_summary")
+ledger_n <- function(k) {
+  v <- si_ledger[[k]]
+  stopifnot(length(v) == 1L)
+  v
+}
+legacy <- si("legacy_agreement")
+stopifnot(nrow(legacy) == 1L)
+coverage <- si("classification_coverage")
+cov_row <- function(region) {
+  x <- coverage[coverage$region == region, ]
+  stopifnot(nrow(x) == 1L)
+  x
+}
+alt_counts <- si("alternative_counts")
+alt_n <- function(decision, column) {
+  v <- alt_counts[[column]][alt_counts$decision == decision]
+  stopifnot(length(v) == 1L)
+  v
+}
+# analysed mutualists or parasites whose subtype rests on a genus statement or a source's inference from
+# relatives (basis other than 'direct'): those dropped by the species-level-only decision (Appendices S1, S6)
+main_table <- read_report_table(file.path(dir_s03, "species_table.csv"))
+main_table <- main_table[!is.na(main_table$interaction_type) & is.finite(main_table$range_area) &
+                           main_table$range_area > 0 & !is.na(main_table$genus) & !is.na(main_table$subfamily), ]
+subtype_indirect <- function(type) {
+  indirect <- main_table$interaction_type %in% type & !main_table$interaction_type_basis %in% "direct"
+  v <- sum(indirect)
+  col <- paste0("n_", type)
+  stopifnot(v == alt_n("main", col) - alt_n("species_level_subtype_only", col))
+  # "mainly Lepidochrysops and Thestor" (Appendix S1) holds only for the parasites
+  if (type == "p") stopifnot(sum(main_table$genus[indirect] %in% c("Lepidochrysops", "Thestor")) > v / 2)
+  v
+}
+# of these, analysed mutualists or parasites whose obligate association was documented for the species (basis
+# 'direct_class_inferred_subtype'), which Table S1 therefore counts as species-specific (Appendix S1)
+subtype_added <- function(type) {
+  v <- sum(main_table$interaction_type %in% type & main_table$interaction_type_basis %in% "direct_class_inferred_subtype")
+  stopifnot(v + sum(si_evidence[[type]][si_evidence$evidence != "Species-specific source evidence"]) == subtype_indirect(type))
+  v
+}
+# number of the largest-ranged analysed parasites that belong to genus g (Appendix S5)
+n_top_p <- function(g) {
+  p <- main_table[main_table$interaction_type %in% "p", ]
+  n <- sum(cumprod(p$genus[order(-p$range_area)] == g))
+  stopifnot(n >= 2L)
+  n
+}
+# omitting Phengaris raises the f-p and n-p ratios in all three models of Table S8 (Appendix S5)
+stopifnot(all(vapply(c("lmm", "pgls_yumnam_2025", "pgls_schar_2018"), function(mo) all(vapply(c("f-p", "n-p"),
+  function(ct) lg("Phengaris", mo, ct)$ratio > lg("none", mo, ct)$ratio, logical(1))), logical(1))))
+# analysed parasites of model genus g that matched a tip of the tree rather than being grafted (Appendix S5);
+# keyed on the model genus (Lycaena_ortygia is a Lepidochrysops)
+n_matched_genus <- function(g, tree) {
+  cw <- read_report_table(file.path(dir_s04, paste0("crosswalk_", tree, ".csv")))
+  sp <- main_table$species[main_table$genus %in% g & main_table$interaction_type %in% "p"]
+  stopifnot(length(sp) == n_par_genus(g), all(sp %in% cw$analysis_species))
+  sum(cw$matched[match(sp, cw$analysis_species)] %in% TRUE)
+}
+# origins of parasitism (Appendix S5): the Schar tree holds every analysed parasite; the four
+# subfamilies are named in the text; Lepidochrysops and Thestor are one origin each on both trees; on the Yumnam
+# tree Niphanda is absent and the two Ogyris parasites, one grafted, are separate origins
+local({
+  oc <- origin_clades
+  stopifnot(orig("schar_2018")$n_parasites == cnt("model_area_type_p"),
+            orig("yumnam_2025")$n_parasites < cnt("model_area_type_p"),
+            all(origins$n_parasite_subfamilies[origins$tips == "grafted"] == 4L),
+            setequal(unlist(strsplit(oc$subfamily, ";")), c("Aphnaeinae", "Miletinae", "Polyommatinae", "Theclinae")),
+            all(table(oc$tree[oc$genera %in% c("Lepidochrysops", "Thestor")]) == 2L),
+            !any(grepl("Niphanda", oc$genera[oc$tree == "yumnam_2025"])),
+            sum(oc$tree == "yumnam_2025" & oc$genera == "Ogyris") == 2L,
+            sum(oc$n_grafted[oc$tree == "yumnam_2025" & oc$genera == "Ogyris"]) == 1L,
+            sum(oc$tree == "schar_2018" & oc$genera == "Ogyris") == 1L,
+            orig("yumnam_2025", "matched")$changes < orig("schar_2018", "matched")$changes,
+            orig("schar_2018", "matched")$changes < orig("schar_2018")$changes)
+})
+# parasitic genus-by-type units of the main type model and how many lie below the median facultative unit (Appendix S5)
+gu_desc <- local({
+  u <- aggregate(log10_range ~ genus + interaction_type, data = model.frame(main_models$area_type), FUN = mean)
+  med_f <- median(u$log10_range[u$interaction_type == "f"])
+  pu <- u[u$interaction_type == "p", ]
+  pu <- pu[order(pu$log10_range), ]
+  above <- paste0("*", as.character(pu$genus[pu$log10_range >= med_f]), "*")
+  stopifnot(length(above) >= 2L)
+  list(n_p = nrow(pu), n_f = sum(u$interaction_type == "f"), n_below = sum(pu$log10_range < med_f),
+       above_txt = paste(paste(above[-length(above)], collapse = ", "), "and", above[length(above)]))
+})
+# one value shared by all main models of the given predictor sets (Table S3b caption)
+meta_one <- function(column, predictors = c("type", "breadth")) {
+  v <- unique(main_metadata[[column]][main_metadata$predictors %in% predictors])
+  stopifnot(length(v) == 1L)
+  v
+}
+# type-only LMM contrasts on the same side of p = 0.05 under log10 and Box-Cox (Appendix S3)
+bc_lmm_type <- boxcox_comparison[boxcox_comparison$model == "lmm" & boxcox_comparison$predictors == "type", ]
+# one range-area contrast of the type-only mixed model under both transformations
+bc_row <- function(contrast) {
+  d <- bc_lmm_type[bc_lmm_type$measure == "area" & gsub(" ", "", bc_lmm_type$contrast) == contrast, ]
+  stopifnot(nrow(d) == 1L)
+  d
+}
+# the only contrast that changes side is the area facultative-mutualist contrast (supported under log10 only);
+# the area mutualist-parasite contrast stays supported, with an interval above one
+bc_same_side <- function() {
+  same <- (bc_lmm_type$log_p < 0.05) == (bc_lmm_type$boxcox_p < 0.05)
+  stopifnot(sum(!same) == 1L, bc_row("f-m")$log_p < 0.05, bc_row("f-m")$boxcox_p >= 0.05,
+            bc_row("m-p")$boxcox_p < 0.05, bc_row("m-p")$boxcox_lower > 1)
+  sum(same)
+}
+dataset_counts <- read_report_table(file.path(dir_s02, "dataset_counts.csv"))
+rec <- function(stage) {
+  v <- dataset_counts$records[dataset_counts$stage == stage]
+  stopifnot(length(v) == 1L)
+  v
+}
+# expert-polygon check of the outlier rule (s02_prepare_ranges, Outlier-rule check; Appendix S2): record groups flagged only by
+# the stringent rule, and how many had centroids within 100 km of the expert polygon
+og_check <- read_report_table(file.path(dir_s02, "outlier_expert_check.csv"))
+og_strict <- og_check[og_check$set == "strict only (f 0.25, not flagged at f 0.5)", ]
+stopifnot(nrow(og_strict) == 1L)
+og_strict_in <- round(og_strict$groups * og_strict$share_inside_expert)
+stopifnot(abs(og_strict$groups * og_strict$share_inside_expert - og_strict_in) < 1e-6)
+pg_geo <- read_report_table(file.path(dir_s04, "phylo_geography_contrasts.csv"))
+pg_geo$contrast <- gsub(" ", "", pg_geo$contrast)
+flip <- pg_geo$contrast == "n-f"
+pg_geo$contrast[flip] <- "f-n"
+pg_geo$ratio[flip] <- 1 / pg_geo$ratio[flip]
+pg_moran <- read_report_table(file.path(dir_s04, "phylo_geography_moran.csv"))
+pgm <- function(model, study = "yumnam_2025") {
+  v <- pg_moran$moran_500[pg_moran$model == model & pg_moran$study == study & pg_moran$measure == "area"]
+  stopifnot(length(v) == 1L)
+  sub("-", "−", report_number(v, 2), fixed = TRUE) # true minus sign (U+2212), as in mor()
+}
+# Table S10 shows the phylogenetic spatial GAM. PGLS + butterfly background (also fitted in s04_fit_models, Joint phylogenetic and spatial models;
+# residuals stay spatially autocorrelated) is a descriptive row of Table S12 (see robust above).
+pg_geo <- pg_geo[pg_geo$model == "phylo_spatial_gam", ]
+wing_coef <- read_report_table(file.path(dir_s06, "wingspan_coefficients.csv"))
+# "ratio 1.98 per doubling of wingspan, 95% CI ..., p = ..." (type model; slope on log10 wingspan)
+wing_txt <- function(measure = "area") {
+  d <- wing_coef[wing_coef$measure == measure & wing_coef$predictors == "type", ]
+  stopifnot(nrow(d) == 1L)
+  dbl <- function(r) 2^log10(r) # ratio per tenfold wingspan -> per doubling
+  sprintf("ratio %.2f per doubling of wingspan, 95%% CI %.2f–%.2f, %s", dbl(d$range_ratio), dbl(d$ratio_lower), dbl(d$ratio_upper), fmt_p(d$p_value))
+}
+cont <- function(type, column = "share_m_or_p") {
+  v <- si_contamination[[column]][si_contamination$type == type]
+  stopifnot(length(v) == 1L)
+  report_number(100 * v, 0)
+}
+# Appendix S6: log(1 + count) breadth "fitted all three range measures better" (lower ML AIC than the raw
+# count for area, latitude and longitude), reported as the range of AIC differences, e.g. "3.7–4.1"; the
+# type-adjusted obligate slope is "also positive"
+breadth_daic <- local({
+  sc <- check_table("breadth_scale_comparison")
+  d <- sc$delta_AIC[sc$scale == "raw"]
+  stopifnot(length(d) == 3L, all(d > 0), all(sc$delta_AIC[sc$scale == "log1p"] == 0))
+  sprintf("%.1f–%.1f", min(d), max(d))
+})
+local({
+  ob <- within_breadth[within_breadth$model == "lmm_obligate" & within_breadth$measure == "area", ]
+  stopifnot(nrow(ob) == 1L, ob$ratio > 1)
+})
+# breadth with Paratrechina/Nylanderia merged into one count group (s05_check_robustness, Partner breadth; Appendix S6)
+merge_eff <- function(model, measure = "area") {
+  x <- check_table("breadth_genus_merge_effects")
+  d <- x[x$model == model & x$measure == measure, ]
+  stopifnot(nrow(d) == 1L)
+  sprintf("ratio %.2f per additional group, 95%% CI %.2f–%.2f, %s", d$ratio, d$lower, d$upper, fmt_p(d$p))
+}
+alt <- function(decision, contrast, measure = "area") {
+  d <- si_alternative[si_alternative$decision == decision & si_alternative$contrast == contrast & si_alternative$measure == measure, ]
+  stopifnot(nrow(d) == 1L)
+  sprintf("ratio %.2f, %s", d$ratio, fmt_p(d$p))
+}
+# Appendix S6: for range area, f-p, n-p and breadth "remained supported under all four" codings, and f-m under all but
+# the species-level-subtype coding
+local({
+  a <- si_alternative[si_alternative$measure == "area" & si_alternative$contrast %in% c("f-p", "n-p", "f-m", "breadth"), ]
+  stopifnot(nrow(a) == 4L * length(unique(si_alternative$decision)), all(a$p[a$contrast != "f-m"] < 0.05),
+            all(a$p[a$contrast == "f-m" & a$decision != "species_level_subtype_only"] < 0.05),
+            a$p[a$contrast == "f-m" & a$decision == "species_level_subtype_only"] >= 0.05)
+})
+```
+
+# Materials and Methods
+
+## Ant-association data
+
+To characterise larval ant associations across Lycaenidae, we compiled evidence
+from regional and global syntheses [@eastwood1999; @heath2003; @fiedler2006;
+@fiedler2012; @schar2018; @fiedler2021], the primary studies they cite and
+further natural-history literature. Each of the
+`r report_number(ledger_n("claims"))` claims from
+`r report_number(ledger_n("sources"))` sources was recorded in an evidence
+database with its source location and coding decision (Appendix S1). The first author compiled the data manually and then directed AI tools
+that assisted literature discovery, extraction, cross-checking and some coding
+decisions. The resulting interaction types agreed with the original manual
+compilation for `r report_number(100 * legacy$share, 0)`% of shared species
+(Cohen's kappa `r report_number(legacy$kappa, 2)`; Appendix S1). We reconciled
+butterfly names with the GBIF Backbone Taxonomy and merged
+duplicate taxonomic entries into species units, which exceed the number of
+described species. Analysed genera follow current checklists and phylogenies
+(Appendix S1).
+
+We classified species into four interaction types: non-ant-associated (n),
+facultatively associated (f), obligately mutualistic (m) and obligately
+parasitic (p). Facultative associates can complete development without ants, but
+obligate associates depend on them. Obligate mutualists obtain most of their
+larval food independently of ants, whereas obligate parasites develop on ant
+brood or other ant-derived food [@pierce2002]. An obligate species was assigned
+to either subtype only when evidence on the species, or an explicit statement
+about its genus, addressed larval feeding. We applied this rule equally to both
+subtypes, so poorly known obligate species were not classified as mutualists by
+default. We used inferences from relatives only when a source made them. Species
+without interaction evidence remained unclassified and were not assumed to be
+non-associated.
+
+Ant-partner breadth was the number of ant genera, with names standardised across
+sources, recorded attending or hosting the larvae or pupae of a species. We
+excluded records marked as doubtful in their source, records of ant attacks or
+mere co-occurrence, and ants identified only to subfamily (Appendix S1). Breadth
+counts observed associations and does not measure experimentally established
+compatibility.
+
+## Occurrence data and range estimates
+
+We used all `r report_number(rec("all_records_with_coordinates") / 1e6, 1)`
+million Lycaenidae records with coordinates in a GBIF download from October 2026
+[@gbif2026]. Because minimum convex polygons (MCPs) are sensitive to erroneous
+and non-native records, we cleaned records with explicit
+rules, without removing individual points by eye (Appendix S2). First, we
+applied metadata and *CoordinateCleaner* filters [@zizka2019]. Second, we
+removed documented introductions and records far from each species' native
+region, defined by country checklists [@pinkert2022] or biogeographic realms
+[@dinerstein2017]. Third, we removed small outlying groups separated from the
+remaining localities by over 200 km and a quarter of their maximum extent.
+
+We measured range area and the latitudinal and longitudinal extents of each
+range, the north–south and east–west distances spanned by its records (Appendix
+S2). Range area, the primary response, was the MCP area in a species-specific
+equal-area projection. The extents complement area but are not independent
+tests. All three describe the extent of occurrence, which includes unoccupied
+ground within the range [@gaston2009]. We analysed species with at least ten unique cleaned localities,
+below which the cleaning protocol flagged range estimates as data-poor.
+Comparison with expert range polygons was possible for
+`r report_number(si_expert$n)` European-centred
+species, whose log~10~ MCP area correlated with expert range-polygon area
+[@hausharter2023] at r = `r report_number(si_expert$pearson_log10, 2)` (Appendix
+S2).
+
+## Comparative models
+
+For each range measure, we fitted a taxonomic linear mixed model of log~10~
+range size with interaction type as a fixed effect and, to account for the
+non-independence of related species, random intercepts for genus nested within
+subfamily [*lme4* and *lmerTest*, @bates2015; @kuznetsova2015]. We used
+taxonomic random effects because they cover all `r pgc("analysed")` analysed
+species (Appendix S5), whereas only `r pgc("matched")`, including
+`r report_number(pg("n_parasite", tree_set = "matched"))` of the
+`r cnt("model_area_type_p")` parasites, matched a tip of the time-calibrated
+phylogeny of @yumnam2025, hereafter the Yumnam tree. We then fitted a second
+model to ant-associated
+species with recorded partners, adding mean-centred partner breadth to
+interaction type. Breadth entered as an
+untransformed count, so its coefficient gives the range-size ratio per
+additional recorded ant genus. Recorded breadth varies mainly among facultative
+species, so we also estimated the breadth association within them (Appendix
+S6). Because the two models use different
+species, we interpret the breadth association separately from the type
+differences.
+
+We report effects as ratios of fitted geometric-mean range sizes, back-transformed
+from the log~10~ scale, with 95% confidence intervals. Geometric means are less
+influenced than arithmetic means by a few very large ranges. Pairwise type
+contrasts, all reported for the main models, used *emmeans* with
+Tukey adjustment within each model [@lenth2026]. We describe effects with
+p < 0.05 as supported or clear, without adjusting for the three range measures
+or the sensitivity analyses. Instead, inference rests on range area and on
+the consistency and precision of estimates across complementary analyses.
+Intervals treat fitted covariance parameters and, in phylogenetic models, the
+chosen tree as known, and non-normal residual tails and few parasitic genera
+make model-based uncertainty approximate (Appendices S3–S5).
+Appendix S3 gives model diagnostics, R² [@barton2026] and a Box–Cox check of
+sensitivity to the log transformation (Table S3c). Analyses were conducted in R
+[@rcore2023], developed iteratively and not preregistered.
+
+## Sensitivity analyses
+
+We tested robustness with `r num_word(length(core_analyses))` core analyses
+(Fig. 4), each using the largest sample its method allowed (Appendices S2,
+S4–S7). These were the reference taxonomic model; a spatial model;
+species-level phylogenetic, joint spatial–phylogenetic and equal-weight
+genus-level phylogenetic models, each on two trees; and models
+of rarefied ranges
+and of modelled ranges from @daru2024. Other analyses were additional checks.
+The core analyses share data and are not independent replicates, so the number
+supporting a contrast indicates consistency.
+
+*Spatial structure.* To account for positive spatial autocorrelation in
+taxonomic-model residuals [@dormann2007], we fitted spatial generalised additive
+models (GAMs) with a spherical smooth of each species' range centre and
+random-effect smooths for subfamily and genus [@wood2025].
+
+*Shared ancestry.* We fitted phylogenetic generalised least squares (PGLS),
+estimating Pagel's lambda [@pagel1999], on the Yumnam tree and, as an
+alternative hypothesis, on the Schär tree, the COI topology of @schar2018 with
+Grafen branch lengths [@grafen1989]. Unmatched species were grafted within their
+genus, so their placement reflects taxonomy alone (matched-only PGLS in
+Appendix S5). Species from genera absent from a tree were omitted, leaving
+`r report_number(rb("pgls_grafted_yumnam_2025", "f-p")$n)` species on the Yumnam
+tree.
+
+*Space and ancestry combined.* PGLS residuals also remained spatially
+autocorrelated, so we fitted joint GAMs combining the spherical smooth with a
+phylogenetically structured species effect [@freckleton2009]. A spatial smooth
+can absorb part of a genuine difference between geographically clustered
+categories [@hodges2010], as can a phylogenetic effect for phylogenetically
+clustered ones. We therefore treat the spatial and joint models as the most
+conservative estimates, which need not recover the true difference.
+
+*Concentration in a few lineages.* We counted origins of parasitism by
+parsimony, fitted PGLS to equally weighted genus-by-interaction-type means and
+refitted species-level models without
+each major parasitic genus or the two largest together, and within and outside
+southern Africa (Appendix S5).
+
+*Occurrence sampling and range estimation.* We re-estimated ranges from equal
+numbers of randomly drawn localities (rarefaction) and restricted analyses to
+species with range estimates stable under subsampling at 90% [@gupta2020], 80%
+or 95% thresholds. We also
+compared cleaning treatments and used modelled native ranges from a global
+butterfly database [@daru2024], which combine occurrences with environmental
+data and include poorly recorded species (Appendices S2, S6).
+
+*Further checks.* We added wingspan, and for non-parasites larval carnivory, as
+covariates, reclassified obligate species under alternative codings and compared each species' range with
+the modelled ranges of co-occurring butterflies of all families (Appendices
+S4–S6).
+
+# Results
+
+## Data coverage and the geography of interaction strategies
+
+Of the `r cnt("units")` species units, `r cnt("units_typed")` met the evidence
+criteria for an interaction type. The `r cnt("model_area_type_total")` of these
+that also met the criterion for an analysed range estimate (at least ten unique
+cleaned localities), from `r cnt("model_genera")` genera, entered the main models
+(`r cnt("model_area_type_n")` non-associated,
+`r cnt("model_area_type_f")` facultative, `r cnt("model_area_type_m")`
+obligately mutualistic and `r cnt("model_area_type_p")` obligately parasitic;
+Table S2).
+
+Interaction strategies showed distinct geographic patterns (Fig. 1). Facultative
+and non-associated species occurred across major regions, whereas the recorded
+obligate mutualists and parasites were confined to Afro-Eurasia and Australasia.
+Parasites formed the highest proportions of classified species in southern Africa
+(Fig. 1D), which also contained many small-ranged lycaenids (Fig. 1E), so
+interaction strategy and range size share geographic structure. Mean recorded
+partner breadth varied among regions (Fig. 1F). Apparent regional absences
+may partly reflect uneven recording and incomplete classification (Fig. S4).
+
+```{r main-biogeography}
+report_figure("plot_interaction_maps")
+```
+
+**Figure 1.** Global distribution of ant-interaction strategies, range size and
+recorded partner breadth in Lycaenidae, in 500-km equal-area cells (Equal Earth
+projection). A–D: proportions of classified species that were non-associated,
+facultative, obligate mutualists and obligate parasites, in cells with at least
+ten classified species. Each of these panels has its own square-root colour
+scale, spanning the 1st to 99th percentiles of its cells (rounded outwards to
+0.1), so colours are not comparable between panels; the few cells beyond this
+range take the end colour (≤ or ≥ in the legend). E: median MCP area of species
+with range estimates (logarithmic scale), in cells with at least ten such
+species. F: mean number of recorded ant genera per ant-associated species
+(linear scale), in cells with at least five associated species with recorded
+breadth. Each species is counted once per occupied cell, using its stringently
+cleaned records; grey land has no estimate. The maps describe the recorded
+fauna; sampling and classification coverage are shown in Fig. S4.
+
+## Interaction strategy and range size
+
+We found that obligate parasites had the smallest fitted ranges (Fig. 2; Table
+1). Facultative associates had `r ratio("lmm", "f-p")` times the estimated range
+area of parasites (`r ci_p("lmm", "f-p")`), and non-associated species
+`r ratio("lmm", "n-p")` times (`r ci_p("lmm", "n-p")`). Obligate mutualists were
+intermediate, with smaller ranges than facultative associates and larger than
+parasites (Table 1). Facultative associates had the largest point estimate, but
+their difference from non-associated species was uncertain
+(`r effi("lmm", "f-n")`). Interaction type accounted for
+`r report_number(100 * main_metadata$marginal_r2[main_metadata$measure == "area" & main_metadata$predictors == "type"], 1)`%
+of the variation in log~10~ range area (marginal R²; Table S3a).
+
+The facultative–parasite and non-associated–parasite contrasts were also
+supported for both range extents (Table 1). The mutualist–parasite contrast was
+supported for
+latitudinal but not longitudinal extent, and the facultative–mutualist contrast
+for longitudinal but not latitudinal extent.
+
+```{r main-type}
+report_figure("plot_range_by_interaction_type")
+```
+
+**Figure 2.** Geographic range size by interaction type: A, MCP area; B,
+latitudinal extent; C, longitudinal extent (logarithmic axes; n gives the number
+of species). Coloured violins show the distribution of range sizes among the
+analysed species of each type, all drawn with the same maximum width. White
+boxes show medians and interquartile ranges, whiskers extend to the most extreme
+values within 1.5 times the interquartile range of the box edges (on the log
+scale), and small points show values beyond them. Black diamonds and bars show
+the model-estimated geometric mean of each type with its 95% confidence interval
+(back-transformed estimated marginal means of the taxonomic models, for a
+typical genus and subfamily). These means can differ from the medians because
+the log ranges of non-associated and facultative species have a long tail of
+small values, and because the models attribute part of the small ranges of
+species-rich genera (e.g. *Chrysoritis*, *Lepidochrysops*) to genus instead of
+interaction type. Types sharing a letter do not differ clearly (Tukey-adjusted
+p ≥ 0.05), which does not make them equivalent. Table 1 gives the ratios and
+intervals.
+
+**Table 1.** Range-size ratios in the main taxonomic models
+(`r cnt("model_area_type_total")` species; breadth model:
+`r cnt("model_area_breadth_n")`). Ratios compare the first category with the
+second. Type contrasts have Tukey-adjusted 95% confidence intervals and
+p-values; breadth has a coefficient-based interval and p-value and is the ratio
+per additional recorded ant genus. n: non-associated; f: facultative; m:
+obligate mutualist; p: obligate parasite. P-values below 0.05 are bold.
+Appendix S3 gives model fit, estimated means and breadth-model type contrasts.
+Spatial and phylogenetic models assess the non-independence left in these
+full-sample estimates (Fig. 4).
+
+```{r table-1-main}
+t1_rows <- c(
+  `f-p` = "f / p", `n-p` = "n / p", `m-p` = "m / p", `f-m` = "f / m", `f-n` = "f / n", `n-m` = "n / m",
+  breadth = "Per recorded ant genus"
+)
+t1 <- data.frame(Contrast = unname(t1_rows), check.names = FALSE)
+measure_names <- c(area = "Area", lat = "Latitudinal extent", lon = "Longitudinal extent")
+for (key in names(measure_names)) {
+  t1[[measure_names[[key]]]] <- vapply(names(t1_rows), function(k) {
+    d <- rb("lmm", k, key)
+    sprintf("%.2f (%.2f–%.2f) %s", d$ratio, d$lower, d$upper, format_table_p(d$p))
+  }, "")
+}
+report_table(t1, align = c("l", "r", "r", "r"), escape = FALSE, row.names = FALSE)
+```
+
+## Recorded partner breadth and range size
+
+Among the `r cnt("model_area_breadth_n")` ant-associated species with recorded
+partners, range size increased with the number of recorded ant genera after
+accounting for interaction type (Fig. 3; Table 1). Each additional genus was
+associated with `r pct("lmm")` greater area, and both range extents also
+increased with breadth. Facultative associates had more recorded partners than
+mutualists and parasites (median `r num_word(breadth_med[["f"]])` versus
+`r num_word(breadth_med[["m"]])` genus). The breadth association nevertheless
+held among facultative species alone, with `r within_eff("lmm_facultative")`
+greater area per additional genus, and remained after spatial adjustment (Table
+S13a). Recorded breadth varied much less among obligate associates, and their
+separate slope was imprecise (Appendix S6).
+
+```{r main-breadth}
+report_figure("plot_range_by_partner_breadth")
+```
+
+**Figure 3.** Range size against the number of recorded ant genera: A, MCP area;
+B, latitudinal extent; C, longitudinal extent (logarithmic range axes). Points
+are species, jittered horizontally so that species with the same number of
+recorded genera remain visible. Lines and 95% confidence bands are fixed-effect
+predictions of the taxonomic models, with a common breadth slope and
+type-specific intercepts, drawn over the breadth values observed in each type
+and dashed where fewer than five species of that type have at least that many
+recorded genera. Breadth slopes within facultative and within obligate species
+are reported in Appendix S6.
+
+## Robustness to spatial, phylogenetic and sampling structure
+
+Facultative associates had clearly larger ranges than parasites in
+`r core_support("f-p")` core analyses (Fig. 4; range-area ratios `r span("f-p")`),
+and non-associated species in `r core_k("n-p")` (ratios
+`r span_supported("n-p")`), all except the
+Yumnam joint model (`r rp("phylo_spatial_yumnam_2025", "n-p")`). Residuals of
+the taxonomic models were positively spatially autocorrelated (Moran's I =
+`r mor("lmm", 500)` within 500 km; Table S6), so their intervals are probably
+too narrow. Spatial adjustment removed this positive autocorrelation, leaving
+weak negative autocorrelation (Moran's I = `r mor("spherical_gam", 500)`). It
+also reduced the parasite contrasts, with the facultative–parasite ratio falling
+from
+`r ratio("lmm", "f-p")` (taxonomic model) to `r ratio("spherical_gam", "f-p")`
+(spatial model). Phylogenetic adjustment alone changed this ratio less
+(`r ratio("pgls_grafted_yumnam_2025", "f-p")` and
+`r ratio("pgls_grafted_schar_2018", "f-p")` in species-level PGLS on the Yumnam
+and Schär trees). Joint spatial and phylogenetic adjustment gave the most
+conservative estimate, `r eff("phylo_spatial_yumnam_2025", "f-p")` on the Yumnam
+tree.
+
+The mutualist–parasite and facultative–mutualist contrasts kept their direction
+in every core analysis but were supported in `r core_k("m-p")` and
+`r core_k("f-m")` of the `r num_word(length(core_analyses))`, respectively, and
+in none of the spatial or joint models. Obligate mutualists differed clearly
+from non-associated species only in species-level PGLS on the Schär tree.
+Facultative associates had larger point estimates than non-associated species in
+every core analysis (Fig. S8), but clearly so only with the modelled ranges of
+@daru2024. Partner breadth remained positively associated with range area in
+every analysis estimating it (Table S12).
+
+Parasites were concentrated in two genera, *Lepidochrysops*
+(`r n_par_genus("Lepidochrysops")` species) and *Thestor*
+(`r n_par_genus("Thestor")`). With genus-by-type units weighted equally,
+facultative genera had larger ranges than parasitic genera on both trees,
+including without *Lepidochrysops* (Table S9). Omitting any major parasitic
+genus other than *Lepidochrysops* left both parasite contrasts supported in all three
+species-level models (Table S8). The facultative–parasite contrast remained
+supported in two of these three models without *Lepidochrysops*, outside
+southern Africa and even without both genera, which contain
+`r n_par_genus("Lepidochrysops") + n_par_genus("Thestor")` of the
+`r cnt("model_area_type_p")` parasites. The exception was Yumnam-tree PGLS
+(without *Lepidochrysops*, `r lg_rp("Lepidochrysops", "pgls_yumnam_2025")`;
+Tables S8, S13c). The non-associated–parasite contrast was more sensitive. It
+lost clear support without both genera (all three species-level models and
+Yumnam genus-level PGLS), without *Lepidochrysops* (Yumnam-tree species- and
+genus-level PGLS), outside southern Africa (taxonomic model and Yumnam-tree
+PGLS) and in the 90% and 95% range-stability subsets (Tables S8, S9, S12, S13c).
+
+Among species centred in southern Africa
+(`r reg_row("southern_Africa_only")$n_parasite` of the
+`r cnt("model_area_type_p")` parasites), parasites had smaller ranges than
+facultative and non-associated species in the taxonomic model and in PGLS on
+both trees (facultative–parasite ratio about
+`r report_number(reg_row("southern_Africa_only")$ratio, 0)` in the taxonomic
+model, with wide intervals). Obligate mutualists there did not differ clearly
+from parasites and had smaller ranges than facultative associates in all three
+models (Table S13c). Species centred in Afro-Eurasia and Australasia, including
+all analysed parasites, gave a facultative–parasite contrast similar to the
+full-sample estimate (taxonomic model; Table S13c).
+
+The facultative–parasite ratio exceeded one and was supported under every
+alternative range estimate.
+Rarefied and full ranges of the same species gave similar ratios
+(`r ratio("rarefied_k10", "f-p")` with ten localities against
+`r ratio("lmm", "f-p")`; Table S13b). Parasites were disproportionately excluded
+by the ten-locality threshold, but the modelled ranges [@daru2024], which relax this
+threshold and include more parasites (Table S2), gave a smaller but supported
+difference (`r rp("modelled_ranges_daru", "f-p")`). In the 80%, 90% and 95%
+range-stability subsets the ratios were
+`r report_number(rb("stability_80", "f-p")$ratio, 2)`,
+`r report_number(rb("stability_90", "f-p")$ratio, 2)` and
+`r report_number(rb("stability_95", "f-p")$ratio, 2)` (all supported, the last with
+`r fmt_p(rb("stability_95", "f-p")$p)`; Table S12), although the 95% subset retained only
+`r num_word(rb("stability_95", "f-p")$n_parasite)` of the
+`r cnt("model_area_type_p")` parasites.
+
+Parasites also had clearly smaller ranges than facultative and non-associated
+species under every alternative coding and cleaning, and in Box–Cox-transformed
+taxonomic models (Tables S3c, S11, S14a), although inclusive cleaning and
+requiring species-level subtype evidence each roughly halved the
+facultative–parasite ratio, to `r halved_fp_span`. The mutualist–parasite
+contrast lost support under both decisions and under the broader parasite
+definition of @fiedler2012. The interaction and breadth associations
+remained supported with wingspan as a covariate (Table S12; Appendix S6).
+
+```{r main-robustness}
+report_figure("plot_robustness_core_analyses")
+```
+
+**Figure 4.** Range-area effects in the `r num_word(length(core_analyses))` core
+analyses, grouped by the alternative explanation they address: the full-sample
+taxonomic linear mixed model (LMM; reference); the spherical spatial GAM
+(space); species-level PGLS on genus-grafted trees (phylogeny), the joint
+phylogenetic spatial GAM (phylogeny + space) and equal-weight genus-by-type
+PGLS (genus weighting), each on the Yumnam (main) and Schär trees; and
+taxonomic models of rarefied and of modelled native ranges (range estimate).
+Rarefied ranges use ten random localities per species, and modelled ranges are
+from @daru2024. Numbers after each label give the species (or genus-by-type
+units) and parasites (or parasitic units) in the type model; breadth-model
+samples are in Table S12. * marks the spatial and joint models, whose residuals
+showed no positive spatial autocorrelation (Table S6) and which are treated as
+the most conservative estimates, although they need not recover the true
+difference (Materials and Methods). Residuals of the reference model and of
+species-level PGLS were positively autocorrelated, and those of the
+genus-by-type, rarefied-range and modelled-range analyses were not assessed. A,
+B: facultative/parasite and non-associated/parasite range-area ratios
+(logarithmic axes, reference line at one). C: percentage increase in range area
+per additional recorded ant genus, 100 × (ratio − 1) (linear axis, reference
+line at zero); genus-by-type PGLS has no breadth estimate. Bars are 95%
+confidence intervals, Tukey-adjusted for type contrasts and coefficient-based for
+breadth; filled points indicate p < 0.05. Axis ranges differ among panels. The
+analyses differ in samples and units and are complementary comparisons, which
+are not independent replicates. Fig. S8 shows the other pairwise contrasts, and
+Table S12 gives all estimates.
+
+# Discussion
+
+Contrasting interaction strategies showed a clear range-size signature in
+Lycaenidae, but mainly at the parasitic end of the mutualism–parasitism
+spectrum. In what is, to our knowledge, the first family-wide test, covering
+`r cnt("model_area_type_total")` species, obligate parasites had smaller ranges
+than facultative associates in every core analysis. Their contrast with
+non-associated species held in all but the most conservative analysis, although
+it was more sensitive to omitting parasitic genera or southern Africa. This
+supports the expectation that parasites, which both depend on ants and exploit
+them, have the smallest ranges (hypothesis 3), although they differed less
+consistently from obligate mutualists. Obligate mutualists were intermediate,
+and the smaller ranges expected from their dependence on compatible ants
+received only weak, model-dependent support (hypothesis 2). Facultative
+associates, expected to benefit from ants without depending on them (hypothesis
+1), had larger ranges than parasites but rarely differed clearly from
+non-associated species. Because they form the majority of ant-associated
+species, coding ant association as present or absent would largely have hidden
+this pattern. Recorded partner breadth covaried positively with range size,
+consistent with the niche-breadth hypothesis (hypothesis 4). Range size thus
+varied with how, rather than whether, species interact with ants.
+
+Although interactions are often assumed to matter less for total range size than
+for individual range boundaries [@paquette2021; @galiana2023], our results show
+that interaction strategy can be associated with total range size. This
+signature accounted for a modest share of variation, with interaction type alone
+explaining
+`r report_number(100 * main_metadata$marginal_r2[main_metadata$measure == "area" & main_metadata$predictors == "type"], 1)`%
+of log~10~ range area and type and recorded breadth together
+`r report_number(100 * main_metadata$marginal_r2[main_metadata$measure == "area" & main_metadata$predictors == "breadth"], 1)`%
+among species with recorded partners (marginal R²; Table S3a). The association
+is consistent with the suggestion that ant associations form an additional
+niche dimension in Lycaenidae [@hausharter2023]. We could not include climatic,
+habitat and plant-diet breadth as covariates, because comparable estimates
+exist mainly for European-centred species, which include few obligate
+associates, and occurrence-derived climatic breadth would partly reflect range
+extent. Whether ant interactions act independently of these dimensions, and
+whether they explain the negative plant-diet relationship within the family,
+therefore remains to be tested.
+
+## Obligate parasites have consistently small ranges
+
+Several features of parasitism could explain why parasites have small ranges. Parasites must
+be accepted by compatible colonies and exploit them [@pierce2002; @fiedler2012],
+and among fleas, more host-specific species have smaller ranges [@krasnov2005].
+In *Lepidochrysops* and *Phengaris* (= *Maculinea*), which include
+`r n_par_genus("Lepidochrysops") + n_par_genus("Phengaris")` of the
+`r cnt("model_area_type_p")` analysed parasites, larvae first feed on plants
+[@pierce2002], so food plants and compatible colonies must coincide. Small
+ranges were not a general feature of carnivory. The
+`r carn_row("coded")$n_carnivore` carnivorous non-parasites, mostly
+hemipteran-feeding Miletinae, did not have smaller ranges than plant feeders,
+although no analysed parasite was coded as a plant feeder, so carnivory cannot
+be fully separated from parasitism (Appendix S6).
+
+Constraints on local occupancy need not, however, produce a small extent of
+occurrence [@gaston2009], as the best-studied parasites show. In European
+*Phengaris*, dependence on particular *Myrmica* species was proposed to explain
+why populations occupy few of the sites where their food plants and *Myrmica*
+ants are abundant [@thomas1989]. Yet Palaearctic *Phengaris* have some of the
+largest parasite ranges in our sample (Appendix S5), consistent with host use
+that varies geographically, combining local specialisation with host sharing and
+switching [@tartally2019].
+
+Part of the parasite signal is geographic. Most analysed parasites occur in
+southern Africa, where many lycaenids, particularly in the Cape, have small
+ranges (Fig. 1D,E). After accounting for interaction type, the spatial model
+also estimated smaller ranges in other regions, including West Africa,
+Mediterranean-type regions, Madagascar and islands (Fig. S5). The parasite
+contrasts shrank substantially under spatial and further under joint adjustment,
+but this need not mean a weaker association, because a range-centre smooth
+compresses each distribution to one location and can absorb part of a genuine
+difference between geographically clustered strategies [@hodges2010].
+Why interaction strategies are
+geographically concentrated merits further research, and climate, ant
+assemblages, habitat and evolutionary history may help explain it
+[@pellissier2012; @piercedankowicz2022a].
+
+Uneven classification and occurrence sampling could also contribute. Outside
+southern Africa, species without an interaction type had smaller ranges than
+classified species, whereas within southern Africa, where most species are
+classified, the two differed less (Appendix S2). Classified facultative and
+non-associated species elsewhere may therefore be biased towards large ranges,
+inflating their contrasts with parasites. Yet among species centred in southern
+Africa, parasites also had smaller ranges than facultative and non-associated
+species (Table S13c), suggesting that the contrast is not only a difference
+between regions or in classification coverage. The facultative–parasite
+difference also held with rarefied, modelled and differently cleaned ranges
+(Fig. 4; Tables S13b, S14a). These checks draw partly on the same public records
+and cannot exclude every sampling bias, but they show that the association does
+not depend on one way of estimating ranges.
+
+Species age offers an alternative explanation. *Lepidochrysops*, with
+`r n_par_genus("Lepidochrysops")` of the `r cnt("model_area_type_p")` analysed
+parasites, diversified rapidly from about 6.5 million years ago, when its
+phyto-predaceous life history probably evolved [@espeland2023]. Older species
+tend to have larger ranges across many plant and animal groups [@alzate2025], so
+if many parasites arose in recent radiations, their small ranges could partly
+reflect their youth instead of ecological constraints of parasitism. Yet small
+ranges were not confined to *Lepidochrysops*. Genus-level comparisons indicate
+that they recur in several parasitic clades (Table S9; Fig. S7), and
+two of the
+three species-level models retained the facultative–parasite contrast without
+*Lepidochrysops* (Table S8). Parsimony on both trees required at least
+`r orig("schar_2018")$changes` origins of parasitism among the analysed species,
+in `r num_word(orig("schar_2018")$n_parasite_subfamilies)` subfamilies
+(Appendix S5), so the association is unlikely to rest on the few transitions
+that can make comparative associations appear strong
+[@maddison2015; @uyeda2018].
+
+These origins offer natural replicates for testing whether ranges
+shrank after parasitism arose, and why, by combining dated transitions with
+species ages, host distributions and colony compatibility. Small present-day
+ranges need not imply faster declines. A regional study found no
+greater long-term occupancy decline in obligately ant-associated lycaenids
+[@engelhardt2025].
+
+## Mutualist contrasts are weaker
+
+Facultative associates rarely differed clearly from non-associated species,
+giving limited support for the range-expanding benefits often reported for
+facultative positive interactions [@stephan2021]. Local benefits of ant
+attendance, such as better larval survival [@forister2010], need not translate
+into larger ranges.
+
+Obligate mutualists had intermediate ranges, compatible with partner dependence
+constraining distributions while mutualistic benefits partly offset it
+[@fowler2022; @stephan2021]. Because mutualists and parasites both depend on
+ants, whereas only parasites exploit them, comparing the two could separate
+dependence from exploitation. Parasites had smaller estimated ranges than
+mutualists in every core analysis, clearly so in `r core_k("m-p")` (Fig. S8).
+In southern Africa, however, where both obligate strategies are concentrated,
+the two did not differ clearly, so it remains open whether small parasite ranges
+reflect exploitation or obligate dependence. The mutualist contrasts were also sensitive to spatial adjustment,
+genus weighting and the choice of phylogeny, and the mutualist–parasite contrast
+lost support under
+`r num_word(sum(si_alternative$decision != "main" & si_alternative$measure == "area" & si_alternative$contrast == "m-p" & si_alternative$p >= 0.05))`
+of the `r num_word(length(setdiff(unique(si_alternative$decision), "main")))`
+alternative codings. Shared habitat or lineage effects could produce the
+intermediate pattern, so we treat the mutualist comparisons as secondary.
+
+## Recorded partner breadth covaries with range size
+
+Niche breadth is among the most consistent correlates of range size, but it is
+usually measured through climate, habitat or diet [@slatyer2013]. Our results,
+like those for trophic interactions in gall-inducing sawflies [@galiana2023],
+suggest that the same pattern holds for the breadth of biotic partners. The
+association held within facultative species and rests mainly
+on them, because recorded partner counts vary little among obligate associates,
+consistent with their much greater partner specificity [@fiedler2001]. A
+log-transformed count fitted range area better than the raw count, suggesting
+smaller proportional increases in range area with each additional recorded genus
+(Appendix S6).
+
+Because the association held in every analysis, including spatial, phylogenetic,
+rarefied-range and modelled-range models (Table S12), it is unlikely to reflect only
+regional ant diversity or research effort, shared ancestry or occurrence
+sampling. Three processes could still produce it. First, using more ant genera
+may let butterflies persist in more places, as increasing use of a widespread
+host plant allowed the lycaenid *Aricia agestis* to expand its range
+[@pateman2012]. Second, wide-ranging species encounter more potential partners
+[@hurtado2024]. Among Lycaeninae, the ant genera associated with most butterfly
+species are largely the most prevalent and widespread [@fiedler2001], so
+widespread facultative species may accumulate partner genera simply by meeting
+more ant assemblages. Third, better-studied butterflies may have more partner
+records and better-recorded ranges. Rarefaction does not standardise partner
+documentation, and claim counts, often repeated across syntheses, cannot measure
+documentation effort. All three predict that few small-ranged species have many
+recorded partner genera (Fig. 3).
+
+Recorded breadth is also an imperfect measure of partner use. Larval attendance
+does not show that an ant is a compatible or necessary partner throughout
+the range, and for parasites a single recorded host genus can hide
+geographically variable host specificity [@tartally2019]. Data on partner-ant
+distributions and standardised field surveys of larval attendance would test
+whether partner availability limits butterfly ranges
+and whether recorded breadth reflects encounter opportunity or biological
+flexibility.
+
+# Conclusions
+
+Lycaenid range size varied with the type of ant interaction. Obligate parasites,
+which arose at least `r orig("schar_2018")$changes` times, had consistently small
+ranges, whereas mutualist contrasts were weaker. Species with more recorded
+partner genera had larger ranges in every analysis. Although geographic
+structure, the concentration of parasites in a few lineages and uneven
+documentation qualify them, these results justify treating ant-interaction
+strategy as a dimension of comparative range-size research, alongside the
+climatic, habitat and resource niches that dominate such work. Testing whether other partner-dependent clades show a
+similar pattern, strongest where interactions become parasitic, would reveal
+how generally the biotic niche is reflected in range size.
+
+# Acknowledgements
+
+We thank Sämi Schär for providing the phylogeny from Schär et al. (2018).
+ChatGPT (OpenAI) and Claude (Anthropic) were used in 2024–2026 to assist with
+writing and revising analysis code and with refining the manuscript text; their
+use in compiling the interaction data is described in the Methods. The authors
+directed this work and take full responsibility for the content.
+
+# Author contributions
+
+O.P. conceived the study. O.P. and A.P. designed the study and the analyses,
+with input from J.W. A.P. supervised the project. O.P. compiled the data,
+performed the analyses and wrote the manuscript. O.P., A.P. and J.W. interpreted
+the results. All authors contributed substantially to revisions of the
+manuscript.
+
+# Data availability
+
+The interaction evidence database, the species-level interaction dataset, source
+metadata and range estimates are included in the accompanying repository. The
+occurrence data are identified by their GBIF download DOI [@gbif2026], and the
+modelled ranges are available from @daru2024. A permanent repository accession
+will be added before publication.
+
+# Code availability
+
+The complete R workflow, manuscript source and instructions for reproducing the
+derived data, models, tables and figures are included in the accompanying
+repository. A permanent repository URL and release identifier will be added
+before publication.
+
+# References
+
+::: {#refs}
+:::
+
+\newpage
+
+# Supporting Information
+
+The Supporting Information gives the details of data compilation and of the
+analyses summarised in the main text. Appendices S1–S6 are each followed by
+their figures and tables, with wide tables on landscape pages. Appendix S7
+collects the sensitivity results (Fig. S8, Table S12) and the targeted
+comparisons cited in the main text and in Appendices S2, S5 and S6 (Tables
+S13–S14).
+
+## Appendix S1. Ant-association data
+
+**Evidence database.** Every interaction claim was recorded as one row of an
+evidence database linking the species as published, the source, the page, table
+or row, the claim (interaction category, ant association, documented
+non-association, carnivory) and, for ant records, the ant taxon and the kind of
+association. The database contains `r report_number(ledger_n("claims"))` claims
+from `r report_number(ledger_n("sources"))` sources for
+`r report_number(ledger_n("species"))` species. Sources were syntheses for Australia [@eastwood1999], southern Africa
+[@heath2003], the Palaearctic [@fiedler2006], ant-parasitic species
+[@fiedler2012] and the family as a whole [@schar2018; @fiedler2021], together
+with the primary studies they cite, regional encyclopaedias and further
+species-level literature. Disagreements between sources were kept in the
+database, and the chosen value and its reasoning were recorded in a decision register.
+
+**Names.** All butterfly names were matched to the GBIF Backbone Taxonomy
+through a synonym database. GBIF keys representing one biological species under
+an older and a modern genus combination were merged into a single species,
+whereas different species that share an epithet, author and year (for example
+*Pentila inconspicua* and *Triclema inconspicua*, which belong to different
+subfamilies) were kept separate. Metalmarks (Riodinidae) that the GBIF Backbone
+lists within Lycaenidae were excluded. The resulting `r cnt("units")` species
+units link evidence to occurrence records. They outnumber the almost 5,400
+described species [@pierce2002; @piercedankowicz2022a] because the GBIF
+Backbone, assembled from many source checklists, still accepts some outdated or
+duplicate names that could not all be identified and merged. The count is
+therefore not an estimate of species richness. Ant names were matched to currently accepted genera.
+
+**Genus classification.** Species identities and names follow the GBIF Backbone,
+which links the interaction data to the occurrence records, but the genus used
+in the models (random effects, subfamily assignment, grafting onto the
+phylogenies) was updated where the Backbone retains outdated combinations. Two
+kinds of change were made. First, genus names treated as junior synonyms or
+subgenera in current classifications were merged with their senior genus:
+*Agrodiaetus* and *Plebicula* with *Polyommatus*, *Lycaeides* with *Plebejus*,
+*Everes* with *Cupido*, the Palaearctic copper segregates (*Helleia*,
+*Palaeochrysophanus*, *Thersamonia*, *Loweia*) with *Lycaena* and other
+Palaearctic cases following @wiemers2018; *Maculinea* with *Phengaris*
+[@fric2007]; *Poecilmitis* and *Oxychaeta* with *Chrysoritis* [@heath1997];
+*Spindasis* with *Cigaritis* [@boyle2015]; Nearctic subgenera of *Callophrys*
+and *Satyrium* following @pelham2008; and *Epamera*, *Argiolaus* and
+*Trichiolaus* with *Iolaus* [@larsen2005]. Second, species placed in a genus to
+which they do not belong were moved to their current genus when this was
+supported by the names used in the modelled range maps [@daru2024] or in the
+published phylogenies [@schar2018; @kawahara2023; @yumnam2025], together with
+regional checklists [@wiemers2018; @pelham2008; @robbins2004; @warren2024boa].
+Examples are American hairstreaks still combined with the Palaearctic genus
+*Thecla*, *Lycaena ortygia* (= *Lepidochrysops ortygia*), *Lycaena arionides*
+and *Glaucopsyche alcon* (= *Phengaris*), *Thestor callimachus* (= *Tomares
+callimachus*, a Palaearctic theclinine previously assigned to the African
+parasitic genus *Thestor*) and *Lepidochrysops ariadne* and *Euchrysops niobe*
+(= *Orachrysops*). Genera that current phylogenies continue to recognise (for
+example *Lysandra*, *Kretania*, *Agriades* and *Tharsalea*) were kept. The
+revision changed the genus of `r cnt("model_genus_revised")` analysed species
+and no interaction type; each change, its evidence and its source are listed in
+the genus revision table of the repository.
+
+**Interaction type.** Facultative associates are attended by ants but can
+complete development without them, whereas obligate associates depend on ants.
+Obligate associates were divided by the source of larval food. A species was
+classified as an obligate parasite when its larvae develop on food obtained from
+ants, by preying on ant brood or eggs or by being fed by ants in place of plant
+food. It was classified as an obligate mutualist when its larvae feed on plants
+or other non-ant food, such as algae, while attended by ants, even if ants
+occasionally regurgitate food to them. Larvae that prey on ant-tended
+hemipterans, such as aphids and scale insects, also obtain their own food and
+were not classified as parasites. When sources disagreed, we used the type
+recorded by more independent sources; ties went to direct observations of the
+species over reviews and compilations, and then to the more recent source.
+Inferences from relatives were used only for species without direct evidence.
+For this reason,
+*Axiocerses harpax* and two *Crudaria* species, which @schar2018 treated as
+mutualists, were classified as parasites, because their larvae were observed
+feeding on ant-derived food in ant runs (*A. harpax*) or shown not to eat plants
+(*Crudaria*; Table S11). Scores that their authors marked as doubtful, records
+of no ant association in @schar2018 and parasite records resting only on ants
+regurgitating food to larvae were used only when a species had no other
+evidence.
+
+**Evidence criteria for the analysis.** We analysed interaction types that a
+source stated for the species, based on observations or on the source's own
+assessment of the species, or for the whole genus (for example, that all species of a genus are parasites). Types
+that could only be inferred from relatives by our own rules were not used. For
+obligate species, the mutualist or parasite subtype also needed evidence on
+larval food, with the same standard for both subtypes. This evidence was a
+source classifying the species as mutualistic or parasitic from its biology, a
+larval feeding category (herbivorous or entomophagous) in @heath2003, or an
+explicit genus statement, such as that older larvae of *Thestor* feed on ant
+brood or that *Orachrysops* larvae are not parasites of ants [@fiedler2012].
+Obligate species whose subtype had merely been assumed (for example, "mutualist,
+because no parasitism has been recorded"), or whose genus statement established
+only obligate association, were left unclassified. Most of them were southern
+African Aphnaeinae such as *Aloeides*, whose larvae live in ant nests and whose
+genus includes both herbivorous species and a documented egg predator (*A.
+pallida*).
+
+For `r subtype_indirect("p")` of the `r cnt("model_area_type_p")` analysed
+parasites (mainly *Lepidochrysops* and *Thestor*) and
+`r subtype_indirect("m")` of the `r cnt("model_area_type_m")` mutualists, the
+subtype did not come from a species-level classification in the source that
+documented the obligate association. For
+`r subtype_indirect("p") - subtype_added("p")` of these parasites and
+`r num_word(subtype_indirect("m") - subtype_added("m"))` mutualists, both the
+association and the subtype rested on a genus statement or a source's inference
+from relatives. For the other `r num_word(subtype_added("p"))` parasites and
+`r subtype_added("m")` mutualists, the obligate association was documented for
+the species, but the subtype came from separate evidence on larval food or from
+a genus statement, so Table S1 counts them as species-specific. Appendix S6
+reports the models without all of these species, and Table S1 gives the
+evidence basis of the analysed types.
+
+**Ant-partner breadth.** Breadth was the number of ant genera recorded
+attending, visiting or hosting the larvae or pupae of a species, or tending the
+hemipterans on which its larvae feed. We excluded
+records that sources marked as doubtful, ants attacking larvae and other
+aberrant associations, co-occurrence only, laboratory-only records, visits to
+adults or eggs, and ants identified only to subfamily. We counted genera
+because many sources do not identify ants to species [@fiedler2012]. For
+parasites, a recorded genus need not be one in whose nests the larva can
+complete development, so breadth measures documented association, which can
+exceed the range of hosts that support development. Old *Paratrechina* records
+that cannot be assigned to *Paratrechina* or *Nylanderia* formed one count
+group alongside resolved records of either genus, so counts approximate the
+number of present-day genera; merging all three into one group gave a similar
+association (Appendix S6). In Table 19 of @fiedler1991, a question mark before
+an ant species epithet marks an uncertain species identification within a known
+genus, and these records were kept, whereas a question mark after the epithet
+can mark a doubtful record, and these were excluded. A source correction
+register in the repository lists these exclusions and the attack record for
+*Ogyris genoveva* and, where an excluded record's genus was still counted, the
+other records that support it. The reported breadth models use the corrected counts, and the
+corrections left interaction types and range estimates unchanged.
+
+**Use of AI tools.** The interaction data were first compiled manually by the
+first author. The rebuilt dataset was then extended with the help of ChatGPT
+(OpenAI) and Claude (Anthropic) in 2024–2026, which helped to locate, extract
+and cross-check literature records and to take some coding decisions under the
+first author's direction. The decision register records whether each decision was
+taken by the first author or with AI assistance, and the database links each
+retained claim to its source location. Not every extraction was independently
+checked a second time. Of the `r report_number(legacy$shared)` species
+entries of the manual compilation that had one of the four interaction types in
+both compilations, `r report_number(legacy$agree)`
+(`r report_number(100 * legacy$share, 0)`%) received the same type in the
+rebuilt dataset (Cohen's kappa `r report_number(legacy$kappa, 2)`). The two
+compilations draw largely on the same syntheses, and the rebuild was
+cross-checked against the earlier coding, so this agreement measures the consistency
+of coding.
+
+**Table S1.** Evidence basis of the interaction types of the species in the main
+models. Species-specific source evidence includes both observations and
+statements in compilations, so not every entry is an independent field
+observation. Species without interaction evidence were left unclassified.
+
+```{r table-s1-evidence}
+ev <- si_evidence[, c("evidence", intersect(c("n", "f", "m", "p"), names(si_evidence)), "total")]
+# rows from the most to the least direct evidence; the middle category is the source's own inference from
+# relatives for the named species (interaction_type_basis 'presumed_relatives', not genus-level; s06_summarise_results, Supporting Information tables)
+ev_labels <- c(`Species-specific source evidence` = "Species-specific source evidence",
+  `Stated for the species in a source (no direct observation)` =
+    "Presumed for the species in a source (the source's inference from relatives; no direct observation)",
+  `Genus-wide presumption stated in a source` = "Genus-wide presumption stated in a source")
+stopifnot(setequal(ev$evidence, names(ev_labels)))
+ev <- ev[match(names(ev_labels), ev$evidence), ]
+ev$evidence <- unname(ev_labels[ev$evidence])
+names(ev) <- c("Evidence", "Non-associated", "Facultative", "Mutualist", "Parasite", "Total")[seq_len(ncol(ev))]
+report_table(ev, row.names = FALSE)
+```
+
+## Appendix S2. Occurrence data and range estimates
+
+**Download and names.** We used all Lycaenidae records with coordinates in a
+GBIF download from October 2026 [@gbif2026]
+(`r report_number(rec("all_records_with_coordinates"))` records), interpreted
+with the GBIF Backbone Taxonomy so that names matched the interaction data.
+Records of subspecies were assigned to their species. Records that GBIF had
+resolved only above species rank were assigned to a species when their verbatim
+name exactly matched an accepted species or a reviewed synonym; no fuzzy
+matching was used.
+
+**Record filters.** Fossil and living-specimen records, records explicitly
+described as introduced, records dated before 1900, records with more than 1,000
+individuals and records with coordinate uncertainty above 25 km were excluded;
+records without stated uncertainty were retained if both coordinates had at
+least two decimal places. *CoordinateCleaner* [@zizka2019] flagged zero and
+equal coordinates, country and province centroids, biodiversity institutions,
+the GBIF headquarters, records at sea (with a 10-km coastal buffer) and records
+near capital cities (within 1 km, or within 10 km when imprecise). After these
+filters `r report_number(rec("base_main"))` records remained.
+
+**Native region and introductions.** Country checklists of @pinkert2022 were
+mapped onto GADM country boundaries and RESOLVE biogeographic realms
+[@dinerstein2017]. For species whose records broadly agreed with their checklist
+(at least 80% of occupied 25-km cells within 300 km of listed countries),
+records more than 300 km from the listed countries were removed. For species
+without a reliable checklist, realms holding at least 10% of a species' cells or
+at least two cell–dataset incidences were taken as native, and records more than
+300 km from them were removed. A cell–dataset incidence counts each dataset once
+per occupied cell, so a single dataset recorded in two cells of a realm
+scores two. Nine documented introductions and four cases in which GBIF names
+combine different species concepts on different continents were removed with
+explicit geographic rules, each supported by a cited source
+(`r report_number(rec("introduced_removed"))` records).
+
+**Geographic outliers.** Remaining localities were thinned to one per 25-km cell
+and grouped by single-linkage clustering of great-circle distances. A group was
+removed if it contained at most 10% of the species' localities (or two
+localities, whichever was larger) and was separated
+from the remaining localities by a gap exceeding both 200 km and one-quarter of
+their maximum great-circle extent. The rule was applied iteratively and never
+reduced a species below five localities. We chose this stringent treatment
+after an exploratory comparison with expert range polygons. The intermediate
+treatment used gaps of 250 km and half the remaining extent,
+retained groups supported by multiple datasets and had a more permissive
+native-region rule. An inclusive treatment retained flagged geographic outliers.
+All three were evaluated in identical-species as well as eligible-species models
+(Table S14a), keeping interaction coding fixed. The facultative–parasite area
+contrast persisted; mutualist–parasite contrasts were less consistent. The final
+stringent dataset contained `r report_number(rec("final_strict_plus"))` records.
+
+**Thinning and range measures.** Species spanning more than 250 km were thinned
+to one record per approximately 50-km Equal Earth cell, all species were thinned
+to a 10-km minimum great-circle distance, and minimum-convex-polygon vertices
+were restored, so that thinning removed redundant interior records without
+changing the range boundary. Latitudinal extent is the north–south distance (km)
+between the northernmost and southernmost localities. Longitudinal extent is the
+occupied east–west span: longitudes are treated as a circle, so that ranges
+crossing the 180° meridian are not split, the span is 360° minus the largest
+longitude gap without localities, and it is converted to kilometres along the
+parallel midway between the latitudinal limits. Area is
+the planar MCP in a species-specific cylindrical equal-area projection whose
+seam lies in the largest empty longitude gap, so that ranges crossing the
+antimeridian are continuous. Species with fewer than ten unique localities, the
+threshold at which the cleaning protocol flags a range estimate as data-poor,
+were not analysed (Table S2). Fig. 2 shows the range sizes of all analysed
+species by interaction type.
+
+**Validation.** For the `r report_number(si_expert$n)`
+European-centred species with expert range polygons [@hausharter2023], log~10~
+MCP area correlated closely with expert polygon area (r =
+`r report_number(si_expert$pearson_log10, 2)`; Fig. S1). MCP areas were on
+average `r report_number(si_expert$geometric_ratio, 2)` times the expert areas,
+as expected because convex hulls include unoccupied ground. On these species,
+the stringent cleaning matched the expert polygons slightly better than the
+other treatments (Table S14b), but the same species guided the choice of
+cleaning, so this is not an independent validation. The stringent outlier rule
+can also remove plausibly genuine disjunct populations: of the
+`r report_number(og_strict$groups)` record groups that only this rule removed,
+`r report_number(og_strict_in)` had centroids within 100 km of the expert
+polygon.
+
+**Stability of range estimates.** To measure how much each range estimate
+depends on its particular records, we followed @gupta2020, who treated an
+estimate as complete when the last 20% of records added less than 10% to it. We
+drew 1,000 random subsamples of 80% of each species' thinned localities and
+divided their mean range estimate by the full estimate. Because removing
+records can only shrink a convex hull or an extent, this ratio is at most one.
+Estimates with ratios above 0.9, which meet this criterion, were treated as
+stable, and a looser threshold of 0.8 and a stricter one of 0.95 bracket it
+(Fig. S2; Appendix S6).
+
+**Classification coverage.** Interaction types are known for a larger share of
+species in southern Africa, where most parasites occur, than elsewhere, and this
+could bias the comparison with parasites. Outside southern Africa (defined by
+range centre; Appendix S5),
+`r report_number(100 * cov_row("elsewhere")$share_classified, 0)`% of species
+with a range estimate had an analysed interaction type, and their geometric
+mean range area was
+`r report_number(signif(cov_row("elsewhere")$gm_area_classified, 2))` km²,
+against `r report_number(signif(cov_row("elsewhere")$gm_area_unclassified, 2))`
+km² for unclassified species. In southern Africa, which holds
+`r cov_row("southern_Africa")$parasites` of the `r cnt("model_area_type_p")`
+analysed parasites,
+`r report_number(100 * cov_row("southern_Africa")$share_classified, 0)`% were
+classified, and classified and unclassified species had more similar ranges
+(`r report_number(signif(cov_row("southern_Africa")$gm_area_classified, 2))`
+and `r report_number(signif(cov_row("southern_Africa")$gm_area_unclassified, 2))`
+km²). Most facultative and non-associated species occur outside southern
+Africa, so as a group they may be biased towards wide-ranging species, which
+would inflate their contrasts with parasites. The comparison within southern
+Africa, where most species are classified, tests this (Table S13c; Appendix
+S5).
+
+**Modelled ranges.** As an alternative method of range estimation, we repeated
+the taxonomic models with the native range maps of @daru2024, estimated through
+species distribution modelling with occurrence-derived alpha hulls and
+environmental and habitat information. These maps relax our cleaning and
+locality requirements and include poorly recorded species
+(`r report_number(daru_parasites)` parasites, against
+`r cnt("model_area_type_p")` with occurrence-based ranges; Table S2). They draw
+on the same public occurrence sources, so they test the method of range
+estimation on largely the same records.
+
+**Table S2.** Species with an interaction type that met the evidence criteria,
+with a range estimate from at least ten unique localities, in the main type and
+breadth models, and with a modelled range [@daru2024], by interaction type.
+
+```{r table-s2-attrition}
+att <- si_attrition
+att$interaction_type <- c(n = "Non-associated", f = "Facultative", m = "Mutualist", p = "Parasite")[att$interaction_type]
+names(att) <- c("Interaction type", "Classified", "Range (≥ 10 localities)", "Type model", "Breadth model", "Modelled range")
+report_table(att, row.names = FALSE)
+```
+
+```{r figure-s1, out.width=if (knitr::is_html_output()) '60%' else '3.9in'}
+report_figure("plot_expert_validation")
+```
+
+**Figure S1.** Occurrence-based minimum-convex-polygon area against expert
+range-polygon area for `r report_number(si_expert$n)` European-centred species
+[@hausharter2023], on logarithmic axes. The grey line is one-to-one, and the blue
+line and band are a least-squares fit and its 95% confidence band.
+
+```{r figure-s2}
+report_figure("plot_accumulation_example")
+```
+
+**Figure S2.** Range-size accumulation curves for *Celastrina argiolus*: A,
+latitudinal extent; B, longitudinal extent; C, range area. Each of 1,000 random
+permutations of the species' thinned localities was accumulated in steps of 50
+localities; black lines show means and grey ribbons one standard deviation.
+Longitudinal extent is the occupied circular span converted to east–west
+distance at the midpoint latitude of the full range, and area is the planar MCP
+in the species-specific cylindrical equal-area projection of the full set of
+localities. Because the seam, reference latitude and projection stay fixed, the
+curves cannot decline as localities are added. The range-stability criterion
+(Appendix S2) compares the mean of 80% subsamples with the full estimate.
+
+## Appendix S3. Main taxonomic mixed models
+
+The main taxonomic mixed models are summarised in Table 1 and Fig. 2 of the
+main text. Table S3a gives their fit and the tests of interaction type and
+partner breadth, Table S3b their variance components, Table S3c a comparison
+with Box–Cox-transformed responses, Table S4 the back-transformed estimated
+marginal means and Table S5 the pairwise contrasts in the models with partner
+breadth (those of the type models are in Table 1).
+
+```{r table-main}
+main_tables <- publication_log_model_sections(main_models, main, main_means, main_metadata)
+```
+
+**Table S3a.** Model fit and hypothesis tests for interaction type and
+ant-partner breadth as predictors of log~10~ geographic range size. Mixed models
+include genus nested within subfamily as random effects; sample sizes are given
+in the model labels. Area is the primary response; Lat and Lon are latitudinal
+and longitudinal extent. R²m and R²c are marginal and conditional R². Breadth
+ratio is the multiplicative change in expected range per additional recorded ant
+genus, with 95% confidence interval. P-values smaller than 0.05 are bold.
+
+```{r table-s3-fit}
+report_table(main_tables$fit,
+  align = c("l", "l", rep("r", ncol(main_tables$fit) - 2L)),
+  escape = FALSE, row.names = FALSE
+)
+```
+
+**Table S3b.** Variance components of the primary taxonomic models on the log~10~
+response scale. Subfamily and genus are random-intercept variances; residual is
+the residual variance. Singularity indicates a boundary variance estimate. All
+models contain `r num_word(meta_one("subfamilies"))` subfamilies; the type
+models contain `r meta_one("genera", "type")` genera and the breadth models
+`r meta_one("genera", "breadth")`.
+
+```{r table-s3b-variance}
+v3 <- main_metadata
+v3 <- v3[order(match(v3$measure, c("area", "lat", "lon")), match(v3$predictors, c("type", "breadth"))), ]
+report_table(data.frame(
+  Model = ifelse(v3$predictors == "type", "Type", "Type + breadth"),
+  Metric = c(area = "Area", lat = "Lat", lon = "Lon")[v3$measure], N = v3$n,
+  Subfamily = sprintf("%.3f", v3$subfamily_variance), Genus = sprintf("%.3f", v3$genus_variance),
+  Residual = sprintf("%.3f", v3$residual_variance), Singular = ifelse(v3$singular, "Yes", "No"),
+  check.names = FALSE
+), row.names = FALSE)
+```
+
+**Response transformation.** To check whether the results depend on the
+log~10~ transformation, we refitted the main models with Box–Cox-transformed
+responses [@box1964]: the three type-only mixed models, the range-area mixed
+model with breadth and the two range-area joint models on the Yumnam tree, each
+with the same species, predictors and covariance structure. Each power was
+chosen by maximising the likelihood of the full-sample mixed model, including
+the Jacobian of the transformation: `r bc_power_text("area_type")`,
+`r bc_power_text("lat_type")` and `r bc_power_text("lon_type")` for area,
+latitudinal and longitudinal extent in the type-only models and
+`r bc_power_text("area_breadth")` for area with breadth. The joint models used
+the corresponding area powers. The transformation was
+$[(y/g)^\lambda-1]/\lambda$, where $g$ is the geometric mean of the sample.
+Box–Cox effects are not constant ratios, so we report ratios of back-transformed
+predictions, which depend on the reference prediction, with delta-method
+intervals that treat the power as known. Type contrasts kept the Tukey
+adjustment, and breadth tests apply to the coefficient on the transformed scale.
+
+**Table S3c.** Range-size ratios under log~10~ and Box–Cox transformation of
+the response. LMM: taxonomic mixed model; Joint: phylogenetic spatial GAM on the
+Yumnam tree; N in brackets. Each cell gives the ratio (95% interval) and p.
+Contrasts in the breadth models are evaluated at one recorded ant genus, and
+joint-model predictions set the spatial and phylogenetic effects to zero. Ant
+genus compares one with two recorded genera in facultative species. Box–Cox
+intervals are approximate and can disagree with the test when p is close to
+0.05. n: non-associated; f: facultative; m: mutualist; p: parasite. P-values
+below 0.05 are bold.
+
+::: {.allow-page-break}
+```{r table-s3c-boxcox}
+bc3 <- boxcox_comparison
+stopifnot(nrow(bc3) == 29L,
+          !anyDuplicated(bc3[c("model", "measure", "predictors", "contrast")]))
+# show non-associated / facultative as f / n, as in Table 1 and Table S12: reciprocal ratios with
+# swapped bounds; p-values unchanged
+bc_flip <- bc3$contrast == "n - f"
+stopifnot(sum(bc_flip) == 4L)
+for (s in c("log", "boxcox")) {
+  r <- paste0(s, "_ratio"); lo <- paste0(s, "_lower"); up <- paste0(s, "_upper")
+  old_lo <- bc3[[lo]][bc_flip]
+  bc3[[r]][bc_flip] <- 1 / bc3[[r]][bc_flip]
+  bc3[[lo]][bc_flip] <- 1 / bc3[[up]][bc_flip]
+  bc3[[up]][bc_flip] <- 1 / old_lo
+}
+bc3$contrast[bc_flip] <- "f - n"
+bc_cell <- function(ratio, lower, upper, p) {
+  sprintf("%.2f (%.2f–%.2f) %s", ratio, lower, upper, format_table_p(p))
+}
+model_label <- paste0(
+  ifelse(bc3$model == "lmm", "LMM", "Joint"),
+  ifelse(bc3$predictors == "type", ": type", ": breadth"),
+  " (", bc3$n, ")"
+)
+metric_label <- unname(c(area = "Area", lat = "Lat", lon = "Lon")[bc3$measure])
+group <- paste(model_label, metric_label)
+first <- !duplicated(group)
+report_table(data.frame(
+  `Model (N)` = ifelse(first, model_label, ""),
+  Metric = ifelse(first, metric_label, ""),
+  Effect = ifelse(bc3$contrast == "breadth", "Ant genus",
+                  gsub(" - ", " / ", bc3$contrast, fixed = TRUE)),
+  `Log10 ratio (95% CI); p` = bc_cell(bc3$log_ratio, bc3$log_lower,
+                                  bc3$log_upper, bc3$log_p),
+  `Box–Cox ratio (95% CI); p` = bc_cell(bc3$boxcox_ratio, bc3$boxcox_lower,
+                                    bc3$boxcox_upper, bc3$boxcox_p),
+  check.names = FALSE
+), align = c("l", "l", "l", "r", "r"), escape = FALSE, row.names = FALSE)
+```
+:::
+
+The main results held under Box–Cox. The facultative–parasite contrast and the
+breadth association remained supported, including in the joint models, and
+`r bc_same_side()` of the `r nrow(bc_lmm_type)` contrasts of the type-only mixed models stayed on the
+same side of p = 0.05. The exception was the area facultative–mutualist
+contrast (`r fmt_p(bc_row("f-m")$log_p)` under log~10~ and `r fmt_p(bc_row("f-m")$boxcox_p)` under
+Box–Cox). The area mutualist–parasite contrast of the type-only model remained
+supported (Box–Cox ratio `r report_number(bc_row("m-p")$boxcox_ratio, 2)`, 95% CI
+`r sprintf("%.2f–%.2f", bc_row("m-p")$boxcox_lower, bc_row("m-p")$boxcox_upper)`). Box–Cox made the residuals of the
+taxonomic models nearly symmetric, but those of the joint models were still
+skewed and heavy-tailed, and a transformation does not address spatial
+dependence. We kept log~10~ as the primary transformation because it gives
+constant, directly interpretable range ratios, and fixed-effect estimates of
+mixed models are generally unbiased, although less precise, when distributional
+assumptions are violated [@schielzeth2020].
+
+**Table S4.** Back-transformed estimated marginal means and 95% confidence
+intervals for the models in Table S3a. Area is in millions of km²; latitude and
+longitude are in km. Breadth-model means are evaluated at one recorded ant
+genus.
+
+```{r table-s4-estimates}
+report_table(main_tables$estimates,
+  align = c("l", "l", rep("r", ncol(main_tables$estimates) - 2L)),
+  escape = FALSE, row.names = FALSE
+)
+```
+
+```{r table-pairwise}
+main_contrast_table <- publication_log_contrast_table(contrasts)
+```
+
+**Table S5.** Pairwise differences between the estimated range sizes of the
+three ant-associated types in the models with partner breadth; the contrasts of
+the type models are given in Table 1. Ratios greater than one indicate that the
+first category has the larger expected range. f: facultatively associated; m:
+obligately mutualistic; p: obligately parasitic. Confidence intervals and
+p-values are Tukey-adjusted across the three contrasts in each breadth model.
+P-values smaller than 0.05 are bold.
+
+```{r table-s5-pairwise}
+s5 <- main_contrast_table[main_contrast_table$Model == "Type + breadth", setdiff(names(main_contrast_table), "Model")]
+stopifnot(nrow(s5) == 9L)
+report_table(s5, align = c("l", "l", "r", "r"), escape = FALSE, row.names = FALSE)
+```
+
+
+**Model diagnostics and inference.** No main taxonomic model was singular
+(Table S3b), and Fig. S3 shows the spread and tails of the residuals. Type
+contrasts used Kenward–Roger degrees of freedom (*emmeans* and *pbkrtest*;
+@lenth2026; @halekoh2014), and omnibus and breadth tests in the mixed models
+used Satterthwaite degrees of freedom. In the spatial models, type contrasts
+used normal approximations and breadth tests the GAM summary. PGLS intervals
+treat the fitted lambda and the tree as known, so they include no uncertainty
+in graft placement or phylogeny. Heavy residual tails and the spatial
+autocorrelation of the taxonomic residuals (Table S6) make nominal intervals and
+p-values approximate, which is why we compared estimates across covariance
+structures (Table S12) and response transformations (Table S3c).
+
+```{r figure-s3-diagnostics}
+report_figure("plot_model_diagnostics")
+```
+
+**Figure S3.** Residual diagnostics of the range-area models. Rows, from top:
+taxonomic and spherical spatial type models, then taxonomic and spherical
+spatial breadth models. Left: normal quantile–quantile plots; right: residuals
+against fitted log~10~ area, with a smoothed trend. Spatial dependence is shown
+in Table S6.
+
+## Appendix S4. Geographic analyses
+
+**Spatial patterns.** Fig. S4 maps, in 500-km equal-area cells, the number of
+recorded species and the proportions of them with an interaction type and with
+a range estimate. Small ranges and parasites are both concentrated in the
+south-western Cape (Fig. 1D,E), so interaction-type differences could partly
+reflect geography, which the spatial models address. Classification is least
+complete, and species counts most variable, in the tropical Americas and
+central Africa (Fig. S4A,B), so the proportion maps of Fig. 1 mask cells with
+fewer than ten classified species.
+
+**Spherical GAM.** Each species was represented by the spherical centroid of its
+occupied 200-km Equal Earth cells, or by a spherical medoid when opposite parts
+of a very broad distribution made the centroid unstable. Centres and the
+butterfly background were computed from the records of the intermediate
+cleaning, whereas range measures and maps used the stringent cleaning. Models
+contained interaction type (or type and partner breadth), a spline on the
+sphere of latitude and longitude (basis dimension 160) and random-effect smooths
+for subfamily and genus, fitted by REML with *mgcv* [@wood2025]. These models
+estimate differences among interaction types at a given location. Because a
+spatial smooth can also absorb part of a genuine difference between
+geographically clustered categories [@hodges2010], they may understate these
+differences. The fitted spatial surface (Fig. S5) shows larger expected ranges at high northern latitudes and in continental
+interiors, and smaller ranges in the Cape and on the south-eastern coast of
+southern Africa, in West Africa, Mediterranean-type regions, temperate South
+America, Madagascar and on islands.
+
+**Regional butterfly background.** We also asked whether a species' range is
+small relative to the butterflies living in the same regions.
+For each 500-km Equal Earth cell occupied by a species, we averaged the log~10~
+modelled range areas [@daru2024] of all butterfly species of every family in
+that cell, excluding the species' own genus and requiring at least five
+comparison species, and averaged these cell values with equal weight over the
+species' occupied cells (Fig. S6). This background entered the mixed models as
+a centred covariate. We used butterflies of all families as comparators because
+co-occurring lycaenids share the trait under test: the co-occurring lycaenids
+of a parasite were on average `r cont("p")`% obligate mutualists or parasites,
+compared with `r cont("f")`% for a facultative species and `r cont("n")`% for a
+non-associated species, so a lycaenid background would partly adjust for
+interaction type itself. Relative to this background, facultative associates had
+`r ratio("background_500km_butterflies", "f-p")` times and non-associated
+species `r ratio("background_500km_butterflies", "n-p")` times the range area of
+parasites (Table S12). The background can itself share geographic structure with
+interaction types, and its residuals remained spatially autocorrelated, so we
+treat it as a descriptive check with less weight than the spherical GAM.
+
+**Residual spatial autocorrelation.** We measured Moran's I of model residuals
+among species whose range centres lay within 500 km or 1,000 km of each other
+(Table S6). Residuals of the taxonomic mixed models were positively
+autocorrelated (Moran's I = `r mor("lmm", 500)` within 500 km), as were those
+of the models with the butterfly background, so their intervals are probably
+too narrow. The spherical GAM removed this positive autocorrelation and left
+weak negative autocorrelation (Moran's I = `r mor("spherical_gam", 500)`).
+
+```{r figure-s4}
+report_figure("plot_richness_range_maps")
+```
+
+**Figure S4.** Sampling and data coverage in 500-km equal-area cells (Equal Earth
+projection). A: number of Lycaenidae species recorded in each cell (logarithmic
+colour scale); B: proportion of these species with an interaction
+classification; C: proportion with a range estimate from at least ten unique
+localities (colour scale truncated at 0.5, so the few cells below 0.5 take the
+lightest colour). As in Fig. 1, each species, including those without a range
+estimate, is counted once per cell from its stringently cleaned records, and
+grey land has no value. Mean recorded ant-partner breadth is mapped in Fig. 1F.
+
+```{r figure-s5}
+report_figure("plot_gam_spatial_effect")
+```
+
+**Figure S5.** Partial spatial effect of the spherical GAM for range area (type
+model), evaluated at the centres of 500-km equal-area cells occupied by at least
+three species with a range estimate. Blue cells are associated with larger and
+red cells with smaller expected range area than average, given interaction type
+and taxonomy; values are on the log~10~ scale, where ±0.3 is about a twofold
+difference. The map shows a partial model term, not observed range size; grey
+land has no estimate.
+
+```{r figure-s6, out.width=if (knitr::is_html_output()) "100%" else "6.0in"}
+report_figure("plot_regional_background")
+```
+
+**Figure S6.** The regional butterfly background on the 500-km Equal Earth grid.
+A: geometric-mean modelled range area of all butterfly species [@daru2024] in
+each cell with at least five species; B: number of butterfly species per cell
+(Lycaenidae richness is shown in Fig. S4A). A species' background is the mean,
+over its occupied cells, of these cell values recalculated without its own
+genus. Cells
+are clipped to land and not shown south of 60° S; grey land has no value.
+
+**Table S6.** Residual spatial autocorrelation in the range-area type models:
+Moran's I of residuals among species whose range centres lie within 500 km (and
+1,000 km for the full-sample models), with binary distance weights. The expected
+value under no autocorrelation is close to zero (−1/(N − 1)). For the
+phylogenetic models (Appendix S5), Moran's I was computed at 500 km only and
+without a test (–); raw PGLS residuals retain the phylogenetic covariance,
+whereas normalised residuals have it removed. P-values smaller than 0.05 are
+bold.
+
+```{r table-s6-moran}
+m1 <- data.frame(
+  Model = c(
+    lmm = "Taxonomic mixed model (main)", background_500km_butterflies = "Mixed model + butterfly regional background",
+    spherical_gam = "Spherical spatial GAM"
+  )[moran$model],
+  `Distance (km)` = moran$distance_km, N = moran$n, `Moran's I` = sprintf("%.3f", moran$moran_i),
+  p = format_table_p(moran$p), check.names = FALSE
+)
+pm <- pg_moran[pg_moran$measure == "area", ]
+pm_models <- c(
+  pgls_raw_residuals = "PGLS, raw residuals", pgls_normalised_residuals = "PGLS, normalised residuals",
+  pgls_background_normalised_residuals = "PGLS + butterfly background, normalised residuals",
+  phylo_spatial_gam = "Phylogenetic spatial GAM"
+)
+pm <- pm[pm$model %in% names(pm_models), ]
+pm <- pm[order(match(pm$model, names(pm_models)), match(pm$study, c("yumnam_2025", "schar_2018"))), ]
+m2 <- data.frame(
+  Model = paste0(
+    pm_models[pm$model], " (",
+    c(yumnam_2025 = "Yumnam", schar_2018 = "Schär")[pm$study], ")"
+  ),
+  `Distance (km)` = 500, N = pm$n, `Moran's I` = sprintf("%.3f", pm$moran_500), p = "–", check.names = FALSE
+)
+report_table(rbind(m1, m2), escape = FALSE, row.names = FALSE)
+```
+
+## Appendix S5. Phylogenetic analyses
+
+**Trees and matching.** We used two published phylogenies as alternative
+hypotheses: the time-calibrated Lycaenidae phylogeny of @yumnam2025, used for
+the main phylogenetic analyses, and the COI topology of @schar2018. Yumnam
+branch lengths were used as published; Schär's substitution lengths, which
+measure sequence divergence rather than time, were replaced by Grafen branch
+lengths [@grafen1989] on the pruned topology before grafting. We did not analyse
+the dated butterfly phylogeny of @kawahara2023 separately: Yumnam and
+Kodandaramaiah used it as a constrained backbone, so these would share backbone
+information. Species were matched to tips by identical names or unambiguous GBIF
+accepted keys; fuzzy and ambiguous matches were excluded. Figure S7 shows the
+interaction types and range areas of the matched species on the Yumnam tree;
+parasitism occurs in several separate clades.
+
+**Grafting.** Only `r pgc("matched")` of the `r pgc("analysed")` analysed
+species matched a tip of the Yumnam tree (`r pgc("matched", "schar_2018")` for
+Schär), and the matched species included only
+`r report_number(pg("n_parasite", tree_set = "matched"))` of the
+`r cnt("model_area_type_p")` parasites; tree coverage is biased towards
+well-studied lineages, so PGLS on matched species alone would test a smaller and
+unrepresentative sample. We therefore grafted each analysed species missing from
+a tree onto its genus. A species whose genus was represented by two or more tips
+was attached to the most recent common ancestor of its congeners, forming a
+polytomy at the genus node; a species with a single congener on the tree became
+its sister, splitting that tip's branch at its midpoint. New branches kept the
+trees ultrametric, and species of genera absent from a tree were omitted.
+Grafting places species by taxonomy alone. It adds no sequence or
+divergence-time information, leaves relationships among grafted congeners
+unresolved and assumes that genera are monophyletic; where a genus is not, the
+species was attached to the smallest clade containing all its congeners.
+Grafting added `r pgc("grafted")` species to the Yumnam tree (`r pgc("on_tree")`
+species on the tree) and `r pgc("grafted", "schar_2018")` to the Schär tree
+(`r pgc("on_tree", "schar_2018")`).
+
+**Species-level PGLS.** PGLS models had the same fixed effects as the mixed
+models and estimated Pagel's lambda over 0–1 by profiling the likelihood
+[@pagel1999] (Table S7). On the alternative Schär tree, the parasite contrasts
+and the breadth association were supported as on the Yumnam tree, with larger
+contrasts (facultative / parasite range area
+`r effi("pgls_grafted_schar_2018", "f-p")`; Table S12).
+
+**Influence of individual parasitic genera.** Parasites were concentrated in a
+few genera, and *Lepidochrysops* and *Thestor* alone contributed
+`r n_par_genus("Lepidochrysops") + n_par_genus("Thestor")` of the
+`r cnt("model_area_type_p")` analysed parasites. We therefore refitted the
+species-level range-area models after omitting each parasitic genus with at
+least three analysed parasites
+(`r paste0("*", logo_single, "*", collapse = ", ")`), one at a time (Table S8).
+In the mixed model and in PGLS on the Schär tree, the
+facultative–parasite and non-associated–parasite contrasts remained supported in
+every refit. On the Yumnam tree, both remained supported when any genus other
+than *Lepidochrysops* was omitted, but not without *Lepidochrysops*, whose
+species make up nearly half of the parasites. All but
+`r num_word(n_matched_genus("Lepidochrysops", "yumnam_2025"))` of its
+`r n_par_genus("Lepidochrysops")` analysed species (all but
+`r num_word(n_matched_genus("Lepidochrysops", "schar_2018"))` on the Schär tree)
+were grafted, so their relationships within the genus were not resolved. The
+mutualist–parasite contrast was the least robust: it was not supported in any of
+the three models without *Lepidochrysops*, and in the mixed model it lost
+support when `r num_word(n_mp_lost)` of the `r num_word(length(logo_single))`
+genera were omitted individually. Omitting *Phengaris*, whose species include
+the `r num_word(n_top_p("Phengaris"))` largest-ranged analysed parasites, raised
+the estimated facultative–parasite and non-associated–parasite ratios in all
+three models (Table S8).
+
+**Genus-level PGLS.** Species-level PGLS gives every species a vote, so a
+species-rich genus can dominate it. To ask instead whether small ranges recur
+across parasitic lineages, we fitted PGLS at genus level. Each combination of
+genus and interaction type was one unit (a genus with species of two types gave
+two units), with the mean log~10~ range of its species in the main mixed-model
+sample as the response. The tree was the genus-grafted tree pruned to one
+species per unit, choosing the alphabetically first originally matched species
+within each unit when available and otherwise the alphabetically first grafted
+species. Multiple type units within a genus kept separate representative tips,
+so the covariance still depends on which species represent a genus. Genera
+absent from a tree were omitted, leaving `r gl("yumnam_2025")$n_units` units,
+`r gl("yumnam_2025")$n_p_units` of them parasitic genera, on the Yumnam tree and
+`r gl("schar_2018")$n_units` (`r gl("schar_2018")$n_p_units`) on the Schär tree
+(Table S9). Parasitic genera had markedly smaller ranges than facultative genera
+on both trees, with all genera and without *Lepidochrysops* (range area on the
+Yumnam tree: `r gli("yumnam_2025")`; without *Lepidochrysops*:
+`r gli("yumnam_2025", "Lepidochrysops")`). Descriptively, `r gu_desc$n_below` of
+the `r gu_desc$n_p` parasitic genus-by-type units of the main mixed-model sample
+(before omitting genera absent from a tree) had mean log~10~ range areas below the
+median of the `r gu_desc$n_f` facultative units; the exceptions were
+`r gu_desc$above_txt`. The facultative–parasite latitudinal contrast also
+retained support on both trees with and without *Lepidochrysops*. For range area,
+non-associated genera had larger ranges than parasitic genera on the Schär tree with and
+without *Lepidochrysops*, and on the Yumnam tree with all genera but not without
+*Lepidochrysops*. For range area, the mutualist–parasite and facultative–mutualist contrasts
+were supported only on the Schär tree. Residual phylogenetic covariance among genus units was weak
+(lambda `r report_number(gl("yumnam_2025")$lambda, 2)` on the Yumnam tree and
+close to zero on the Schär tree, where the model is therefore close to an
+ordinary comparison of genus means; Table S9).
+
+**Origins of parasitism.** Associations resting on a few evolutionary
+transitions can appear strong in comparative tests [@maddison2015; @uyeda2018],
+so we counted how often parasitism must have arisen among the analysed species.
+We coded each species of the main range-area sample as parasitic or not and
+reconstructed this character by parsimony on the genus-grafted Yumnam and Schär
+trees. Gains and losses had equal costs, the root was set as non-parasitic and
+polytomies could be resolved in whichever way required the fewest changes. Both
+trees required `r orig("schar_2018")$changes` changes, and no equally
+parsimonious reconstruction included a loss of parasitism, so all were origins.
+On the Schär tree, which includes every analysed parasite, the origins lay in
+`r num_word(orig("schar_2018")$n_parasite_subfamilies)` subfamilies (Aphnaeinae,
+Miletinae, Polyommatinae and Theclinae), and
+`r num_word(length(origin_singles))` of them were single analysed species
+(`r paste0("*", origin_singles, "*", collapse = ", ")`), each resting on the
+classification of one species. On the Yumnam tree, which lacks
+*Niphanda*, the two parasitic *Ogyris* species, one of them grafted, formed
+separate origins, so the count was the same. With grafted species removed,
+`r orig("yumnam_2025", "matched")$n_parasites` and
+`r orig("schar_2018", "matched")$n_parasites` parasites remained on the Yumnam and Schär trees,
+and parsimony required `r orig("yumnam_2025", "matched")$changes` origins on the
+Yumnam tree and `r orig("schar_2018", "matched")$changes` on the Schär tree.
+Parsimony gives the fewest origins compatible with a tree, and the count also
+depends on the placement of grafted species, which reflects taxonomy alone.
+*Lepidochrysops* and *Thestor*, each a single origin, contain
+`r n_par_genus("Lepidochrysops") + n_par_genus("Thestor")` of the
+`r cnt("model_area_type_p")` analysed parasites (see *Sample and regional
+concentration* below).
+
+**Phylogeny and geography together.** Phylogenetic adjustment alone left the
+residuals spatially autocorrelated (Moran's I within 500 km =
+`r pgm("pgls_normalised_residuals")` for the normalised PGLS residuals on the
+Yumnam tree; Table S6), so we combined both adjustments in a phylogenetic
+spatial GAM on the genus-grafted Yumnam and Schär trees (Table S10). It
+contained a spherical spline (basis dimension 100), a species random effect
+whose covariance followed the phylogeny (with an estimated variance instead of a
+profiled Pagel's lambda) and an independent residual. Its residuals showed weak
+negative autocorrelation within 500 km (Moran's I =
+`r pgm("phylo_spatial_gam")` on the Yumnam tree; Table S6). The
+facultative–parasite contrast and the breadth association remained supported
+for all three range measures on both trees, and the non-associated–parasite
+contrast for latitudinal extent on both trees and for all three measures on the
+Schär tree. The contrasts involving mutualists kept their direction but were not
+supported. Because lineage, region and interaction type overlap, this model
+cannot show which of them accounts for the weaker contrasts. As a second
+combination of phylogenetic and geographic adjustment, PGLS on both trees
+included the regional butterfly background (Appendix S4) as a covariate. It
+retained the facultative–parasite and non-associated–parasite area contrasts on
+both trees (Table S12), but its residuals remained spatially autocorrelated (Moran's
+I = `r pgm("pgls_background_normalised_residuals")` on the Yumnam tree; Table
+S6), so we treat it as descriptive.
+
+**Sample and regional concentration.** Three further tests asked whether the
+parasite contrasts depend on grafted species, on the two largest parasitic
+genera or on southern Africa (Table S13c). First, with tree-matched species
+only, PGLS supported the facultative–parasite range area contrast on both
+trees; the non-associated–parasite contrast pointed the same way (ratios
+`r report_number(mcv("pgls", "n-p", "yumnam_2025")$range_ratio, 1)` and
+`r report_number(mcv("pgls", "n-p", "schar_2018")$range_ratio, 1)` on the Yumnam and Schär trees) but
+was not supported (`r fmt_p(mcv("pgls", "n-p", "yumnam_2025")$p.value)` and
+`r fmt_p(mcv("pgls", "n-p", "schar_2018")$p.value)`), whereas the taxonomic model of the same species
+supported both. The facultative–parasite contrast therefore does not require
+the grafted species. Second, without
+*Lepidochrysops* and *Thestor*, which contain
+`r n_par_genus("Lepidochrysops") + n_par_genus("Thestor")` of the
+`r cnt("model_area_type_p")` parasites, the facultative–parasite contrast
+remained supported in the taxonomic model, in PGLS on the Schär tree and in
+genus-by-type PGLS on both trees, but not in species-level PGLS on the Yumnam
+tree. The non-associated–parasite contrast was more sensitive and remained
+supported only in genus-by-type PGLS on the Schär tree. Third, among species
+centred in southern Africa, parasites had smaller ranges than facultative and
+non-associated species in the taxonomic model and in PGLS on both trees, with
+wide intervals. Mutualists there also had smaller ranges than facultative
+species and did not differ clearly from parasites. Outside southern Africa, the
+facultative–parasite contrast remained supported in the taxonomic model and on
+the Schär tree but not on the Yumnam tree, and the non-associated–parasite
+contrast only on the Schär tree. Regions were assigned by range centre: southern
+Africa as latitude < −15° and longitude 10–55° E, and Afro-Eurasia and
+Australasia as east of 30° W (longitude ≥ −30°). These are coarse divisions, and most parasites of the southern African subset belong to
+*Lepidochrysops* and *Thestor*.
+
+```{r figure-s7, out.width=if (knitr::is_html_output()) "60%" else "4.4in"}
+report_figure("plot_phylogeny_traits")
+```
+
+**Figure S7.** The time-calibrated Lycaenidae phylogeny of @yumnam2025, showing
+A: the interaction types of `r report_number(si_overlay$classified_on_tree)`
+matched classified species, with or without a range estimate, and B: the range
+areas of `r report_number(si_overlay$range_on_tree)` matched species with a
+range estimate, classified or not (log~10~ colour scale). Unmatched tips are not
+coloured. In A, the genera of matched parasitic species are labelled beside
+their tips; a labelled genus can also include non-parasitic species. The
+matched-species analyses use the `r rb("pgls_yumnam_2025", "f-p")$n` species
+with both (Table S12). The overlays are descriptive and are not ancestral-state
+reconstructions.
+
+<!-- Tables S7-S10 are wide: this block ends the portrait section, and the block after Table S10 ends the landscape one.
+     Page numbers: docx_template.docx has a footer with a PAGE field; Pandoc gives its relationship the id rId9, and
+     every raw section break (here and below) must carry r:id="rId9" or its pages would have no footer. Check that
+     the id is still rId9 (word/_rels/document.xml.rels of the rendered .docx) after changing Pandoc or the template. -->
+```{=openxml}
+<w:p><w:pPr><w:sectPr><w:footerReference w:type="default" r:id="rId9"/><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720" w:gutter="0"/><w:cols w:space="720"/></w:sectPr></w:pPr></w:p>
+```
+
+**Table S7.** Sample composition and best-fitting Pagel lambda (approximate 95%
+profile-likelihood interval) of species-level range-area PGLS for matched
+species and for trees including genus grafts (genus-by-type PGLS: Table S9).
+N/F/M/P are the numbers of non-associated, facultative, obligately mutualistic
+and obligately parasitic species; grafted is the number added at genus level.
+Effect intervals in Table S12 condition on the fitted lambda.
+
+```{r table-s7-pgls}
+options(report_table_width = 9) # Tables S7-S10 are on landscape pages
+pm5 <- pgls_metadata[pgls_metadata$measure == "area", ]
+pm5 <- pm5[order(match(pm5$study, c("yumnam_2025", "schar_2018")), match(pm5$tree_set, c("matched", "grafted")), match(pm5$predictors, c("type", "breadth"))), ]
+report_table(data.frame(
+  Tree = c(yumnam_2025 = "Yumnam & Kodandaramaiah 2025", schar_2018 = "Schär et al. 2018 (Grafen)")[pm5$study],
+  Sample = ifelse(pm5$tree_set == "grafted", "Genus grafts included", "Matched only"),
+  Grafted = ifelse(pm5$tree_set == "matched", 0, pm5$n_grafted),
+  Model = ifelse(pm5$predictors == "type", "Type", "Type + breadth"),
+  `N / F / M / P` = sprintf("%s / %s / %s / %s", pm5$n_non_associated, pm5$n_facultative, pm5$n_mutualist, pm5$n_parasite),
+  `Lambda (95% CI)` = sprintf("%.2f (%.2f–%.2f)", pm5$lambda, pm5$lambda_lower, pm5$lambda_upper),
+  check.names = FALSE
+), row.names = FALSE)
+```
+
+**Table S8.** Range-area contrasts after omitting parasitic genera: the main
+taxonomic mixed model (all analysed species) and species-level PGLS on the
+genus-grafted Yumnam and Schär trees, refitted after omitting each parasitic
+genus with at least three analysed parasites, one at a time (all species of an
+omitted genus are removed; lambda re-estimated for each PGLS; omitting a genus
+absent from a tree leaves that tree's PGLS unchanged). *None*: the full models.
+N: species in the model; Parasites: parasites remaining in the model. Values are
+ratios with Tukey-adjusted 95% confidence intervals and p-values. P-values
+smaller than 0.05 are bold.
+
+::: {.allow-page-break}
+```{r table-s8-leave-genus-out}
+eff7g <- c(`f-p` = "f / p", `n-p` = "n / p", `m-p` = "m / p", `f-m` = "f / m")
+lg7 <- logo[logo$contrast %in% names(eff7g), ]
+lg7$cell <- cell_ci(lg7)
+keys7g <- expand.grid(
+  model = c("lmm", "pgls_yumnam_2025", "pgls_schar_2018"), dropped = c("none", logo_single),
+  stringsAsFactors = FALSE
+)
+t7g <- do.call(rbind, lapply(seq_len(nrow(keys7g)), function(i) {
+  x <- lg7[lg7$dropped == keys7g$dropped[i] & lg7$model == keys7g$model[i], ]
+  stopifnot(nrow(x) == length(eff7g))
+  out <- data.frame(
+    Omitted = if (keys7g$dropped[i] == "none") "None" else paste0("*", gsub(" + ", "* + *", keys7g$dropped[i], fixed = TRUE), "*"),
+    Model = c(lmm = "Mixed model", pgls_yumnam_2025 = "PGLS, Yumnam", pgls_schar_2018 = "PGLS, Schär")[[keys7g$model[i]]],
+    N = x$n[1], Parasites = x$n_parasite[1], check.names = FALSE
+  )
+  for (e in names(eff7g)) out[[eff7g[[e]]]] <- x$cell[match(e, x$contrast)]
+  out
+}))
+report_table(t7g, escape = FALSE, row.names = FALSE)
+```
+:::
+
+**Table S9.** Genus-level PGLS: one unit per genus and interaction type, with
+the mean log~10~ range of its species as the response, on the genus-grafted Yumnam
+and Schär trees pruned to one species per unit (genera absent from a tree
+omitted), with all genera and without *Lepidochrysops*. Units: genus units in
+the model (parasitic genera in brackets). Values are ratios with Tukey-adjusted
+95% confidence intervals and p-values. P-values smaller than 0.05 are bold.
+
+```{r table-s9-genus-level}
+eff7l <- c(`f-p` = "f / p", `n-p` = "n / p", `m-p` = "m / p", `f-m` = "f / m")
+gl7 <- glev[glev$contrast %in% names(eff7l), ]
+gl7$cell <- cell_ci(gl7)
+keys7l <- expand.grid(
+  dropped = c("none", "Lepidochrysops"), measure = c("area", "lat", "lon"), tree = c("yumnam_2025", "schar_2018"),
+  stringsAsFactors = FALSE
+)
+t7l <- do.call(rbind, lapply(seq_len(nrow(keys7l)), function(i) {
+  x <- gl7[gl7$tree == keys7l$tree[i] & gl7$measure == keys7l$measure[i] & gl7$dropped == keys7l$dropped[i], ]
+  stopifnot(nrow(x) == length(eff7l))
+  out <- data.frame(
+    Tree = c(yumnam_2025 = "Yumnam", schar_2018 = "Schär")[[keys7l$tree[i]]],
+    Metric = c(area = "Area", lat = "Lat", lon = "Lon")[[keys7l$measure[i]]],
+    Genera = if (keys7l$dropped[i] == "none") "All" else "Without *Lepidochrysops*",
+    Units = sprintf("%s (%s)", x$n_units[1], x$n_p_units[1]), Lambda = sprintf("%.2f", x$lambda[1]), check.names = FALSE
+  )
+  for (e in names(eff7l)) out[[eff7l[[e]]]] <- x$cell[match(e, x$contrast)]
+  out
+}))
+report_table(t7l, escape = FALSE, row.names = FALSE)
+```
+
+**Table S10.** Phylogenetic spatial GAM on the genus-grafted Yumnam and Schär
+trees: interaction type, or type and partner breadth, with a spherical spline of
+the range centre and a phylogenetically structured species random effect. Values
+are ratios with Tukey-adjusted p-values for contrasts and coefficient p-values
+for breadth (per additional ant genus). P-values smaller than 0.05 are bold.
+
+```{r table-s10-phylo-geography}
+eff6 <- c(`f-p` = "f / p", `n-p` = "n / p", `m-p` = "m / p", `f-m` = "f / m", breadth = "Ant genus")
+g6 <- pg_geo[pg_geo$contrast %in% names(eff6), ]
+g6$cell <- sprintf("%.2f %s", g6$ratio, format_table_p(g6$p))
+keys6 <- unique(g6[c("study", "measure")])
+keys6 <- keys6[order(match(keys6$study, c("yumnam_2025", "schar_2018")), match(keys6$measure, c("area", "lat", "lon"))), ]
+t6 <- do.call(rbind, lapply(seq_len(nrow(keys6)), function(i) {
+  x <- g6[g6$study == keys6$study[i] & g6$measure == keys6$measure[i], ]
+  out <- data.frame(
+    Tree = c(yumnam_2025 = "Yumnam", schar_2018 = "Schär")[[keys6$study[i]]],
+    Metric = c(area = "Area", lat = "Lat", lon = "Lon")[[keys6$measure[i]]],
+    N = x$n[x$contrast == "f-p"][1], check.names = FALSE
+  )
+  for (e in names(eff6)) out[[eff6[[e]]]] <- x$cell[match(e, x$contrast)]
+  out
+}))
+report_table(t6, escape = FALSE, row.names = FALSE)
+```
+
+<!-- End of the landscape section holding Tables S7-S10; Appendix S6 continues in portrait. -->
+```{=openxml}
+<w:p><w:pPr><w:sectPr><w:footerReference w:type="default" r:id="rId9"/><w:pgSz w:w="15840" w:h="12240" w:orient="landscape"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720" w:gutter="0"/><w:cols w:space="720"/></w:sectPr></w:pPr></w:p>
+```
+
+## Appendix S6. Robustness to data decisions
+
+**Range stability.** Restricting the models to species with stable range
+estimates, at the 90% threshold of @gupta2020 or at the looser 80% and stricter
+95% thresholds (Appendix S2), removed proportionally more parasites. Stability was assessed separately for each range
+measure, so samples differ among measures; for range area,
+`r rb("stability_80", "f-p")$n_parasite`,
+`r rb("stability_90", "f-p")$n_parasite` and
+`r rb("stability_95", "f-p")$n_parasite` of the `r cnt("model_area_type_p")`
+parasites remained (Table S12). The area facultative–parasite ratio was
+`r eff("stability_80", "f-p")` at 80%, `r eff("stability_90", "f-p")` at 90%
+and `r eff("stability_95", "f-p")` at 95%. The 95% subset reduced the precision
+of the area contrasts involving parasites, and the area non-associated–parasite
+contrast lost clear support at 90% and 95% (Table S12). These criteria measure
+how much an estimate depends on the observed localities, not how completely the
+true distribution was sampled.
+
+**Balanced occurrence samples.** We estimated ranges from 200 random draws of
+ten or twenty cleaned localities per species, and from ten distinct occupied
+25-km cells, each contributing one sampled locality. All draws used the full
+range's longitude seam, equal-area projection and reference latitude, and the
+response was the geometric mean of the replicate estimates. Models of the full
+ranges of exactly the same species (Table S13b) separate the effect of sampling
+from that of sample composition. The cell-based sample excludes species with
+fewer than ten occupied cells. Intervals treat the averaged rarefied estimates
+as fixed. These comparisons test the effect of locality number and clustering,
+but they cannot recover unrecorded parts of a range.
+
+**Breadth within strategies and functional form.** The breadth association held
+within facultative species, with `r within_eff("lmm_facultative")` greater area
+per additional recorded ant genus in the taxonomic model and
+`r within_eff("spherical_gam_facultative")` after spatial adjustment (Table
+S13a). Among obligate species, the type-adjusted slope was also positive but
+imprecise, with `r within_eff("lmm_obligate")` greater area per genus. Parasites had only one or two
+recorded genera each, too few for a separate slope. Slopes did not differ
+clearly among the three associated types (likelihood-ratio test,
+`r fmt_p(check_table("breadth_interaction_test")[["Pr(>Chisq)"]][2])`). A
+log(1 + count) predictor fitted all three range measures better than the raw
+count (AIC lower by `r breadth_daic`; Table S13d), suggesting that each
+additional genus brings a smaller proportional increase in range size as breadth
+grows. We kept the
+raw count in the main models because it gives a ratio per recorded genus. Few
+species have many recorded genera, so the shape of the relationship at high
+breadth is uncertain. Merging historical *Paratrechina* records with resolved
+*Paratrechina* and *Nylanderia* records into one count group per butterfly gave
+a similar area association (`r merge_eff("lmm_pooled")`; facultative species:
+`r merge_eff("lmm_facultative")`).
+
+**Wingspan.** Larger butterflies may disperse farther, and wingspan has been
+examined as a correlate of range size in butterflies [@hausharter2023]. We
+therefore added log~10~ wingspan as a centred covariate to the main mixed models
+for the `r cnt("model_wingspan_n")` analysed species with a measured wingspan
+(values imputed from congeners were not used). Species with larger wingspans had
+larger ranges (`r wing_txt("area")`), and the interaction and breadth
+associations persisted (Table S12).
+
+**Larval carnivory.** A species was coded as carnivorous when any source in the
+evidence database recorded its larvae feeding on animal matter (ant brood, food
+provided by ants or hemipterans) and as a plant feeder when sources recorded
+only plant feeding. Species without such a record took the code shared by at
+least 90% of at least three directly coded congeners, and remaining parasites of
+brood-predator genera were coded as carnivorous. In the main range-area sample,
+`r carn_n("p", "animal")` of the `r cnt("model_area_type_p")` parasites were
+coded as carnivorous (`r carn_n("p", "animal", "genus")` from these genus
+rules), the other `r num_word(carn_n("p", "uncoded"))` were uncoded and none
+was coded as a plant feeder. Carnivory and parasitism therefore cannot be
+separated in the interaction-type model. We instead asked whether carnivorous
+species that are not ant parasites also had small ranges, by adding carnivory
+to the main taxonomic model of the `r carn_row("coded")$n` non-parasites with a
+carnivory code (`r carn_n(c("n", "f", "m"), "plant", "genus")` of their
+plant-feeder codes came from congeners). The `r carn_row("coded")$n_carnivore`
+carnivores comprised `r num_word(carn_row("coded")$n_carnivore_n)`
+non-associated, `r num_word(carn_row("coded")$n_carnivore_f)` facultative and
+`r num_word(carn_row("coded")$n_carnivore_m)` mutualistic species from
+`r carn_row("coded")$n_carnivore_genera` genera, and
+`r carn_row("coded")$n_carnivore_miletinae` of them were hemipteran-feeding
+Miletinae. Their ranges did not differ clearly from those of plant feeders, and
+the point estimate indicated larger carnivore ranges (raw geometric mean area
+`r report_number(carn_row("coded")$geomean_carnivore / 1e6, 2)` versus
+`r report_number(carn_row("coded")$geomean_plant / 1e6, 2)` million km²;
+plant-feeder/carnivore `r carn_eff("coded")`). Results were similar for
+latitudinal (`r carn_eff("coded", "lat")`) and longitudinal extent
+(`r carn_eff("coded", "lon")`), when the
+`r carn_row("uncoded_as_plant")$n - carn_row("coded")$n` uncoded non-parasites
+were treated as plant feeders (`r carn_eff("uncoded_as_plant")`) and when
+carnivores were limited to the `r carn_row("consistent_evidence")$n_carnivore`
+species coded as such by at least two sources and as plant feeders by none
+(`r carn_eff("consistent_evidence")`). Without Miletinae, only
+`r num_word(carn_row("without_miletinae")$n_carnivore)` carnivores remained
+(`r carn_eff("without_miletinae")`). The carnivores are few and concentrated in
+one subfamily, which contains no plant feeders, so this comparison has little
+power and wide intervals. It indicates only that small ranges are not shared by
+all lycaenids with carnivorous larvae, and it cannot separate brood predation
+from feeding by ants.
+
+**Alternative classification decisions.** We refitted the main model under four
+alternative codings of mutualists and parasites (Table S11). For range area, the
+contrasts of parasites with facultative and non-associated species and the
+breadth association remained supported under all four, and the
+facultative–mutualist contrast under all but the coding that used only
+species-level subtype evidence (`r alt("species_level_subtype_only", "f-m")`). The mutualist–parasite contrast was the most sensitive. Counting
+as mutualists the obligate species whose subtype had only been assumed, mostly
+small-ranged southern African Aphnaeinae, strengthened the
+facultative–mutualist contrast and weakened the mutualist–parasite contrast.
+Following @schar2018 in treating the three ant-fed aphnaeines of Appendix S1 as
+mutualists slightly strengthened the mutualist–parasite and
+facultative–parasite contrasts; this moved
+`r num_word(alt_n("ant_fed_aphnaeines_as_m", "n_m") - alt_n("main", "n_m"))`
+analysed species, because *Crudaria wykehami* has too few localities for a range
+estimate. Two codings weakened the parasite contrasts and left the
+mutualist–parasite area contrast unsupported. Using only subtypes coded directly
+from the classifying source (Appendix S1) left
+`r alt_n("species_level_subtype_only", "n_p")` parasites and
+`r alt_n("species_level_subtype_only", "n_m")` mutualists (mutualist/parasite
+`r alt("species_level_subtype_only", "m-p")`), and coding as parasites all
+species that @fiedler2012 lists as ant parasites, a definition that includes
+any recorded trophallaxis, gave `r alt_n("fiedler2012_parasites", "n_p")`
+parasites (mutualist/parasite `r alt("fiedler2012_parasites", "m-p")`).
+
+**Table S11.** Main taxonomic mixed model under alternative classification
+decisions (range area and latitudinal extent). *Main*: the classification used
+throughout. *Assumed subtype as mutualist*: obligate species whose mutualistic
+or parasitic status had been assumed rather than documented are counted as
+mutualists. This alternative also leaves unclassified *Thestor murrayi*, a
+parasite in the main classification whose only species-level evidence is an
+ant-attendance record. *Ant-fed aphnaeines as mutualists*: *Axiocerses harpax*,
+*Crudaria capensis* and *C. wykehami* (no range estimate) classified as
+mutualists, following @schar2018. *Species-level subtype only*: obligate species
+whose mutualist or parasite subtype was not coded directly from the classifying
+source (Appendix S1) are left unclassified. *Fiedler (2012) parasites*:
+classified species that @fiedler2012 lists as ant parasites, a definition that
+includes any recorded trophallaxis, are coded as parasites. N: species, with
+mutualists/parasites in brackets. Ratios with Tukey-adjusted p-values; breadth
+is per additional ant genus. P-values smaller than 0.05 are bold.
+
+```{r table-s11-alternative}
+options(report_table_width = 6.5) # Appendix S6 is portrait
+eff7 <- c(`f-p` = "f / p", `n-p` = "n / p", `m-p` = "m / p", `f-m` = "f / m", breadth = "Ant genus")
+a7 <- si_alternative[si_alternative$contrast %in% names(eff7), ]
+a7$cell <- sprintf("%.2f %s", a7$ratio, format_table_p(a7$p))
+labels7 <- c(main = "Main", assumed_subtype_as_m = "Assumed subtype as mutualist",
+  ant_fed_aphnaeines_as_m = "Ant-fed aphnaeines as mutualists",
+  species_level_subtype_only = "Species-level subtype only", fiedler2012_parasites = "Fiedler (2012) parasites")
+stopifnot(setequal(unique(si_alternative$decision), names(labels7)))
+# 'Assumed subtype as mutualist' is fitted on the earlier MAIN table, which leaves Thestor murrayi unclassified (caption)
+stopifnot(alt_n("main", "n_p") - alt_n("assumed_subtype_as_m", "n_p") == 1L)
+keys7 <- expand.grid(measure = c("area", "lat"), decision = names(labels7), stringsAsFactors = FALSE)
+t7 <- do.call(rbind, lapply(seq_len(nrow(keys7)), function(i) {
+  x <- a7[a7$decision == keys7$decision[i] & a7$measure == keys7$measure[i], ]
+  n <- x$n[x$contrast == "f-p"][1]
+  stopifnot(n == alt_n(keys7$decision[i], "n"))
+  out <- data.frame(
+    Classification = labels7[[keys7$decision[i]]],
+    Metric = c(area = "Area", lat = "Lat")[[keys7$measure[i]]],
+    N = sprintf("%d (%d/%d)", n, alt_n(keys7$decision[i], "n_m"), alt_n(keys7$decision[i], "n_p")),
+    check.names = FALSE
+  )
+  for (e in names(eff7)) out[[eff7[[e]]]] <- x$cell[match(e, x$contrast)]
+  out
+}))
+report_table(t7, escape = FALSE, row.names = FALSE)
+```
+
+## Appendix S7. Core and supplementary sensitivity results
+
+This appendix collects the sensitivity results: the core analyses of Fig. 4 and
+`r num_word(length(setdiff(names(analysis_labels), core_analyses)))` further
+checks (Fig. S8, Table S12), and the targeted comparisons of breadth,
+occurrence sampling, lineage and regional concentration, and cleaning (Tables
+S13–S14). The taxonomic model of all species is the common reference, and the
+spatial and joint models are treated as the most conservative estimates
+(Materials and Methods). The analyses share data, so the three range measures,
+the two trees and the alternative specifications are not independent
+replicates.
+
+<!-- Figure S8 and the wide Tables S12-S14 are landscape: this block ends the portrait section, which now also
+     holds the Appendix S7 text; the document's
+     final landscape section comes from docx_template.docx. -->
+```{=openxml}
+<w:p><w:pPr><w:sectPr><w:footerReference w:type="default" r:id="rId9"/><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720" w:gutter="0"/><w:cols w:space="720"/></w:sectPr></w:pPr></w:p>
+```
+
+```{r figure-s8, out.width=if (knitr::is_html_output()) "100%" else "8.6in"}
+report_figure("plot_robustness_mutualist_contrasts")
+```
+
+**Figure S8.** Range-area contrasts involving obligate mutualists, and between
+facultative and non-associated species, in the core analyses of Fig. 4: A,
+mutualist/parasite; B, facultative/mutualist; C, non-associated/mutualist; D,
+facultative/non-associated (range-area ratios on a common logarithmic axis, with
+a reference line at one). Rows, groups, sample sizes and * are as in Fig. 4.
+Bars are Tukey-adjusted 95% confidence intervals, and filled points indicate
+p < 0.05.
+
+**Table S12.** Interaction-type contrasts and partner-breadth effects for range
+area, latitudinal extent and longitudinal extent, in the core analyses of Fig. 4
+(first block, in the order and with the labels of Fig. 4) and in further checks
+(second block: the taxonomic model with the regional butterfly background, PGLS
+of tree-matched species only, PGLS with the butterfly background,
+range-stability subsets and wingspan as a covariate). Ratios compare the first
+category with the second, with Tukey-adjusted 95% confidence intervals and
+p-values; breadth is the ratio per additional recorded ant genus, with a
+coefficient-based interval and p-value. N: species/parasites in the type model,
+with the species of the breadth model in brackets, or genus-by-type
+units/parasitic units in genus-level PGLS. Range-stability subsets use the 90% criterion of @gupta2020 and looser (80%)
+and stricter (95%) thresholds (Appendix S2); they are defined separately for
+each range measure, so their samples differ. Breadth is not
+given (–) for genus-level PGLS, which has no breadth model. Rarefied ranges use
+ten random localities per species (Table S13b). P-values smaller than 0.05 are bold.
+
+::: {.allow-page-break}
+```{r table-s12-robustness}
+options(report_table_width = 9) # Appendix S7 and Tables S12-S14 are on landscape pages
+effects <- c(`f-p` = "f / p", `n-p` = "n / p", `m-p` = "m / p", `f-m` = "f / m", `n-m` = "n / m", `f-n` = "f / n",
+             breadth = "Ant genus")
+s3 <- robust[robust$contrast %in% names(effects), ]
+# p-values on a second line in every cell: ten columns cannot hold "ratio (CI) p" on one line
+s3$cell <- sprintf("%.2f (%.2f–%.2f)%s%s", s3$ratio, s3$lower, s3$upper, report_line_break, format_table_p(s3$p))
+# core analyses first, in the order of Figure 4, then the further specifications in report order
+s12_order <- c(core_analyses, setdiff(names(analysis_labels), core_analyses))
+stopifnot(all(core_analyses %in% names(analysis_labels)))
+rows <- expand.grid(measure = c("area", "lat", "lon"), analysis = s12_order, stringsAsFactors = FALSE)
+# short row labels, those of the core analyses as in Figure 4, so that the table fits a landscape page
+s12_labels <- c(
+  lmm = "Taxonomic LMM (main)", spherical_gam = "Spatial GAM",
+  pgls_grafted_yumnam_2025 = "Species PGLS, Yumnam", pgls_grafted_schar_2018 = "Species PGLS, Schär",
+  phylo_spatial_yumnam_2025 = "Joint GAM, Yumnam", phylo_spatial_schar_2018 = "Joint GAM, Schär",
+  pgls_genus_yumnam_2025 = "Genus PGLS, Yumnam", pgls_genus_schar_2018 = "Genus PGLS, Schär",
+  rarefied_k10 = "Rarefied ranges", modelled_ranges_daru = "Modelled ranges",
+  background_500km_butterflies = "LMM + butterfly background",
+  pgls_yumnam_2025 = "Matched PGLS, Yumnam", pgls_schar_2018 = "Matched PGLS, Schär",
+  pgls_background_yumnam_2025 = "PGLS + background, Yumnam", pgls_background_schar_2018 = "PGLS + background, Schär",
+  stability_80 = "Stability 80%", stability_90 = "Stability 90%", stability_95 = "Stability 95%",
+  wingspan_covariate = "Wingspan covariate")
+stopifnot(setequal(names(s12_labels), names(analysis_labels)))
+s3_display <- do.call(rbind, lapply(seq_len(nrow(rows)), function(i) {
+  x <- s3[s3$analysis == rows$analysis[i] & s3$measure == rows$measure[i], ]
+  if (!nrow(x)) {
+    return(NULL)
+  }
+  n_type <- x$n[x$contrast == "f-p"]
+  n_parasite <- x$n_parasite[x$contrast == "f-p"]
+  stopifnot(length(n_type) == 1L, length(n_parasite) == 1L, is.finite(n_parasite))
+  n_breadth <- x$n[x$contrast == "breadth"]
+  n_cell <- sprintf("%s/%s", n_type, n_parasite)
+  out <- data.frame(
+    Analysis = if (rows$measure[i] == "area") unname(s12_labels[rows$analysis[i]]) else "",
+    Metric = c(area = "Area", lat = "Lat", lon = "Lon")[[rows$measure[i]]],
+    N = if (length(n_breadth)) sprintf("%s (%s)", n_cell, n_breadth) else n_cell, check.names = FALSE
+  )
+  for (e in names(effects)) {
+    v <- x$cell[match(e, x$contrast)]
+    out[[effects[[e]]]] <- if (is.na(v)) "–" else v
+  }
+  out$core <- rows$analysis[i] %in% core_analyses
+  out
+}))
+stopifnot(all(s3_display$Metric[s3_display$Analysis != ""] == "Area"))
+# group-heading rows instead of a 'Set' column
+group_row <- function(label) {
+  g <- s3_display[1, setdiff(names(s3_display), "core")]; g[] <- ""; g$Analysis <- label; g
+}
+s3_display <- rbind(group_row("**Core analyses (Fig. 4)**"), s3_display[s3_display$core, names(s3_display) != "core"],
+                    group_row("**Further sensitivity analyses**"), s3_display[!s3_display$core, names(s3_display) != "core"])
+report_table(s3_display, escape = FALSE, row.names = FALSE)
+```
+:::
+
+**Table S13a.** Recorded partner breadth within interaction strategies, for all
+three range measures. Ratios and coefficient-based 95% intervals are per
+additional recorded ant genus. Facultative models contain a breadth slope with
+taxonomic random effects, with or without a spherical spatial smooth; obligate
+models contain type and breadth with taxonomic random effects. N is the number
+of species. Singularity denotes a boundary variance estimate in a taxonomic
+model (– for GAM). P-values smaller than 0.05 are bold.
+
+```{r table-s13a-within-breadth}
+w13 <- within_breadth
+stopifnot(all(w13$model %in% c("lmm_facultative", "spherical_gam_facultative", "lmm_obligate")))
+w13 <- w13[order(
+  match(w13$model, c("lmm_facultative", "spherical_gam_facultative", "lmm_obligate")),
+  match(w13$measure, c("area", "lat", "lon"))
+), ]
+report_table(data.frame(
+  Model = c(
+    lmm_facultative = "Facultative: taxonomic", spherical_gam_facultative = "Facultative: spatial",
+    lmm_obligate = "Obligates: taxonomic, type adjusted"
+  )[w13$model],
+  Metric = c(area = "Area", lat = "Lat", lon = "Lon")[w13$measure], N = w13$n, Singular = ifelse(is.na(w13$singular), "–", ifelse(w13$singular, "Yes", "No")),
+  `Ratio (95% CI), p` = cell_ci(w13), check.names = FALSE
+), escape = FALSE, row.names = FALSE)
+```
+
+**Table S13b.** Balanced-locality range-area models and their full-range
+comparisons on exactly the same species. K10/K20: ten/twenty randomly sampled
+cleaned localities; K10 cells: ten distinct occupied 25-km cells. N is the
+type-model sample (breadth sample in brackets); P is the number of parasites in
+the type model. Values are ratios with Tukey-adjusted 95% intervals and p-values
+for type contrasts, and coefficient-based inference for breadth. Breadth is not
+fitted in these spatial rarefaction models (–). All sampling treatments use 200
+draws; uncertainty conditions on their geometric-mean range estimate. P-values smaller than 0.05 are bold.
+
+::: {.allow-page-break}
+```{r table-s13b-balanced}
+review_effects <- c(`f-p` = "f / p", `n-p` = "n / p", `m-p` = "m / p", `f-m` = "f / m", breadth = "Ant genus")
+q13 <- rare_results[rare_results$measure == "area", ]
+q13$contrast <- gsub(" ", "", q13$contrast)
+q13$cell <- cell_ci(q13)
+qkeys <- unique(q13[c("model", "sampling", "ranges")])
+qkeys <- qkeys[order(
+  match(qkeys$model, c("lmm", "spherical_gam")),
+  match(qkeys$sampling, c("k10", "k20", "k10_cells")),
+  match(qkeys$ranges, c("rarefied", "full_same_species"))
+), ]
+qt <- do.call(rbind, lapply(seq_len(nrow(qkeys)), function(i) {
+  x <- q13[q13$model == qkeys$model[i] & q13$sampling == qkeys$sampling[i] & q13$ranges == qkeys$ranges[i], ]
+  a <- x[x$contrast == "f-p", ]
+  b <- x[x$contrast == "breadth", ]
+  stopifnot(nrow(a) == 1L, nrow(b) <= 1L)
+  out <- data.frame(
+    Model = ifelse(qkeys$model[i] == "lmm", "Taxonomic", "Spatial"),
+    Draw = c(k10 = "K10", k20 = "K20", k10_cell = "K10 cells", k10_cells = "K10 cells")[qkeys$sampling[i]],
+    Range = ifelse(qkeys$ranges[i] == "rarefied", "Rarefied", "Full, same species"),
+    N = if (nrow(b)) sprintf("%s (%s)", a$n, b$n) else as.character(a$n), P = a$n_parasite,
+    check.names = FALSE
+  )
+  for (e in names(review_effects)) {
+    v <- x$cell[match(e, x$contrast)]
+    out[[review_effects[[e]]]] <- ifelse(is.na(v), "–", v)
+  }
+  out
+}))
+report_table(qt, escape = FALSE, row.names = FALSE)
+```
+:::
+
+**Table S13c.** Range-area contrasts testing the influence of sample, lineage
+and region: the full-sample taxonomic model as reference; PGLS and the
+taxonomic model on the same tree-matched species; omission of all species of
+*Lepidochrysops* and *Thestor* (the taxonomic model, species-level PGLS on the
+genus-grafted trees and genus-by-type PGLS, which weights each retained unit
+equally); and species
+centred within or outside southern Africa, or in Afro-Eurasia and Australasia
+(definitions in Appendix S5). N/P: species/parasites, or genus-by-type
+units/parasitic units. Values are ratios with Tukey-adjusted 95% intervals and
+p-values. P-values smaller than 0.05 are bold.
+
+::: {.allow-page-break}
+```{r table-s13c-concentration}
+region_effects <- review_effects[names(review_effects) != "breadth"]
+r13 <- regional_results[regional_results$measure == "area", ]
+r13$tree[is.na(r13$tree)] <- "none"
+r13$contrast <- gsub(" ", "", r13$contrast)
+r13$cell <- cell_ci(r13)
+rkeys <- unique(r13[c("model", "subset", "dropped", "tree")])
+stopifnot(all(rkeys$subset %in% c("all", "southern_Africa_only", "excluding_southern_Africa", "Old_World_only")))
+rkeys <- rkeys[order(
+  match(rkeys$subset, c("all", "southern_Africa_only", "excluding_southern_Africa", "Old_World_only")),
+  rkeys$dropped != "none", match(rkeys$model, c("lmm", "pgls")), match(rkeys$tree, c("none", "yumnam_2025", "schar_2018"))
+), ]
+region_name <- c(
+  all = "Global", southern_Africa_only = "Southern Africa only",
+  excluding_southern_Africa = "Excluding southern Africa", Old_World_only = "Afro-Eurasia and Australasia"
+)
+tree_name <- c(yumnam_2025 = "Yumnam", schar_2018 = "Schär")
+rt <- do.call(rbind, lapply(seq_len(nrow(rkeys)), function(i) {
+  x <- r13[r13$model == rkeys$model[i] & r13$subset == rkeys$subset[i] &
+    r13$dropped == rkeys$dropped[i] & r13$tree == rkeys$tree[i], ]
+  a <- x[x$contrast == "f-p", ]
+  stopifnot(nrow(a) == 1L)
+  out <- data.frame(
+    Sample = ifelse(rkeys$dropped[i] == "none", region_name[rkeys$subset[i]],
+      "Without Lepidochrysops + Thestor"
+    ),
+    Model = ifelse(rkeys$model[i] == "lmm", "Taxonomic", paste("PGLS", tree_name[rkeys$tree[i]])),
+    `N / P` = sprintf("%s / %s", a$n, a$n_parasite), check.names = FALSE
+  )
+  for (e in names(region_effects)) out[[region_effects[[e]]]] <- x$cell[match(e, x$contrast)]
+  out
+}))
+g13 <- pair_genus[pair_genus$measure == "area", ]
+g13$cell <- cell_ci(g13)
+gt <- do.call(rbind, lapply(c("yumnam_2025", "schar_2018"), function(s) {
+  x <- g13[g13$tree == s, ]
+  a <- x[x$contrast == "f-p", ]
+  stopifnot(nrow(a) == 1L)
+  out <- data.frame(
+    Sample = "Without Lepidochrysops + Thestor", Model = paste("Genus-by-type PGLS", tree_name[s]),
+    `N / P` = sprintf("%s / %s", a$n_units, a$n_p_units), check.names = FALSE
+  )
+  for (e in names(region_effects)) out[[region_effects[[e]]]] <- x$cell[match(e, x$contrast)]
+  out
+}))
+mc <- matched_checks[matched_checks$measure == "area", ]
+mc$contrast <- gsub(" ", "", mc$contrast)
+mc$ratio <- mc$range_ratio
+mc$lower <- mc$ratio_lower
+mc$upper <- mc$ratio_upper
+mc$p <- mc$p.value
+mc$cell <- cell_ci(mc)
+mm <- matched_checks_metadata[matched_checks_metadata$measure == "area" & matched_checks_metadata$predictors == "type", ]
+mt <- do.call(rbind, lapply(seq_len(nrow(mm)), function(i) {
+  x <- mc[mc$model == mm$model[i] & mc$study == mm$study[i], ]
+  stopifnot(sum(x$contrast == "f-p") == 1L)
+  # Matched LMM metadata may not contain type counts; obtain them from PGLS's identical sample.
+  p <- mm$n_parasite[mm$model == "pgls" & mm$study == mm$study[i]]
+  out <- data.frame(
+    Sample = paste("Matched", tree_name[mm$study[i]]),
+    Model = ifelse(mm$model[i] == "pgls", "PGLS", "Taxonomic, same species"),
+    `N / P` = sprintf("%s / %s", mm$n[i], p), check.names = FALSE
+  )
+  for (e in names(region_effects)) out[[region_effects[[e]]]] <- x$cell[match(e, x$contrast)]
+  out
+}))
+# blocks: full-sample reference, matched species, lineage omission, regional subsets
+reference <- rkeys$subset == "all" & rkeys$dropped == "none"
+lineage <- rkeys$subset == "all" & rkeys$dropped != "none"
+stopifnot(sum(reference) == 1L, sum(lineage) >= 1L)
+block <- function(x, label) cbind(Test = c(label, rep("", nrow(x) - 1L)), x)
+report_table(rbind(block(rt[reference, ], "Reference"), block(mt, "Matched species"),
+                   block(rbind(rt[lineage, ], gt), "Lineage omission"),
+                   block(rt[!reference & !lineage, ], "Region")), escape = FALSE, row.names = FALSE)
+```
+:::
+
+**Table S13d.** Functional form of recorded partner breadth on the identical
+sample, retaining interaction type and taxonomic random effects. AIC and delta
+AIC compare maximum-likelihood fits within each response. For comparability,
+effects and coefficient-based intervals from REML fits express a change from one
+to two recorded ant genera: the raw-count coefficient directly, and the log1p
+coefficient multiplied by log(3/2) before back-transformation. P-values test the
+respective breadth coefficient. P-values smaller than 0.05 are bold.
+
+```{r table-s13d-breadth-scale}
+sc <- check_table("breadth_scale_comparison")
+br <- check_table("breadth_raw_coefficients")
+bl <- check_table("breadth_log1p_coefficients")
+br$scale <- "raw"
+bl$scale <- "log1p"
+bc <- rbind(br, bl)
+sc <- merge(sc, bc[c("measure", "scale", "range_ratio", "ratio_lower", "ratio_upper", "p_value")],
+  by = c("measure", "scale")
+)
+sc <- sc[order(match(sc$measure, c("area", "lat", "lon")), match(sc$scale, c("raw", "log1p"))), ]
+factor_change <- ifelse(sc$scale == "raw", 1, log(3 / 2))
+sc$ratio <- sc$range_ratio^factor_change
+sc$lower <- sc$ratio_lower^factor_change
+sc$upper <- sc$ratio_upper^factor_change
+sc$p <- sc$p_value
+report_table(
+  data.frame(
+    Metric = c(area = "Area", lat = "Lat", lon = "Lon")[sc$measure],
+    Scale = c(raw = "Raw count", log1p = "log(1 + count)")[sc$scale], N = sc$n,
+    AIC = sprintf("%.2f", sc$AIC), `Delta AIC` = sprintf("%.2f", sc$delta_AIC),
+    `Ratio, one to two genera (95% CI), p` = cell_ci(sc), check.names = FALSE
+  ),
+  escape = FALSE, row.names = FALSE
+)
+```
+
+**Table S14a.** Sensitivity of range-area results to occurrence cleaning, using
+each treatment's eligible species and the identical species shared by all three
+treatments. Interaction types, partner coding and taxonomic assignments are
+fixed. N is the type-model sample (breadth sample in brackets). Values are
+ratios with Tukey-adjusted 95% intervals and p-values for type contrasts, and
+coefficient-based inference for breadth. Stringent is the manuscript's primary
+treatment. Intermediate and inclusive treatments are defined in Appendix S2. P-values smaller than 0.05 are bold.
+
+```{r table-s14a-cleaning}
+c14 <- cleaning_results[cleaning_results$measure == "area" &
+  ((cleaning_results$predictors == "type") | cleaning_results$contrast == "breadth"), ]
+c14$cell <- cell_ci(c14)
+ckeys <- expand.grid(
+  cleaning = c("inclusive", "main", "strict_plus"),
+  sample = c("eligible", "identical_species"), stringsAsFactors = FALSE
+)
+ct <- do.call(rbind, lapply(seq_len(nrow(ckeys)), function(i) {
+  x <- c14[c14$cleaning == ckeys$cleaning[i] & c14$sample == ckeys$sample[i], ]
+  a <- x[x$contrast == "f-p", ]
+  b <- x[x$contrast == "breadth", ]
+  stopifnot(nrow(a) == 1L, nrow(b) == 1L)
+  out <- data.frame(
+    Sample = ifelse(ckeys$sample[i] == "eligible", "Eligible", "Identical species"),
+    Cleaning = c(inclusive = "Inclusive", main = "Intermediate", strict_plus = "Stringent")[ckeys$cleaning[i]],
+    N = sprintf("%s (%s)", a$n, b$n), check.names = FALSE
+  )
+  for (e in names(review_effects)) out[[review_effects[[e]]]] <- x$cell[match(e, x$contrast)]
+  out
+}))
+report_table(ct, escape = FALSE, row.names = FALSE)
+```
+
+**Table S14b.** Comparison with expert polygons for the identical
+`r si_expert$n` European-centred species available under all cleaning treatments. Pearson r and
+RMSE compare log~10~ areas; Spearman rho compares their ranks. Area ratio is the
+geometric mean occurrence-MCP/expert-area ratio. These species were used during
+exploratory cleaning comparison and are not held-out validation.
+
+```{r table-s14b-expert}
+ce <- cleaning_expert[match(c("inclusive", "main", "strict_plus"), cleaning_expert$cleaning), ]
+report_table(data.frame(
+  Cleaning = c("Inclusive", "Intermediate", "Stringent"), N = ce$n,
+  `Pearson r` = sprintf("%.3f", ce$pearson_log10), `Spearman rho` = sprintf("%.3f", ce$spearman),
+  `Area ratio` = sprintf("%.2f", ce$geometric_area_ratio), `RMSE (log10)` = sprintf("%.3f", ce$rmse_log10),
+  check.names = FALSE
+), row.names = FALSE)
+```

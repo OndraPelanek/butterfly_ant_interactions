@@ -1,0 +1,2334 @@
+---
+title: "Butterfly-ant interactions 02 - occurrence cleaning and range sizes"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+This is the second of six R Markdown notebooks. It turns the 2026 GBIF download of Lycaenidae occurrence records into cleaned records and geographic range measures for every species of the trait table of `s01_prepare_traits`.
+
+Records are assigned to the species of the trait table (GBIF Backbone keys, duplicate keys merged into clusters) and then cleaned by explicit rules: metadata filters, coordinate tests, a native-region filter based on country checklists, documented introductions and species-concept errors, and a proportional geographic-outlier rule. Every rule is a flag on the record, and three datasets select flags: `main`, `inclusive` (the least restrictive) and the stringent `strict_plus` used in the paper. For each dataset, latitudinal extent, circular longitudinal extent and minimum-convex-polygon (MCP) area are measured, with their 80% rarefaction stability for `main` and `strict_plus`.
+
+The raw inputs are the GBIF download (`gbif_occurrences/`), native-region layers (`native_region_layers/`: Pinkert et al. 2022 checklists, GADM countries, RESOLVE realms), curated rule tables (`occurrence_cleaning/`), the GBIF Backbone snapshot, taxonomy tables and the Hausharter et al. (2023) expert ranges (`expert_ranges/`); the species table, synonym database and 2024 name crosswalk come from `s01_prepare_traits`. The main outputs are the cleaned records (`records_final.rds`) and the range table (`range_metrics.csv`), used by the later notebooks, together with the record counts, outlier groups and expert-range checks reported in the paper. A full run takes about 1 h on a 16 GB laptop (range measurement about 25 min with four workers) and needs up to about 8 GB of memory and 6 GB of temporary disk space.
+
+# Setup
+
+## Packages
+
+`terra` and `sf` handle the spatial data and `data.table` the record tables. Packages used for a few functions only (`CoordinateCleaner`, `countrycode`, `geosphere`, `jsonlite`, `parallel`, `rlang`, `zip`) are called with `::`.
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(terra)
+library(data.table)
+library(sf)
+```
+
+## Variables
+
+The thresholds and seeds of the cleaning rules and range measures are fixed here, grouped by the section that uses them; they are saved with the range table as `parameters.csv`. The number of parallel workers for the range measurement does not affect the results.
+
+```{r setup_variables}
+# Thresholds and seeds of the cleaning rules and range measures, grouped by the section that
+# uses them
+parameters <- list(
+  # --- Country and realm geometry ---
+  # A listed country supports realms covering >= 5% of its land
+  realm_min_country_share = 0.05,
+
+  # --- Record metadata flags ---
+  # Older records are flagged; records without a year are kept
+  year_min = 1900,
+
+  # Larger counts indicate aggregated or erroneous records
+  individual_count_max = 1000,
+
+  # Fossils and captive specimens are excluded by basis of record from main and strict_plus
+  # (inclusive excludes only fossils)
+  excluded_basis_of_record = c("FOSSIL_SPECIMEN", "LIVING_SPECIMEN"),
+
+  # Establishment means that mark a record as non-native
+  excluded_establishment_means = c("introduced", "invasive", "managed", "naturalised"),
+
+  # Coordinate uncertainty limits (m) of main and strict_plus, and of inclusive
+  uncertainty_max_main_m = 25000,
+  uncertainty_max_inclusive_m = 100000,
+
+  # A missing uncertainty is accepted with >= 2 decimals (about 1 km)
+  na_uncertainty_min_decimals = 2,
+
+  # --- Coordinate tests and the capital rule of the native-region filter ---
+  # The CoordinateCleaner capital test uses a 10 km buffer (all datasets). Within that buffer,
+  # records within 1 km of a capital are removed, and so are records within 10 km if the
+  # uncertainty is missing or > 5 km or a coordinate has < 3 decimals.
+  capital_buffer_inclusive_m = 10000,
+  capital_buffer_strict_m = 1000,
+  capital_imprecise_m = 5000,
+  capital_min_decimals = 3,
+
+  # --- Native-region filter ---
+  # Equal Earth cells of the native-region and outlier rules (km)
+  outlier_cell_km = 25,
+
+  # Cells within 300 km of the listed area are consistent with it
+  pinkert_reliability_buffer_km = 300,
+
+  # Below this share of consistent cells the checklist is not used
+  pinkert_reliability_min_coverage = 0.8,
+
+  # main: remove cells > 300 km away in an unsupported realm, or > 1,000 km away in any realm
+  pinkert_remove_other_realm_km = 300,
+  pinkert_remove_any_realm_km = 1000,
+
+  # strict_plus: remove all cells > 300 km away
+  pinkert_remove_strict_km = 300,
+
+  # Without a usable checklist, a realm with >= 10% of the cells or cells from >= 2 datasets is
+  # native, and cells > 300 km from native-realm cells are removed
+  fallback_realm_min_cell_share = 0.1,
+  fallback_realm_min_datasets = 2,
+  fallback_remove_km = 300,
+
+  # --- Outlier rule ---
+  # Coarser cells (50 km) for species occupying more than 4,000 of the 25-km cells
+  outlier_cell_km_large = 50,
+  outlier_large_cells = 4000,
+
+  # main: the gap must exceed half the remaining diameter and 250 km
+  outlier_f_main = 0.5,
+  outlier_floor_main_km = 250,
+
+  # strict_plus: the gap must exceed a quarter of the diameter and 200 km
+  outlier_f_strict = 0.25,
+  outlier_floor_strict_km = 200,
+
+  # An outlier group holds at most 10% of the localities (or two)
+  outlier_minority_share = 0.1,
+
+  # main keeps a group recorded by >= 2 datasets, or by one dataset in >= 2 years and by >= 2
+  # recorders, within 100 km of each other
+  corroboration_min_datasets = 2,
+  corroboration_single_dataset_years = 2,
+  corroboration_single_dataset_recorders = 2,
+  corroboration_radius_km = 100,
+
+  # --- Range measurement and range table ---
+  # Minimum unique localities for range measures
+  min_unique_localities = 5,
+
+  # Species below this number of localities are flagged as low-data
+  low_data_localities = 10,
+
+  # Coarse Equal Earth thinning (cells in km) for species spanning > 5 cells
+  thin_cell_km = 50,
+
+  # Minimum great-circle distance between thinned localities (km)
+  thin_distance_km = 10,
+
+  # Per-species seed = this + GBIF key
+  thin_seed = 20240926,
+
+  # Random 80% subsamples of the stability measure
+  rarefaction_reps = 1000,
+
+  # Per-species seed = this + GBIF key
+  rarefaction_seed = 20240401
+)
+
+# Parallel workers of the range measurement (they do not affect the results)
+n_workers <- 4
+```
+
+## Folders
+
+Raw inputs are read from the versioned raw data and the trait tables from the folder of `s01_prepare_traits`; outputs are written to this notebook's folder in the versioned intermediate data. The input and output lists of the sections below give paths relative to these folders (`s01/` for the trait tables).
+
+```{r setup_folders}
+# Raw data and the trait tables of s01
+dir_data_raw <- path_resrepo("data/raw")
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_traits")
+
+# Outputs of this notebook
+dir_data_intermediate <- path_resrepo("data/intermediate/s02_prepare_ranges")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+`write_table()` writes the output tables, `name_matching.R` matches checklist names to the GBIF Backbone snapshot, and `projections.R` and `range_metrics.R` hold the equal-area grids and range measures shared with the later notebooks.
+
+```{r load_functions}
+# Output tables
+source(here::here("code", "R", "write_table.R"))
+
+# Matching of checklist names to the GBIF Backbone snapshot
+source(here::here("code", "R", "name_matching.R"))
+
+# Equal-area grids and range measures shared with the later notebooks
+source(here::here("code", "R", "projections.R"))
+source(here::here("code", "R", "range_metrics.R"))
+```
+
+Tables are read with every column as character, so that GBIF keys and codes keep their exact text.
+
+```{r define_readers}
+# Read a CSV with all columns as character and empty strings or "NA" as missing
+read_chr <- function(path) {
+  read.csv(path, colClasses = "character", na.strings = c("", "NA"),
+           check.names = FALSE, encoding = "UTF-8")
+}
+```
+
+Each section below reads its inputs from disk and ends by removing its objects (in a hidden chunk), so only the objects defined in this setup carry over from one section to the next.
+
+```{r keep_setup_objects}
+# Objects of the setup, kept when each section clears its own objects
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Frozen inputs
+
+The records come from GBIF download 0009920-260928105237408 (GBIF.org, 4 October 2026, doi 10.15468/dl.58kd9b; licence CC BY-NC 4.0). It was requested on gbif.org for occurrence status PRESENT and taxon key C98 (Lycaenidae in Catalogue of Life XR), interpreted with the GBIF Backbone Taxonomy (checklist d7dddbf4-2cf0-4f39-9b2a-bb099caae36c) and exported as tab-separated SIMPLE_CSV with 10,797,420 records. The data bundle keeps the CSV, renamed `gbif_download_lycaenidae_2026.csv`, in `gbif_occurrences/gbif_download_lycaenidae_2026.zip`, beside metadata that record its size and md5 checksum. The chunk below, which is not run, shows how to rebuild the zip from GBIF; the GBIF import below checks the checksum.
+
+```{r rebuild_gbif_download, eval = FALSE}
+# --- Download the zip from GBIF ---
+key <- "0009920-260928105237408"
+tmp <- tempfile("gbif_")
+dir.create(tmp)
+download.file(paste0("https://api.gbif.org/v1/occurrence/download/request/", key, ".zip"),
+              file.path(tmp, "download.zip"), mode = "wb")
+zip::unzip(file.path(tmp, "download.zip"), exdir = tmp)
+
+# --- Rename the CSV and zip it into the data bundle ---
+# The download's only file is the CSV
+file.rename(list.files(tmp, pattern = "[.]csv$", full.names = TRUE),
+            file.path(tmp, "gbif_download_lycaenidae_2026.csv"))
+zip::zip(file.path(dir_data_raw, "gbif_occurrences", "gbif_download_lycaenidae_2026.zip"),
+         "gbif_download_lycaenidae_2026.csv", root = tmp)
+```
+
+The native-region layers were downloaded on 4 October 2026: the country checklists of Pinkert et al. (2022; Map of Life, doi 10.48600/mol-1sr2-nh14, version 4), GADM 3.6 level-0 countries with ten small territories that the simplified 3.6 world layer omits taken from GADM 4.1 (GADM licence: academic and non-commercial use, no redistribution), and RESOLVE Ecoregions 2017 (Dinerstein et al. 2017; CC BY 4.0). The chunk below, which is not run, downloads them again.
+
+```{r download_native_region_layers, eval = FALSE}
+# Download one file into the native_region_layers folder; `...` is its path below that folder
+get <- function(url, ...) {
+  dest <- file.path(dir_data_raw, "native_region_layers", ...)
+  dir.create(dirname(dest), recursive = TRUE, showWarnings = FALSE)
+  download.file(url, dest, mode = "wb")
+}
+
+# --- Pinkert et al. (2022) country checklists ---
+get("https://storage.googleapis.com/cdn.mol.org/dataset_downloads/butterflies_country_checklist_v4.csv",
+    "pinkert_2022", "butterflies_country_checklist_v4.csv")
+
+# --- GADM countries ---
+# GADM 3.6 level-0 countries, and ten small territories from GADM 4.1
+get("https://geodata.ucdavis.edu/gadm/gadm3.6/gadm36_adm0_r1_pk.rds",
+    "gadm", "gadm36_adm0_r1_pk.rds")
+for (iso in c("CCK", "GIB", "MCO", "MDV", "MHL", "TKL", "TUV", "VAT", "XPI", "XSP")) {
+  f <- paste0("gadm41_", iso, "_0_pk.rds")
+  get(paste0("https://geodata.ucdavis.edu/gadm/gadm4.1/pck/", f), "gadm", "gadm41_small", f)
+}
+
+# --- RESOLVE Ecoregions 2017 ---
+get("https://storage.googleapis.com/teow2016/Ecoregions2017.zip",
+    "resolve_2017", "Ecoregions2017.zip")
+```
+
+Two tables freeze answers of live web services and are read as data: `gbif_backbone/pinkert_name_match_cache.csv` holds GBIF species-match responses (strict matching, 4 October 2026) for checklist names that the other matching tiers leave unresolved, and `occurrence_cleaning/doubtful_key_map.csv` maps 17 DOUBTFUL Backbone species keys to species of the universe when the epithet is identical or a gender variant and the GBIF record-country composition overlaps by at least 0.5 with exactly one species (built on 7 October 2026 from GBIF country facets). The rules for introduced populations (nine cited cases) and species-concept exclusions (four cases) are curated tables in `occurrence_cleaning/`.
+
+# Checklist names
+
+The country checklists of Pinkert et al. (2022) use the Lamas (2015) taxonomy. Their names are matched to the species of the trait table in tiers (Backbone snapshot, subspecies synonyms, verbatim alternatives, genus synonyms, reviewed name decisions, frozen GBIF matches); cross-genus epithet matches are never applied. The output lists the countries in which each species is recorded.
+
+*Inputs:* native_region_layers/pinkert_2022/butterflies_country_checklist_v4.csv; gbif_backbone/ snapshot and pinkert_name_match_cache.csv; taxonomy/riodinid_genera.csv; trait_evidence/decisions/name_decisions.csv; s01/species_traits.csv  
+*Output:* pinkert/pinkert_species_countries.csv (representative key x country)
+
+```{r read_checklist_inputs}
+# --- Checklist and Backbone snapshot ---
+# The checklist must have the expected number of rows, with a name and a country on each
+pk <- read_chr(file.path(dir_data_raw, "native_region_layers", "pinkert_2022",
+                         "butterflies_country_checklist_v4.csv"))
+stopifnot(nrow(pk) == 87506L, !anyNA(pk$scientificname), !anyNA(pk$iso3))
+
+# Accepted species, synonyms and doubtful names of the Backbone snapshot
+acc <- read_chr(file.path(dir_data_raw, "gbif_backbone", "accepted_species_20261002.csv"))
+syn <- read_chr(file.path(dir_data_raw, "gbif_backbone", "synonyms_20261002.csv"))
+dbt <- read_chr(file.path(dir_data_raw, "gbif_backbone", "doubtful_20261002.csv"))
+
+# --- Trait table and name decisions ---
+traits <- read_chr(file.path(dir_s01, "species_traits.csv"))
+decisions <- read_chr(file.path(dir_data_raw, "trait_evidence", "decisions",
+                                "name_decisions.csv"))
+
+# Representative key of each GBIF key
+rep_of <- setNames(traits$representative_key, traits$gbif_key)
+
+# Riodinid genera, which are skipped
+riodinid <- read_chr(file.path(dir_data_raw, "taxonomy", "riodinid_genera.csv"))$genus
+```
+
+## Lycaenidae candidates
+
+The checklists have no family column. A name is a candidate if its genus is any genus-level name attached to Lycaenidae in the Backbone (accepted genera, synonym genera, genera of synonyms or doubtful names); genus homonyms in other families are caught by the family check of tier 5. Riodinid genera are skipped.
+
+```{r find_lycaenid_candidates}
+# --- Lycaenidae-linked genera ---
+# Any genus-level name attached to Lycaenidae in the Backbone
+lyc_genera <- unique(na.omit(c(
+  acc$genus, syn$genus, dbt$genus,
+  syn$canonicalName[syn$rank == "GENUS"], dbt$canonicalName[dbt$rank == "GENUS"]
+)))
+
+# --- Candidate checklist names ---
+# Unique checklist names with their normalised name and genus
+names_tab <- unique(pk[c("scientificname")])
+nn <- normalise_name(names_tab$scientificname)
+names_tab$normalised <- nn$normalised
+names_tab$genus <- nn$genus
+
+# Names in Lycaenidae-linked genera, except riodinid genera
+cand <- names_tab[!is.na(names_tab$genus) & names_tab$genus %in% lyc_genera &
+                    !names_tab$genus %in% riodinid, ]
+cat("Pinkert names:", nrow(names_tab),
+    "; in Lycaenidae-linked genera (excl. Riodinidae):", nrow(cand),
+    "; riodinid-genus names skipped:",
+    sum(names_tab$genus %in% intersect(lyc_genera, riodinid)), "\n")
+
+# --- Verbatim alternatives ---
+# Verbatim alternative names of each accepted checklist name
+verb <- unique(pk[c("scientificname", "verbatimscientificname")])
+alt_of <- lapply(split(verb$verbatimscientificname, verb$scientificname), function(v) {
+  a <- unique(trimws(unlist(strsplit(v, ";"))))
+  a[!is.na(a) & nzchar(a)]
+})
+
+# --- Backbone lookups ---
+# Match types that count as a match to the snapshot
+ok_types <- c("accepted_exact", "accepted_and_synonym", "synonym_resolved",
+              "gender_variant_accepted", "gender_variant_synonym")
+
+# Accepted key by canonical name, keeping only names that occur once
+acc_key_by_name <- stats::setNames(acc$key, acc$canonicalName)
+acc_key_by_name <- acc_key_by_name[!duplicated(names(acc_key_by_name)) &
+  !names(acc_key_by_name) %in% names(acc_key_by_name)[duplicated(names(acc_key_by_name))]]
+```
+
+## Tiers 1-2: Backbone snapshot
+
+Names are matched to the snapshot as in `s01_prepare_traits`; a synonym whose accepted taxon is a subspecies is assigned to the parent species of that subspecies.
+
+```{r match_snapshot_tiers}
+# Match names to the snapshot (tier 1) and assign subspecies synonyms to the parent species
+# (tier 2). Returns the match table of match_gbif_names() with a `tier` column.
+match_snapshot <- function(x) {
+  m <- match_gbif_names(x, acc, syn, dbt)
+  m$tier <- ifelse(m$match_type %in% ok_types, "1_snapshot", NA)
+
+  # Tier 2: a synonym whose accepted taxon is a subspecies -> its parent species
+  i <- which(m$match_type == "synonym_to_infraspecific")
+  for (j in i) {
+    s <- syn[syn$rank == "SPECIES" & syn$canonicalName == m$normalised[j], ]
+    parents <- unique(vapply(strsplit(sub(" [(].*$", "", s$accepted), " "),
+                             function(w) paste(w[1:2], collapse = " "), ""))
+    keys <- unique(na.omit(acc_key_by_name[parents]))
+    if (length(keys) == 1L) {
+      m$accepted_key[j] <- keys
+      m$accepted_name[j] <- names(acc_key_by_name)[match(keys, acc_key_by_name)]
+      m$match_type[j] <- "synonym_of_subspecies_parent"
+      m$note[j] <- paste("Backbone treats it as infraspecific:",
+                         paste(unique(s$accepted), collapse = " | "))
+      m$tier[j] <- "2_subspecies_parent"
+    }
+  }
+  m
+}
+
+# --- Match the candidate names ---
+res <- match_snapshot(cand$normalised)
+res$pinkert_name <- cand$scientificname
+res$matched_via <- ifelse(is.na(res$tier), NA, res$pinkert_name)
+```
+
+## Tier 3: verbatim alternatives
+
+A name still unmatched is tried through the verbatim names that the checklist lists for it; all matched alternatives must point to one species.
+
+```{r match_verbatim_alternatives}
+# Names still unmatched
+todo <- which(is.na(res$tier))
+for (j in todo) {
+  # Verbatim alternatives of the name, other than the name itself
+  alts <- setdiff(alt_of[[res$pinkert_name[j]]], res$pinkert_name[j])
+  if (!length(alts)) next
+
+  # The alternatives that match the snapshot must all point to one species
+  am <- match_snapshot(normalise_name(alts)$normalised)
+  hit <- which(!is.na(am$tier))
+  keys <- unique(am$accepted_key[hit])
+  if (length(keys) == 1L) {
+    h <- hit[1]
+    res[j, c("match_type", "usage_key", "status", "accepted_key", "accepted_name", "note")] <-
+      am[h, c("match_type", "usage_key", "status", "accepted_key", "accepted_name", "note")]
+    res$tier[j] <- "3_verbatim_alternative"
+    res$matched_via[j] <- alts[hit[1]]
+  } else if (length(keys) > 1L) {
+    res$note[j] <- paste("verbatim alternatives resolve to several species:",
+                         paste(unique(am$accepted_name[hit]), collapse = " | "))
+  }
+}
+```
+
+## Tier 3b: same epithet under a Backbone genus synonym
+
+If the checklist genus is a genus-rank synonym in the Backbone, a unique hit of the epithet (or a gender variant) in the accepted genus is the same taxon under the Backbone's generic placement.
+
+```{r match_genus_synonyms}
+# Genus synonyms of the Backbone with their accepted genus
+gsyn <- syn[syn$rank == "GENUS" & !is.na(syn$accepted), c("canonicalName", "accepted")]
+gsyn$accepted_genus <- sub(" .*$", "", gsyn$accepted)
+
+# Names still unmatched
+todo <- which(is.na(res$tier) & !is.na(res$normalised))
+for (j in todo) {
+  # Genus and epithet of the name; the genus must be a synonym of one accepted genus
+  g <- sub(" .*$", "", res$normalised[j])
+  e <- sub("^[^ ]+ ", "", res$normalised[j])
+  targets <- unique(gsyn$accepted_genus[gsyn$canonicalName == g])
+  if (length(targets) != 1L) next
+
+  # The epithet (or a gender variant) must have a unique hit in the accepted genus
+  cands <- paste(targets, epithet_variants(e))
+  keys <- unique(na.omit(acc_key_by_name[cands]))
+  if (length(keys) == 1L) {
+    res$accepted_key[j] <- keys
+    res$accepted_name[j] <- names(acc_key_by_name)[match(keys, acc_key_by_name)]
+    res$match_type[j] <- "genus_synonym_transfer"
+    res$note[j] <- paste0("Backbone: genus ", g, " is a synonym of ", targets)
+    res$tier[j] <- "3b_genus_synonym"
+  }
+}
+```
+
+## Tier 4: reviewed name decisions of the trait table
+
+The reviewed genus transfers, spelling variants and subspecies decisions of `s01_prepare_traits` are applied.
+
+```{r apply_name_decisions}
+# Reviewed decisions that give an accepted key
+dec_ok <- decisions[decisions$decision %in% c("genus_transfer", "spelling_variant",
+                                              "infraspecific_to_species") &
+                      grepl("^[0-9]+$", decisions$accepted_key), ]
+
+# Apply them to the names still unmatched
+todo <- which(is.na(res$tier))
+hit <- match(res$normalised[todo], dec_ok$normalised_name)
+for (k in which(!is.na(hit))) {
+  j <- todo[k]
+  r <- dec_ok[hit[k], ]
+  res$accepted_key[j] <- r$accepted_key
+  res$accepted_name[j] <- acc$canonicalName[match(r$accepted_key, acc$key)]
+  res$match_type[j] <- paste0("name_decision_", r$decision)
+  res$note[j] <- r$reason
+  res$tier[j] <- "4_name_decision"
+}
+```
+
+## Tier 5: frozen GBIF species-match responses
+
+Live answers of the GBIF species-match service can change, so the stored responses are read. Only exact matches at species or subspecies rank to species of the universe are accepted.
+
+```{r match_frozen_gbif_responses}
+# --- Stored responses ---
+cache <- read_chr(file.path(dir_data_raw, "gbif_backbone", "pinkert_name_match_cache.csv"))
+todo <- which(is.na(res$tier) & !is.na(res$normalised))
+
+# Every name still unmatched must have a stored response
+missing <- setdiff(res$normalised[todo], cache$query)
+if (length(missing)) stop(length(missing),
+                          " checklist names have no stored GBIF match response, e.g. ",
+                          missing[1], call. = FALSE)
+
+# Stored response of each name, and the species keys of the universe
+cm <- cache[match(res$normalised[todo], cache$query), ]
+universe_keys <- traits$gbif_key[traits$universe_status == "gbif_accepted"]
+
+# --- Accept exact matches ---
+for (k in seq_along(todo)) {
+  j <- todo[k]
+  r <- cm[k, ]
+  if (is.na(r$matchType) || r$matchType == "NONE") next
+
+  # Names that GBIF places outside Lycaenidae
+  if (!identical(r$family, "Lycaenidae")) {
+    res$match_type[j] <- "not_lycaenidae"
+    res$note[j] <- paste0("GBIF: ", r$canonicalName, " (", r$family, ", ", r$matchType, ")")
+    next
+  }
+
+  # Exact matches at species or subspecies rank to a species of the universe are accepted;
+  # other matches are only recorded in the note
+  if (r$matchType == "EXACT" && r$rank %in% c("SPECIES", "SUBSPECIES") &&
+      !is.na(r$speciesKey) && r$speciesKey %in% universe_keys) {
+    res$accepted_key[j] <- r$speciesKey
+    res$accepted_name[j] <- r$species
+    res$usage_key[j] <- r$usageKey
+    res$status[j] <- r$status
+    res$match_type[j] <- paste0("gbif_api_", tolower(r$status), "_", tolower(r$rank))
+    res$tier[j] <- "5_gbif_api"
+  } else {
+    res$note[j] <- paste0("GBIF API: ", r$canonicalName, " ", r$rank, " ", r$status,
+                          " ", r$matchType, "; not auto-accepted")
+  }
+}
+```
+
+## Representative keys
+
+Matched keys are mapped to the representative key of their duplicate cluster.
+
+```{r map_representative_keys}
+# Representative key of each matched name
+res$representative_key <- unname(rep_of[res$accepted_key])
+
+# A matched key outside the species universe is not a match
+bad <- !is.na(res$tier) & is.na(res$representative_key)
+if (any(bad)) {
+  res$note[bad] <- paste("accepted key not in the species universe;", res$note[bad])
+  res$tier[bad] <- NA
+  res$match_type[bad] <- "key_outside_universe"
+}
+res$species <- traits$species[match(res$representative_key, traits$gbif_key)]
+
+# Final status of each name: matched, not a Lycaenidae, or unmatched
+res$status_final <- ifelse(!is.na(res$tier), "matched",
+                           ifelse(res$match_type == "not_lycaenidae", "not_lycaenidae",
+                                  "unmatched"))
+```
+
+## Species x country table
+
+Each representative species receives the union of the countries of all checklist names matched to it.
+
+```{r species_country_table}
+# --- Countries of each representative species ---
+# Matched names with their representative species
+mt <- res[res$status_final == "matched",
+          c("pinkert_name", "representative_key", "species", "tier")]
+
+# One row per species and country: the union of the sources and checklist names
+pc <- merge(pk[c("scientificname", "iso3", "source")], mt,
+            by.x = "scientificname", by.y = "pinkert_name")
+sc <- do.call(rbind, lapply(split(pc, paste(pc$representative_key, pc$iso3)), function(z) {
+  data.frame(representative_key = z$representative_key[1],
+             species = z$species[1],
+             iso3 = z$iso3[1],
+             sources = paste(sort(unique(trimws(unlist(strsplit(z$source, ";"))))),
+                             collapse = "; "),
+             pinkert_names = paste(sort(unique(z$scientificname)), collapse = "; "),
+             # TRUE when every source entry is specimen_rec_gbif
+             gbif_specimen_only = all(trimws(z$source) == "specimen_rec_gbif"),
+             stringsAsFactors = FALSE)
+}))
+sc <- sc[order(sc$species, sc$iso3), ]
+write_table(sc, file.path(dir_data_intermediate, "pinkert", "pinkert_species_countries.csv"))
+
+# --- Summary ---
+# Representative species of the universe, and those receiving several checklist names
+reps <- traits$gbif_key[traits$universe_status == "gbif_accepted" &
+                          traits$gbif_key == traits$representative_key &
+                          !traits$genus %in% riodinid]
+several <- names(which(table(mt$representative_key) > 1L))
+print(rbind(
+  data.frame(item = "pinkert_names_total", n = nrow(names_tab)),
+  data.frame(item = "pinkert_names_in_lycaenidae_genera", n = nrow(cand)),
+  data.frame(item = paste0("status_", names(table(res$status_final))),
+             n = as.integer(table(res$status_final))),
+  data.frame(item = paste0("tier_", names(table(res$tier))),
+             n = as.integer(table(res$tier))),
+  data.frame(item = "universe_representative_species", n = length(reps)),
+  data.frame(item = "universe_species_with_pinkert_countries",
+             n = sum(reps %in% sc$representative_key)),
+  data.frame(item = "universe_species_receiving_several_pinkert_names",
+             n = sum(reps %in% several)),
+  data.frame(item = "species_country_rows", n = nrow(sc))
+), row.names = FALSE)
+```
+
+```{r clear_match_checklist_names, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Country and realm geometry
+
+GADM countries and RESOLVE biogeographic realms (Dinerstein et al. 2017) are rasterised onto a 0.05-degree grid. A country supports the realms covering at least 5% of its land, and the supported country-realm parts form each species' "listed area", so that remote territories (e.g. Hawaii within the USA) do not validate records. The country raster also serves as the land mask of the sea test.
+
+*Inputs:* native_region_layers/gadm/{gadm36_adm0_r1_pk.rds, gadm41_small/*.rds}; native_region_layers/resolve_2017/Ecoregions2017.zip; native_region_layers/pinkert_2022/butterflies_country_checklist_v4.csv; pinkert/pinkert_species_countries.csv  
+*Outputs:* geometry/realm_0p05.tif, geometry/country_0p05.tif, geometry/realm_codes.csv, geometry/country_realm_support.csv, geometry/country_realm_parts.gpkg, geometry/pinkert_species_realms.csv
+
+```{r geometry_folder}
+# terra writes only to existing folders
+out_dir <- file.path(dir_data_intermediate, "geometry")
+dir.create(out_dir, showWarnings = FALSE)
+```
+
+## Countries
+
+GADM 3.6 countries are completed with ten small territories from GADM 4.1, and every checklist country must have a geometry.
+
+```{r read_countries}
+# --- GADM countries ---
+# GADM 3.6 countries, completed with ten small territories from GADM 4.1
+world <- unwrap(readRDS(file.path(dir_data_raw, "native_region_layers", "gadm",
+                                  "gadm36_adm0_r1_pk.rds")))
+world <- world[, "GID_0"]
+small_files <- list.files(file.path(dir_data_raw, "native_region_layers", "gadm", "gadm41_small"),
+                          pattern = "[.]rds$", full.names = TRUE)
+small <- do.call(rbind, lapply(small_files, function(f) unwrap(readRDS(f))[, "GID_0"]))
+small_codes <- small$GID_0
+countries <- rbind(world[!world$GID_0 %in% small_codes, ], small)
+
+# Numeric id of each country
+country_codes <- data.frame(country_id = seq_len(nrow(countries)), iso3 = countries$GID_0)
+countries$country_id <- country_codes$country_id
+
+# --- Checklist countries ---
+# Every checklist country must have a geometry
+pk <- read_chr(file.path(dir_data_raw, "native_region_layers", "pinkert_2022",
+                         "butterflies_country_checklist_v4.csv"))
+missing <- setdiff(unique(pk$iso3), country_codes$iso3)
+if (length(missing)) stop("Pinkert countries without geometry: ",
+                          paste(missing, collapse = " "))
+```
+
+## Realms
+
+The RESOLVE ecoregions give the realms; their unnamed realm of rock and ice is labelled.
+
+```{r read_realms}
+# --- RESOLVE ecoregions ---
+# Read from inside the zip file; the unnamed realm of rock and ice is labelled
+eco <- vect(paste0("/vsizip/",
+                   file.path(dir_data_raw, "native_region_layers", "resolve_2017",
+                             "Ecoregions2017.zip"),
+                   "/Ecoregions2017.shp"))
+eco$REALM[eco$REALM == "N/A"] <- "Rock and ice"
+
+# --- Realm codes ---
+# Numeric id of each realm (in alphabetical order)
+realm_codes <- data.frame(realm_id = seq_along(sort(unique(eco$REALM))),
+                          realm = sort(unique(eco$REALM)))
+eco$realm_id <- realm_codes$realm_id[match(eco$REALM, realm_codes$realm)]
+```
+
+## Rasterise
+
+Countries and realms are rasterised onto a 0.05-degree grid, where small territories win the cells they touch. Country cells without a realm take the modal realm of their neighbours, and remote atolls missing from RESOLVE the realm of the nearest ecoregion.
+
+```{r rasterise_geometry}
+# --- Grid and helper ---
+# Global grid of 0.05 degrees
+grid <- rast(ext(-180, 180, -90, 90), resolution = 0.05, crs = "EPSG:4326")
+
+# Fill the empty cells of the raster r from a rasterisation of the polygons v in which every
+# cell touched by a polygon counts. Returns the completed raster; cells of r keep their value.
+fill_touches <- function(r, v, field) {
+  t <- rasterize(v, grid, field = field, touches = TRUE)
+  cover(r, t)
+}
+
+# --- Realm and country rasters ---
+realm_r <- rasterize(eco, grid, field = "realm_id")
+realm_r <- fill_touches(realm_r, eco, "realm_id")
+
+# Countries other than the small territories
+big <- countries[!countries$GID_0 %in% small_codes, ]
+country_r <- rasterize(big, grid, field = "country_id")
+country_r <- fill_touches(country_r, big, "country_id")
+
+# Small territories win the cells they touch
+small_v <- countries[countries$GID_0 %in% small_codes, ]
+small_r <- rasterize(small_v, grid, field = "country_id", touches = TRUE)
+country_r <- cover(small_r, country_r)
+
+# Warn about countries left without any cell
+present <- unique(values(country_r, na.rm = TRUE))
+lost <- setdiff(country_codes$country_id, present)
+if (length(lost)) warning("countries without any cell: ",
+                          paste(country_codes$iso3[lost], collapse = " "))
+
+# --- Realm for country cells without one ---
+# Modal value of the neighbouring cells, iterated
+need <- !is.na(country_r) & is.na(realm_r)
+cat("country cells without realm before filling:",
+    global(need, "sum", na.rm = TRUE)[[1]], "\n")
+for (i in 1:10) {
+  f <- focal(realm_r, w = 3, fun = "modal", na.policy = "only", na.rm = TRUE)
+  realm_r <- ifel(is.na(realm_r) & !is.na(country_r), f, realm_r)
+}
+need <- !is.na(country_r) & is.na(realm_r)
+cat("country cells without realm after modal filling:",
+    global(need, "sum", na.rm = TRUE)[[1]], "\n")
+
+# Remaining land cells (remote atolls missing from RESOLVE, e.g. Tokelau, Nauru) take the
+# realm of the nearest ecoregion. Antarctica and the Caspian Sea (GADM `XCA`) stay without a
+# realm.
+skip <- country_codes$country_id[country_codes$iso3 %in% c("ATA", "XCA")]
+cells <- which(values(need)[, 1] == 1 & !values(country_r)[, 1] %in% skip)
+if (length(cells)) {
+  pts <- vect(xyFromCell(grid, cells), crs = "EPSG:4326")
+  eco_simple <- simplifyGeom(eco, tolerance = 0.05)
+  nn <- nearest(pts, eco_simple)
+  realm_r[cells] <- eco_simple$realm_id[nn$to_id]
+  cat("cells assigned to the nearest ecoregion's realm:", length(cells),
+      "; max distance (km):", round(max(nn$distance) / 1000), "\n")
+}
+
+# --- Write the rasters and realm codes ---
+names(realm_r) <- "realm_id"
+names(country_r) <- "country_id"
+writeRaster(realm_r, file.path(out_dir, "realm_0p05.tif"),
+            overwrite = TRUE, datatype = "INT1U")
+writeRaster(country_r, file.path(out_dir, "country_0p05.tif"),
+            overwrite = TRUE, datatype = "INT2U")
+write_table(realm_codes, file.path(out_dir, "realm_codes.csv"))
+```
+
+## Country x realm areas and support
+
+A country supports the realms covering at least 5% of its land, and always its largest realm, except rock and ice and Antarctica.
+
+```{r country_realm_support}
+# --- Area of each country-realm part ---
+# The part code is country_id * 100 + realm_id (realm_id < 100)
+area <- cellSize(grid, unit = "km")
+part_r <- country_r * 100 + realm_r
+names(part_r) <- "part"
+z <- zonal(area, part_r, fun = "sum", na.rm = TRUE)
+names(z) <- c("part", "area_km2")
+z$country_id <- z$part %/% 100
+z$realm_id <- z$part %% 100
+z$iso3 <- country_codes$iso3[match(z$country_id, country_codes$country_id)]
+z$realm <- realm_codes$realm[match(z$realm_id, realm_codes$realm_id)]
+
+# --- Share of the country and realm support ---
+# Share of each part in the land of its country, and the largest realm of each country
+z$country_area_km2 <- ave(z$area_km2, z$iso3, FUN = sum)
+z$share <- z$area_km2 / z$country_area_km2
+z$largest <- ave(z$share, z$iso3, FUN = max) == z$share
+
+# A realm is supported when it covers enough of the country or is the largest, except rock and
+# ice and Antarctica
+z$supported <- (z$share >= parameters$realm_min_country_share | z$largest) &
+  !z$realm %in% c("Rock and ice", "Antarctica")
+z <- z[order(z$iso3, -z$share), c("iso3", "realm", "part", "area_km2", "country_area_km2",
+                                  "share", "largest", "supported")]
+write_table(z, file.path(out_dir, "country_realm_support.csv"))
+
+# --- Checks ---
+# Countries with more than one supported realm
+cat("\ncountries with >1 supported realm:\n")
+multi <- z[z$supported & ave(z$supported, z$iso3, FUN = sum) > 1,
+           c("iso3", "realm", "share")]
+print(multi, row.names = FALSE)
+
+# A selection of countries
+cat("\nselected checks:\n")
+print(z[z$iso3 %in% c("USA", "MEX", "CHN", "IDN", "YEM", "IND",
+                      "PNG", "AUS", "FRA", "ESP", "EGY"),
+        c("iso3", "realm", "share", "supported")],
+      row.names = FALSE)
+```
+
+## Supported parts as polygons
+
+The supported country-realm parts are saved as polygons, from which the native-region filter measures distances.
+
+```{r supported_parts}
+# Polygons of the supported country-realm parts, dissolved by part code
+supported_parts <- z$part[z$supported]
+sp_r <- classify(part_r, cbind(supported_parts, supported_parts), others = NA)
+parts <- as.polygons(sp_r, dissolve = TRUE)
+
+# Country, realm and share of country of each part
+parts$iso3 <- z$iso3[match(parts$part, z$part)]
+parts$realm <- z$realm[match(parts$part, z$part)]
+parts$share <- z$share[match(parts$part, z$part)]
+writeVector(parts, file.path(out_dir, "country_realm_parts.gpkg"), overwrite = TRUE)
+cat("\nsupported country-realm parts:", nrow(parts), "\n")
+```
+
+## Supported realms per species
+
+The supported realms of each species' checklist countries become a column of the range table.
+
+```{r species_realms}
+# Supported realms of the countries of each species
+sc <- read_chr(file.path(dir_data_intermediate, "pinkert", "pinkert_species_countries.csv"))
+sup <- z[z$supported, c("iso3", "realm")]
+m <- merge(sc[c("representative_key", "species", "iso3")], sup, by = "iso3")
+
+# One row per species, with its realms joined by "; " and their number
+sr <- aggregate(realm ~ representative_key + species, m,
+                function(v) paste(sort(unique(v)), collapse = "; "))
+names(sr)[3] <- "supported_realms"
+sr$n_realms <- lengths(strsplit(sr$supported_realms, "; "))
+write_table(sr, file.path(out_dir, "pinkert_species_realms.csv"))
+cat("species with Pinkert realms:", nrow(sr), "\n")
+print(table(sr$n_realms))
+```
+
+```{r clear_build_realm_geometry, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# GBIF import
+
+The download is checked (size, md5, integer Backbone keys) and read with the columns needed later; records without coordinates are dropped.
+
+*Inputs:* gbif_occurrences/gbif_download_lycaenidae_2026.zip and .json  
+*Output:* records_imported.rds
+
+```{r import_gbif_records}
+# --- Download metadata ---
+meta <- jsonlite::fromJSON(file.path(dir_data_raw, "gbif_occurrences",
+                                     "gbif_download_lycaenidae_2026.json"))
+
+# --- Extract and check the CSV ---
+# R's internal unzip truncates files of 4 GB or more, so the zip package (Zip64 support)
+# extracts the CSV into a temporary folder; the extracted copy is checked against the metadata
+# and deleted after reading.
+exdir <- tempfile("gbif_download_")
+dir.create(exdir)
+zip::unzip(file.path(dir_data_raw, "gbif_occurrences", "gbif_download_lycaenidae_2026.zip"),
+           files = "gbif_download_lycaenidae_2026.csv", exdir = exdir)
+csv <- file.path(exdir, "gbif_download_lycaenidae_2026.csv")
+if (!isTRUE(file.size(csv) == meta$size_bytes) || unname(tools::md5sum(csv)) != meta$md5)
+  stop("The extracted CSV differs in size or md5 from gbif_download_lycaenidae_2026.json.",
+       call. = FALSE)
+
+# Read the selected columns of the CSV; the taxon keys are kept as text
+reader <- function(select, nrows = Inf) {
+  fread(file = csv, select = select, nrows = nrows, quote = "", showProgress = FALSE,
+        colClasses = list(character = c("taxonKey", "speciesKey")))
+}
+
+# The keys must be integer GBIF Backbone keys, i.e. the download must be interpreted with
+# the Backbone
+head_rows <- reader(c("taxonKey", "speciesKey"), nrows = 1e5)
+non_integer <- mean(!grepl("^[0-9]+$", head_rows$taxonKey[nzchar(head_rows$taxonKey)]))
+if (non_integer > 0) stop(sprintf(
+  "taxonKey is not an integer GBIF Backbone key in %.1f%% of the first rows (e.g. '%s'). ",
+  100 * non_integer, head_rows$taxonKey[!grepl("^[0-9]+$", head_rows$taxonKey)][1]),
+  "The download must be interpreted with the GBIF Backbone taxonomy.", call. = FALSE)
+
+# --- Read the records ---
+cols <- c("gbifID", "datasetKey", "species", "taxonRank", "scientificName",
+          "verbatimScientificName", "taxonKey", "speciesKey", "decimalLatitude",
+          "decimalLongitude", "coordinateUncertaintyInMeters", "coordinatePrecision",
+          "countryCode", "occurrenceStatus", "individualCount", "basisOfRecord", "year",
+          "establishmentMeans", "issue", "recordedBy", "institutionCode")
+x <- reader(cols)
+unlink(exdir, recursive = TRUE)
+
+# Records without coordinates are dropped; the counts must match the metadata
+audit <- data.frame(stage = "download_rows", records = nrow(x))
+x <- x[!is.na(decimalLatitude) & !is.na(decimalLongitude)]
+audit <- rbind(audit, data.frame(stage = "with_coordinates", records = nrow(x)))
+stopifnot(audit$records == c(meta$rows, meta$rows_with_coordinates))
+
+# --- GBIF issue flags ---
+# Keep only the GBIF issue flags used as filters (the full string is large)
+used_issues <- c("ZERO_COORDINATE", "COORDINATE_INVALID", "COORDINATE_OUT_OF_RANGE",
+                 "COUNTRY_COORDINATE_MISMATCH", "PRESUMED_SWAPPED_COORDINATE",
+                 "PRESUMED_NEGATED_LATITUDE", "PRESUMED_NEGATED_LONGITUDE",
+                 "COORDINATE_REPROJECTION_FAILED", "TAXON_MATCH_FUZZY",
+                 "TAXON_MATCH_HIGHERRANK", "COORDINATE_ROUNDED")
+for (u in used_issues) set(x, j = paste0("issue_", tolower(u)),
+                           value = grepl(u, x$issue, fixed = TRUE))
+x[, issue := NULL]
+
+# --- Save ---
+saveRDS(x, file.path(dir_data_intermediate, "records_imported.rds"), compress = "gzip")
+print(audit)
+cat("species (Backbone speciesKey):", uniqueN(x$speciesKey[nzchar(x$speciesKey)]), "\n")
+```
+
+```{r clear_import_gbif_records, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Taxonomic assignment
+
+GBIF's species key is mapped to the representative key of its cluster in the trait table, so subspecies records join their species. Records on DOUBTFUL keys follow the frozen key map, and records that GBIF resolved only above species rank are assigned when their verbatim name exactly matches an accepted species or a reviewed synonym; no fuzzy matching is used.
+
+*Inputs:* records_imported.rds; s01/{species_traits,synonym_database}.csv; occurrence_cleaning/doubtful_key_map.csv; taxonomy/riodinid_genera.csv  
+*Output:* records_taxonomy.rds (adds rep_key, pool_key, rep_species, flag_taxon_*)
+
+```{r assign_taxonomy}
+# --- Records and species lookups ---
+x <- readRDS(file.path(dir_data_intermediate, "records_imported.rds"))
+traits <- read_chr(file.path(dir_s01, "species_traits.csv"))
+acc <- traits[traits$universe_status == "gbif_accepted", ]
+rep_of <- setNames(acc$representative_key, acc$gbif_key)
+sp_of <- setNames(acc$species, acc$gbif_key)
+
+# --- Taxon flags and representative key ---
+# Flags for records above species rank and for riodinid genera
+x[, flag_taxon_rank := !taxonRank %in% c("SPECIES", "SUBSPECIES", "VARIETY", "FORM")]
+x[, genus_name := sub(" .*$", "", species)]
+riodinid <- read_chr(file.path(dir_data_raw, "taxonomy", "riodinid_genera.csv"))$genus
+x[, flag_taxon_riodinid := genus_name %in% riodinid]
+
+# Representative key of the cluster of each GBIF species key
+x[, rep_key := unname(rep_of[speciesKey])]
+
+# --- DOUBTFUL Backbone keys ---
+# Map rows whose target is no longer a representative (clusters changed after the map was
+# built) are ignored.
+dk <- read_chr(file.path(dir_data_raw, "occurrence_cleaning", "doubtful_key_map.csv"))
+dk <- dk[!is.na(dk$rep_key), ]
+stale <- !dk$rep_key %in% acc$representative_key
+if (any(stale)) {
+  message(sum(stale), " DOUBTFUL-map rows point to keys that are no longer ",
+          "representatives: ignored")
+  dk <- dk[!stale, ]
+}
+hit <- is.na(x$rep_key) & x$speciesKey %in% dk$speciesKey
+x[hit, rep_key := dk$rep_key[match(speciesKey, dk$speciesKey)]]
+cat("records mapped from DOUBTFUL keys:", sum(hit), "\n")
+
+# --- Verbatim-name recovery ---
+# Records still without a key (except riodinids) are matched by their verbatim name,
+# e.g. 'Chrysoritis zeuxo', absent from the Backbone and resolved to its genus. Accepted names
+# take precedence over synonyms; recovered records keep GBIF's interpretation in taxonRank.
+syn <- read_chr(file.path(dir_s01, "synonym_database.csv"))
+syn <- syn[syn$gbif_accepted_key %in% acc$gbif_key &
+             syn$resolution_confidence %in% c("high", "high_manual",
+                                              "medium_orthographic_variant",
+                                              "medium_reviewed_transfer"), ]
+
+# Representative key by accepted name and by reviewed synonym name
+name_rep <- c(setNames(acc$representative_key, acc$canonical),
+              setNames(unname(rep_of[syn$gbif_accepted_key]),
+                       gsub("_", " ", syn$normalised_name)))
+name_rep <- name_rep[!duplicated(names(name_rep))]
+
+# Genus and epithet of the verbatim name of each unassigned, non-riodinid record (NA when the
+# name has another form)
+cand <- is.na(x$rep_key) & !x$flag_taxon_riodinid
+vb <- sub("^([A-Z][a-z]+) +[(]?[A-Z]?[a-z]*[)]? *([a-z][a-z-]+).*$", "\\1 \\2",
+          trimws(x$verbatimScientificName[cand]))
+vb[!grepl("^[A-Z][a-z]+ [a-z][a-z-]+$", vb)] <- NA
+rec_key <- unname(name_rep[vb])
+
+# Assign the recovered records
+x[, taxon_recovered_verbatim := FALSE]
+ii <- which(cand)[!is.na(rec_key)]
+x[ii, `:=`(rep_key = rec_key[!is.na(rec_key)], flag_taxon_rank = FALSE,
+           taxon_recovered_verbatim = TRUE)]
+cat("records recovered from verbatim names:", length(ii),
+    "; species:", uniqueN(x$rep_key[ii]), "\n")
+
+# --- Records outside the species universe ---
+x[, flag_taxon_outside_universe := !flag_taxon_rank & !flag_taxon_riodinid &
+      is.na(rep_key)]
+
+# Species name and pool key of each record (each species starts as its own pool)
+x[, rep_species := unname(sp_of[rep_key])]
+x[, genus_name := NULL]
+x[, pool_key := rep_key]
+
+# Species keys outside the universe, by number of records
+um <- x[flag_taxon_outside_universe == TRUE, .(records = .N),
+        by = .(speciesKey, species)][order(-records)]
+
+# --- Summary and save ---
+print(data.frame(
+  stage = c("records_with_coordinates", "above_species_rank", "riodinidae",
+            "species_key_outside_universe", "assigned_to_universe_species",
+            "species_assigned", "recovered_from_verbatim_name"),
+  n = c(nrow(x), sum(x$flag_taxon_rank), sum(x$flag_taxon_riodinid),
+        sum(x$flag_taxon_outside_universe), sum(!is.na(x$rep_key)),
+        uniqueN(x$rep_key, na.rm = TRUE), sum(x$taxon_recovered_verbatim))))
+cat("largest unassigned keys:\n")
+print(head(um, 15))
+saveRDS(x, file.path(dir_data_intermediate, "records_taxonomy.rds"), compress = "gzip")
+```
+
+```{r clear_assign_taxonomy, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Record metadata flags
+
+Each record-level rule becomes a flag: absence records, records before 1900, counts above 1,000 individuals, fossil and living specimens, records stated to be non-native, coordinate uncertainty above 25 km (main) or 100 km (inclusive), missing uncertainty with fewer than two decimals (main), and GBIF coordinate issues. GBIF taxon-match issues are recorded but not used, because at species rank they mostly mark correctly resolved subspecies names and spelling variants.
+
+*Input:* records_taxonomy.rds  
+*Output:* records_meta.rds
+
+```{r flag_record_metadata}
+x <- readRDS(file.path(dir_data_intermediate, "records_taxonomy.rds"))
+
+# --- Number of decimals ---
+# Number of decimals as written. GBIF stores coordinates as numbers, so the shortest
+# representation (up to 6 decimals) is used.
+decimals <- function(v) {
+  s <- sub("0+$", "", sprintf("%.6f", abs(v)))
+  nchar(sub("^[0-9]*[.]?", "", s))
+}
+
+# --- Record metadata flags ---
+# Absence, year, individual count, basis of record and establishment means
+x[, flag_absent := !is.na(occurrenceStatus) & toupper(occurrenceStatus) == "ABSENT"]
+x[, flag_year := !is.na(year) & year < parameters$year_min]
+x[, flag_count := !is.na(individualCount) &
+      (individualCount <= 0 | individualCount > parameters$individual_count_max)]
+x[, flag_basis := basisOfRecord %in% parameters$excluded_basis_of_record]
+x[, flag_establishment := tolower(establishmentMeans) %in%
+      parameters$excluded_establishment_means]
+
+# Coordinate uncertainty: the limit of inclusive, and the limit of main, where a missing
+# uncertainty needs at least the minimum number of decimals
+x[, flag_uncertainty_inclusive := !is.na(coordinateUncertaintyInMeters) &
+      coordinateUncertaintyInMeters > parameters$uncertainty_max_inclusive_m]
+x[, min_decimals := pmin(decimals(decimalLatitude), decimals(decimalLongitude))]
+x[, flag_uncertainty_main :=
+      (!is.na(coordinateUncertaintyInMeters) &
+         coordinateUncertaintyInMeters > parameters$uncertainty_max_main_m) |
+      (is.na(coordinateUncertaintyInMeters) &
+         min_decimals < parameters$na_uncertainty_min_decimals)]
+
+# --- GBIF issue flags ---
+# Coordinate issues; the taxon-match issues are recorded but not used as a filter
+x[, flag_gbif_coordinate_issue := issue_zero_coordinate | issue_coordinate_invalid |
+      issue_coordinate_out_of_range | issue_country_coordinate_mismatch |
+      issue_presumed_swapped_coordinate | issue_presumed_negated_latitude |
+      issue_presumed_negated_longitude | issue_coordinate_reprojection_failed]
+x[, flag_gbif_taxon_issue := issue_taxon_match_fuzzy | issue_taxon_match_higherrank]
+
+# --- Summary and save ---
+flags <- grep("^flag_", names(x), value = TRUE)
+print(data.frame(flag = flags,
+                 records = vapply(flags, function(f) sum(x[[f]]), 0),
+                 share = vapply(flags, function(f) mean(x[[f]]), 0)),
+      row.names = FALSE)
+saveRDS(x, file.path(dir_data_intermediate, "records_meta.rds"), compress = "gzip")
+```
+
+```{r clear_flag_record_metadata, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Coordinate tests
+
+CoordinateCleaner (Zizka et al. 2019) flags capitals, country and province centroids, biodiversity institutions, the GBIF headquarters, zero and equal coordinates; records with no land within about 10 km are flagged as at sea. The tests run once per unique coordinate.
+
+*Inputs:* records_meta.rds; geometry/country_0p05.tif  
+*Output:* records_coord.rds
+
+```{r test_coordinates}
+# --- Unique coordinates ---
+x <- readRDS(file.path(dir_data_intermediate, "records_meta.rds"))
+u <- unique(x[, .(decimalLongitude, decimalLatitude)])
+cat("records:", nrow(x), "; unique coordinates:", nrow(u), "\n")
+u <- as.data.frame(u)
+
+# --- CoordinateCleaner tests ---
+# Run the CoordinateCleaner test f on the unique coordinates in blocks of 250,000 rows.
+# Returns a logical vector, TRUE for the flagged coordinates; `...` are further arguments
+# of f.
+run <- function(f, ...) {
+  out <- logical(nrow(u))
+  chunk <- 250000L
+  for (s in seq.int(1L, nrow(u), by = chunk)) {
+    i <- s:min(s + chunk - 1L, nrow(u))
+    out[i] <- !f(u[i, ], lon = "decimalLongitude", lat = "decimalLatitude",
+                 value = "flagged", verbose = FALSE, ...)
+  }
+  out
+}
+
+# Capitals, country and province centroids, biodiversity institutions, the GBIF headquarters,
+# zero and equal coordinates
+u$flag_cc_capital <- run(CoordinateCleaner::cc_cap,
+                         buffer = parameters$capital_buffer_inclusive_m)
+u$flag_cc_centroid <- run(CoordinateCleaner::cc_cen, buffer = 1000, test = "both")
+u$flag_cc_institution <- run(CoordinateCleaner::cc_inst, buffer = 100)
+u$flag_cc_gbif_hq <- run(CoordinateCleaner::cc_gbif, buffer = 1000)
+u$flag_cc_zero <- run(CoordinateCleaner::cc_zero, buffer = 0.5)
+u$flag_cc_equal <- run(CoordinateCleaner::cc_equ, test = "absolute")
+
+# --- At sea ---
+# At sea: no land within two 0.05-degree cells (about 10 km). Coordinates with no value in the
+# land raster are also flagged.
+land <- rast(file.path(dir_data_intermediate, "geometry", "country_0p05.tif"))
+land <- !is.na(land)
+near_land <- focal(land, w = 5, fun = "max", na.rm = TRUE)
+u$flag_sea <- extract(near_land,
+                      as.matrix(u[c("decimalLongitude", "decimalLatitude")]))[, 1] != 1
+u$flag_sea[is.na(u$flag_sea)] <- TRUE
+
+# --- Join to the records and save ---
+x <- merge(x, as.data.table(u), by = c("decimalLongitude", "decimalLatitude"), sort = FALSE)
+flags <- grep("^flag_cc_|^flag_sea$", names(x), value = TRUE)
+print(data.frame(flag = flags,
+                 unique_coordinates = vapply(flags, function(f) sum(u[[f]]), 0),
+                 records = vapply(flags, function(f) sum(x[[f]]), 0)),
+      row.names = FALSE)
+saveRDS(x, file.path(dir_data_intermediate, "records_coord.rds"), compress = "gzip")
+```
+
+```{r clear_test_coordinates, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Native-region filter
+
+The base filters define the main and inclusive record sets; near capitals only records within 1 km, or within 10 km when imprecise, are removed. Records are grouped into 25-km Equal Earth cells. Where a species' records broadly agree with its checklist (at least 80% of cells within 300 km of the listed area), main removes cells more than 300 km from the listed area in an unsupported realm or more than 1,000 km away anywhere, and strict_plus removes all cells more than 300 km away. Otherwise, realms holding at least 10% of the species' cells or cells from at least two datasets are treated as native, cells in other realms more than 300 km from them are removed, and cells on another continent (more than 1,000 km from the listed area in a realm no listed country supports) are removed unless they are the majority.
+
+*Inputs:* records_coord.rds; geometry/*; pinkert/pinkert_species_countries.csv  
+*Outputs:* records_base.rds (slim record table with base flags and cell ids), native/species_native_summary.csv
+
+```{r apply_base_filters}
+# --- Capital rule ---
+# Coordinates flagged by the capital test that lie within the strict capital buffer
+x <- readRDS(file.path(dir_data_intermediate, "records_coord.rds"))
+cap_u <- unique(x[flag_cc_capital == TRUE, .(decimalLongitude, decimalLatitude)])
+cap_u[, within_1km := !CoordinateCleaner::cc_cap(as.data.frame(cap_u),
+                                                  lon = "decimalLongitude",
+                                                  lat = "decimalLatitude",
+                                                  buffer = parameters$capital_buffer_strict_m,
+                                                  value = "flagged", verbose = FALSE)]
+x <- merge(x, cap_u, by = c("decimalLongitude", "decimalLatitude"),
+           all.x = TRUE, sort = FALSE)
+x[is.na(within_1km), within_1km := FALSE]
+
+# Imprecise records: uncertainty missing or above the limit, or too few decimals
+x[, imprecise := (is.na(coordinateUncertaintyInMeters) |
+                    coordinateUncertaintyInMeters > parameters$capital_imprecise_m) |
+      min_decimals < parameters$capital_min_decimals]
+
+# Main rule: a flagged record is removed if it is within the strict buffer or imprecise
+x[, flag_cc_capital_main := flag_cc_capital & (within_1km | imprecise)]
+cat("capital flag: 10 km rule", sum(x$flag_cc_capital),
+    "records; main rule", sum(x$flag_cc_capital_main), "\n")
+
+# --- Base filters ---
+# Any coordinate test, with the main capital rule
+cc_any_main <- x$flag_cc_capital_main | x$flag_cc_centroid | x$flag_cc_institution |
+  x$flag_cc_gbif_hq | x$flag_cc_zero | x$flag_cc_equal
+
+# Records of a species of the universe
+taxon_ok <- !x$flag_taxon_rank & !x$flag_taxon_riodinid & !x$flag_taxon_outside_universe
+
+# Base set of main: taxon, metadata, coordinate and sea filters. GBIF taxon-match issues are
+# diagnostic only.
+x[, base_main := taxon_ok & !flag_absent & !flag_year & !flag_count & !flag_basis &
+      !flag_establishment & !flag_uncertainty_main & !flag_gbif_coordinate_issue &
+      !cc_any_main & !flag_sea]
+
+# Base set of the inclusive dataset (the least restrictive): only fossils are excluded by basis of
+# record
+x[, base_inclusive := taxon_ok & !flag_absent & !flag_year & !flag_count &
+      !(basisOfRecord %in% "FOSSIL_SPECIMEN") & !flag_uncertainty_inclusive & !cc_any_main &
+      !issue_country_coordinate_mismatch]
+cat("records:", nrow(x), "; base_main:", sum(x$base_main),
+    "; base_inclusive:", sum(x$base_inclusive), "\n")
+```
+
+## 25-km Equal Earth cells
+
+Records are assigned to 25-km Equal Earth cells, realms and countries, and only the columns needed later are kept.
+
+```{r assign_cells}
+# --- 25-km cells ---
+# 25-km Equal Earth cell of each record, projected in chunks of one million records (avoids
+# running out of memory)
+grid25 <- global_thinning_grid(parameters$outlier_cell_km)
+ee <- crs(grid25)
+cell25 <- integer(nrow(x))
+for (s0 in seq(1L, nrow(x), by = 1000000L)) {
+  i <- s0:min(s0 + 999999L, nrow(x))
+  pts <- vect(as.matrix(x[i, .(decimalLongitude, decimalLatitude)]), crs = "EPSG:4326")
+  cell25[i] <- cellFromXY(grid25, crds(project(pts, ee)))
+}
+x[, cell25 := cell25]
+rm(pts, cell25)
+invisible(gc())
+
+# --- Realm and country ---
+realm_r <- rast(file.path(dir_data_intermediate, "geometry", "realm_0p05.tif"))
+realm_codes <- read_chr(file.path(dir_data_intermediate, "geometry", "realm_codes.csv"))
+x[, realm_id := extract(realm_r,
+                        as.matrix(x[, .(decimalLongitude, decimalLatitude)]))[, 1]]
+x[, realm := realm_codes$realm[match(realm_id, as.integer(realm_codes$realm_id))]]
+x[, iso3 := countrycode::countrycode(countryCode, "iso2c", "iso3c", warn = FALSE)]
+
+# Kosovo (country code XK) takes GADM's code XKO
+x[countryCode == "XK", iso3 := "XKO"]
+
+# --- Slim record table ---
+# Only the columns needed later, with the base flags and cell ids
+slim <- x[, .(gbifID, pool_key, rep_key, rep_species, decimalLongitude, decimalLatitude,
+              datasetKey, year, recordedBy, basisOfRecord, iso3, realm, cell25,
+              base_main, base_inclusive)]
+rm(x)
+invisible(gc())
+```
+
+## Cell table for base_main
+
+The filter works on the occupied cells of each species, each represented by its first record.
+
+```{r occupied_cells}
+# Occupied 25-km cells of each unit among the base_main records, each represented by the
+# coordinates and realm of its first record
+m <- slim[base_main == TRUE]
+cells <- m[, .(lon = decimalLongitude[1], lat = decimalLatitude[1], n_records = .N,
+               n_datasets = uniqueN(datasetKey),
+               realm = realm[1]),
+           by = .(pool_key, cell25)]
+cat("species units:", uniqueN(cells$pool_key), "; occupied 25-km cells:", nrow(cells), "\n")
+```
+
+## Listed area per unit
+
+Each cell's distance to the species' listed area decides whether the checklist is reliable for the species and which cells are removed; without a reliable checklist the realms supported by the records decide.
+
+```{r native_region_rule}
+# --- Geometry and checklists ---
+# Supported country-realm parts (simplified), checklist countries and supported realms
+parts <- vect(file.path(dir_data_intermediate, "geometry", "country_realm_parts.gpkg"))
+parts <- simplifyGeom(parts, tolerance = 0.02)
+sc <- read_chr(file.path(dir_data_intermediate, "pinkert", "pinkert_species_countries.csv"))
+support <- read_chr(file.path(dir_data_intermediate, "geometry", "country_realm_support.csv"))
+support <- support[support$supported == "TRUE", ]
+
+# Country-realm part code of each cell's representative point (as in the geometry section)
+country_r <- rast(file.path(dir_data_intermediate, "geometry", "country_0p05.tif"))
+part_r <- country_r * 100 + realm_r
+cells[, part := extract(part_r, as.matrix(cells[, .(lon, lat)]))[, 1]]
+cat("cells with a country-realm code:", sum(!is.na(cells$part)), "of", nrow(cells), "\n")
+
+# --- Apply the rule to the cells of each unit ---
+cells_by_unit <- split(cells, by = "pool_key")
+n_done <- 0L
+res <- vector("list", length(cells_by_unit))
+names(res) <- names(cells_by_unit)
+for (pk in names(res)) {
+  ce <- copy(cells_by_unit[[pk]])
+  n_done <- n_done + 1L
+  if (n_done %% 250L == 0L) cat("native-region units:", n_done, "of", length(res),
+                                format(Sys.time(), "%H:%M:%S"), "\n")
+
+  # Distance of each cell to the listed area, and whether the checklist is reliable
+  # (without a list the status is "no_list")
+  iso <- unique(sc$iso3[sc$representative_key %in% pk])
+  ce[, `:=`(d_listed_km = NA_real_, pinkert_status = "no_list")]
+  if (length(iso)) {
+    sup <- support[support$iso3 %in% iso, ]
+    pv <- parts[parts$iso3 %in% iso &
+                  paste(parts$iso3, parts$realm) %in% paste(sup$iso3, sup$realm), ]
+    if (nrow(pv)) {
+      # Cells whose 5-km country-realm code is a listed supported part are inside the listed
+      # area (d = 0); geodesic distances to the (simplified) part polygons are computed only
+      # for the remaining cells.
+      inside <- ce$part %in% as.integer(sup$part)
+      ce$d_listed_km <- 0
+      if (any(!inside)) {
+        pp <- vect(as.matrix(ce[!inside, .(lon, lat)]), crs = "EPSG:4326")
+        dm <- distance(pp, pv) / 1000
+        ce$d_listed_km[!inside] <- apply(dm, 1, min)
+      }
+      sup_realms <- unique(sup$realm)
+      ce$realm_supported <- ce$realm %in% sup_realms
+
+      # The checklist is used when enough cells are close to the listed area
+      coverage <- mean(ce$d_listed_km <= parameters$pinkert_reliability_buffer_km)
+      ce$pinkert_coverage <- coverage
+      ce$pinkert_status <-
+        if (coverage >= parameters$pinkert_reliability_min_coverage) "used" else "conflict"
+    }
+  }
+
+  # --- Cells to remove ---
+  if (ce$pinkert_status[1] == "used") {
+    # Reliable checklist: remove cells far from the listed area
+    ce$remove_native_main <-
+      (ce$d_listed_km > parameters$pinkert_remove_other_realm_km & !ce$realm_supported) |
+      ce$d_listed_km > parameters$pinkert_remove_any_realm_km
+    ce$remove_native_strict <- ce$d_listed_km > parameters$pinkert_remove_strict_km
+    ce$native_rule <- "pinkert"
+  } else {
+    # Data-driven fallback on realms: realms with enough cells or datasets are native
+    rs <- ce[, .(cells = .N, datasets = sum(n_datasets)), by = realm]
+    rs[, share := cells / sum(cells)]
+    sup_r <- rs$realm[rs$share >= parameters$fallback_realm_min_cell_share |
+                        rs$datasets >= parameters$fallback_realm_min_datasets]
+    sup_r <- sup_r[!is.na(sup_r)]
+    ce$realm_supported <- ce$realm %in% sup_r | is.na(ce$realm)
+
+    # Cells in other realms are removed when far from the cells of the native realms
+    ce$remove_native_main <- FALSE
+    if (any(!ce$realm_supported) && any(ce$realm_supported)) {
+      a <- vect(as.matrix(ce[realm_supported == FALSE, .(lon, lat)]), crs = "EPSG:4326")
+      b <- vect(as.matrix(ce[realm_supported == TRUE, .(lon, lat)]), crs = "EPSG:4326")
+      dd <- apply(distance(a, b) / 1000, 1, min)
+      ce$remove_native_main[!ce$realm_supported] <- dd > parameters$fallback_remove_km
+    }
+    ce$remove_native_strict <- ce$remove_native_main
+    ce$native_rule <- paste0("fallback_", ce$pinkert_status[1])
+
+    # Wrong-continent override when the list is unreliable (see the section introduction)
+    if (ce$pinkert_status[1] == "conflict") {
+      far <- ce$d_listed_km > parameters$pinkert_remove_any_realm_km &
+        !(ce$realm %in% sup_realms)
+      if (any(far) && mean(far) < 0.5) {
+        ce$remove_native_main <- ce$remove_native_main | far
+        ce$remove_native_strict <- ce$remove_native_strict | far
+        ce$native_rule <- "fallback_conflict+wrong_continent"
+      }
+    }
+  }
+  res[[pk]] <- ce
+}
+
+# --- Summary per unit ---
+cells_native <- rbindlist(res, fill = TRUE)
+summ <- cells_native[, .(cells = .N,
+                         pinkert_status = pinkert_status[1],
+                         native_rule = native_rule[1],
+                         pinkert_coverage = pinkert_coverage[1],
+                         cells_removed_main = sum(remove_native_main),
+                         cells_removed_strict = sum(remove_native_strict)),
+                     by = pool_key]
+summ[, species := slim$rep_species[match(pool_key, slim$pool_key)]]
+write_table(summ, file.path(dir_data_intermediate, "native", "species_native_summary.csv"))
+print(summ[, .N, by = native_rule])
+cat("cells removed (main):", sum(cells_native$remove_native_main), "of", nrow(cells_native),
+    "; species affected:", sum(summ$cells_removed_main > 0), "\n")
+
+# --- Flags on the records ---
+# Records outside the cell table (not in base_main) are not removed
+slim <- merge(slim, cells_native[, .(pool_key, cell25, remove_native_main,
+                                     remove_native_strict)],
+              by = c("pool_key", "cell25"), all.x = TRUE, sort = FALSE)
+slim[is.na(remove_native_main),
+     `:=`(remove_native_main = FALSE, remove_native_strict = FALSE)]
+saveRDS(slim, file.path(dir_data_intermediate, "records_base.rds"), compress = "gzip")
+```
+
+```{r clear_flag_native_regions, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Introductions and outliers
+
+Nine documented introductions and four species-concept errors (e.g. *Celastrina argiolus* records in the Americas) are removed by cited geographic rules. Outlying groups of localities are then found by single-linkage clustering of one locality per 25-km cell: a group of at most 10% of localities (or two) is an outlier if its gap to the rest exceeds 250 km and half the diameter of the remaining localities (main; groups corroborated by independent sources within 100 km are kept) or 200 km and a quarter of the diameter (strict_plus; all groups removed). Removal never leaves a species with fewer than five unique localities. The step defines the three datasets and writes the final record table and the record counts reported in the paper.
+
+*Inputs:* records_base.rds; s01/species_traits.csv; occurrence_cleaning/{introduced_populations,taxonomic_range_exclusions}.csv  
+*Outputs:* records_final.rds, outlier_groups.csv, dataset_counts.csv
+
+```{r read_base_records}
+# Records with the base flags, native-region removals and cell ids
+x <- readRDS(file.path(dir_data_intermediate, "records_base.rds"))
+```
+
+## Introduced populations and species-concept exclusions
+
+Each curated rule flags the records of one species outside listed realms, in listed countries or in a bounding box.
+
+```{r apply_curated_rules}
+# Representative key of each GBIF key
+traits <- read_chr(file.path(dir_s01, "species_traits.csv"))
+rep_of <- setNames(traits$representative_key, traits$gbif_key)
+
+# Flag the records that each rule of a curated table selects, in the new logical column
+# `flag` of x (modified by reference). The rule types are realm_not_in (records outside the
+# listed realms), countries (records in the listed countries) and bbox (records inside a
+# box whose limits are listed as longitude minimum and maximum, then latitude minimum and
+# maximum).
+apply_rules <- function(tab, flag) {
+  x[, (flag) := FALSE]
+  for (i in seq_len(nrow(tab))) {
+    # Records of the rule's unit, and the values of the rule
+    pk <- unname(rep_of[tab$gbif_key[i]])
+    vals <- strsplit(tab$rule_value[i], ";")[[1]]
+    sel <- x$pool_key == pk & !is.na(x$pool_key)
+
+    # Records of the unit that the rule selects
+    hit <- switch(tab$rule_type[i],
+      realm_not_in = sel & !is.na(x$realm) & !x$realm %in% vals,
+      countries = sel & !is.na(x$iso3) & x$iso3 %in% vals,
+      bbox = {
+        b <- as.numeric(vals)
+        sel & x$decimalLongitude >= b[1] & x$decimalLongitude <= b[2] &
+          x$decimalLatitude >= b[3] & x$decimalLatitude <= b[4]
+      },
+      stop("unknown rule type ", tab$rule_type[i]))
+    x[hit, (flag) := TRUE]
+    cat(sprintf("%-14s %-24s %-13s records flagged: %d\n", flag, tab$species[i],
+                tab$rule_type[i], sum(hit)))
+  }
+}
+
+# Introduced populations and species-concept exclusions
+apply_rules(read_chr(file.path(dir_data_raw, "occurrence_cleaning",
+                               "introduced_populations.csv")),
+            "flag_introduced")
+apply_rules(read_chr(file.path(dir_data_raw, "occurrence_cleaning",
+                               "taxonomic_range_exclusions.csv")),
+            "flag_taxonomic_exclusion")
+
+# Species-concept exclusions are removed from the base sets of main and inclusive
+x[flag_taxonomic_exclusion == TRUE, `:=`(base_main = FALSE, base_inclusive = FALSE)]
+```
+
+## Outliers
+
+Outlying groups of localities are found by the proportional gap rule below, applied repeatedly so that outliers cannot mask each other. In `main`, a group is kept if independent sources report it within 100 km of each other. In both datasets, removal never leaves a species with fewer than five unique localities.
+
+```{r define_outlier_functions}
+#' Great-circle distance matrix (km) between points given in degrees.
+#' @param lon,lat Numeric vectors (degrees).
+#' @return Symmetric numeric matrix in kilometres.
+gc_distance_matrix <- function(lon, lat) {
+  stopifnot(length(lon) == length(lat))
+  r <- pi / 180
+
+  # Unit vectors of the points; their dot product is the cosine of the central angle
+  x <- cos(lat * r) * cos(lon * r)
+  y <- cos(lat * r) * sin(lon * r)
+  z <- sin(lat * r)
+  dot <- outer(x, x) + outer(y, y) + outer(z, z)
+
+  # Rounding can push the dot product beyond -1 and 1; the replacement keeps matrix dims
+  dot[dot > 1] <- 1
+  dot[dot < -1] <- -1
+
+  # Distance with the mean Earth radius
+  6371.0088 * acos(dot)
+}
+
+#' Flag outlier groups among thinned localities with the proportional gap rule.
+#'
+#' Localities are clustered by single linkage on great-circle distance. Every
+#' subtree G of the dendrogram is a candidate. In single linkage the minimum
+#' distance between G and all other localities equals the height at which G
+#' joins its parent, so gap(G) is read directly from the tree. G is an outlier
+#' group if (1) gap > f x diameter of the remaining localities (computed
+#' without G, so an outlier cannot inflate its own yardstick), (2) gap >
+#' floor_km, and (3) |G| <= max(2, minority_share x n) while at least three
+#' localities remain. Groups are removed one at a time, the most extreme first
+#' (largest gap / rest diameter), and the rule is re-applied to the remaining
+#' localities (outliers can mask each other); the total flagged never exceeds
+#' the size limit. Taking one group per pass matters in small samples: a pass
+#' that finds more groups than the limit allows would otherwise flag nothing.
+#' @param lon,lat Coordinates of unique thinned localities (degrees).
+#' @param f Proportion of the remaining diameter that the gap must exceed.
+#' @param floor_km Absolute minimum gap in km.
+#' @param minority_share Maximum group size as a share of localities.
+#' @return Data frame with one row per locality: `outlier` (logical),
+#'   `group` (integer id of the flagged group, NA otherwise), `gap_km`,
+#'   `rest_diameter_km` (for flagged groups).
+flag_outlier_groups <- function(lon, lat, f = 0.5, floor_km = 250, minority_share = 0.1) {
+  # Outliers can mask each other (a second distant point inflates the "rest"
+  # diameter), so the rule is applied repeatedly to the not-yet-flagged
+  # localities until no new group is found. The minority limit stays relative
+  # to the original number of localities.
+  n <- length(lon)
+  out <- data.frame(outlier = rep(FALSE, n), group = NA_integer_,
+                    gap_km = NA_real_, rest_diameter_km = NA_real_)
+  max_size <- max(2L, floor(minority_share * n))
+  gid <- 0L
+  repeat {
+    keep <- which(!out$outlier)
+    if (length(keep) < 3L) break
+
+    # Localities that may still be flagged: the size limit minus those flagged already, and
+    # at least three localities must remain
+    room <- min(max_size - sum(out$outlier), length(keep) - 3L)
+    if (room < 1L) break
+    r <- flag_outlier_groups_once(lon[keep], lat[keep], f, floor_km, room)
+    if (!any(r$outlier)) break
+
+    # Take only the most extreme flagged group in this pass
+    gs <- unique(r$group[r$outlier])
+    strength <- vapply(gs, function(g) {
+      i <- which(r$group == g)[1]
+      r$gap_km[i] / max(r$rest_diameter_km[i], 1e-9)
+    }, 0)
+    g_best <- gs[which.max(strength)]
+    sel <- which(r$group == g_best)
+    hit <- keep[sel]
+    gid <- gid + 1L
+    out$outlier[hit] <- TRUE
+    out$group[hit] <- gid
+    out$gap_km[hit] <- r$gap_km[sel]
+    out$rest_diameter_km[hit] <- r$rest_diameter_km[sel]
+  }
+  out
+}
+
+#' One pass of the proportional gap rule (used by flag_outlier_groups()).
+#' @param max_size Largest group size that may be flagged.
+#' @return Data frame as returned by flag_outlier_groups().
+flag_outlier_groups_once <- function(lon, lat, f, floor_km, max_size) {
+  n <- length(lon)
+  out <- data.frame(outlier = rep(FALSE, n), group = NA_integer_,
+                    gap_km = NA_real_, rest_diameter_km = NA_real_)
+  if (n < 3L) return(out)
+
+  # --- Single-linkage tree ---
+  D <- gc_distance_matrix(lon, lat)
+  hc <- stats::hclust(stats::as.dist(D), method = "single")
+
+  # Members of each merge node (negative = singleton)
+  members <- vector("list", n - 1L)
+  get_members <- function(k) if (k < 0) -k else members[[k]]
+  for (k in seq_len(n - 1L)) members[[k]] <- c(get_members(hc$merge[k, 1]),
+                                               get_members(hc$merge[k, 2]))
+
+  # Height at which each node (singleton or merge) joins its parent
+  parent_height_single <- numeric(n)
+  parent_height_node <- rep(NA_real_, n - 1L)
+  for (k in seq_len(n - 1L)) for (s in 1:2) {
+    child <- hc$merge[k, s]
+    if (child < 0) parent_height_single[-child] <- hc$height[k] else
+      parent_height_node[child] <- hc$height[k]
+  }
+
+  # Global diameter pair, reused when G does not contain either end
+  ij <- which(D == max(D), arr.ind = TRUE)[1, ]
+  diameter_without <- function(g) {
+    if (!any(ij %in% g)) return(D[ij[1], ij[2]])
+    keep <- setdiff(seq_len(n), g)
+    if (length(keep) < 2L) return(0)
+    max(D[keep, keep])
+  }
+
+  # --- Candidate groups ---
+  # Every singleton, and every merge node of at most max_size members; the loop over the
+  # merges stops before the root (the last merge), which has no parent
+  cand <- list()
+  for (i in seq_len(n)) cand[[length(cand) + 1L]] <- list(g = i,
+                                                          gap = parent_height_single[i])
+  for (k in seq_len(n - 2L)) {
+    if (length(members[[k]]) <= max_size)
+      cand[[length(cand) + 1L]] <- list(g = members[[k]], gap = parent_height_node[k])
+  }
+
+  # --- Flag the groups with a large gap ---
+  flagged <- list()
+  for (cnd in cand) {
+    if (length(cnd$g) > max_size || is.na(cnd$gap) || cnd$gap <= floor_km) next
+    rest_d <- diameter_without(cnd$g)
+    if (cnd$gap > f * rest_d) flagged[[length(flagged) + 1L]] <-
+      list(g = cnd$g, gap = cnd$gap, rest = rest_d)
+  }
+  if (!length(flagged)) return(out)
+
+  # Keep maximal groups only
+  sizes <- vapply(flagged, function(z) length(z$g), 1L)
+  flagged <- flagged[order(-sizes)]
+  gid <- 0L
+  for (z in flagged) {
+    if (any(out$outlier[z$g])) next
+    gid <- gid + 1L
+    out$outlier[z$g] <- TRUE
+    out$group[z$g] <- gid
+    out$gap_km[z$g] <- z$gap
+    out$rest_diameter_km[z$g] <- z$rest
+  }
+  out
+}
+
+#' Decide whether outlier groups are corroborated by independent sources.
+#' @param group Integer outlier-group id per record (NA = not an outlier).
+#' @param dataset,year,recorder Record-level metadata (same length as group).
+#' @param min_datasets Distinct datasetKeys needed.
+#' @param min_years,min_recorders Alternative: one dataset with this many
+#'   distinct years AND recorders.
+#' @param lon,lat Record coordinates (degrees).
+#' @param radius_km Records support each other only within this distance.
+#' @return Logical per record: TRUE if the record's group is corroborated.
+corroborated_groups <- function(group, dataset, year, recorder, min_datasets = 2L,
+                                min_years = 2L, min_recorders = 2L,
+                                lon, lat, radius_km = 100) {
+  # Corroboration is local: independent sources must report the same place. Records of a group
+  # are sub-clustered (single linkage, radius_km); the group is corroborated if any
+  # sub-cluster meets the rule.
+  ok_rule <- function(i) {
+    nd <- length(unique(stats::na.omit(dataset[i])))
+    ny <- length(unique(stats::na.omit(year[i])))
+    rr <- recorder[i]
+    nr <- length(unique(stats::na.omit(rr[!is.na(rr) & nzchar(rr)])))
+    nd >= min_datasets || (ny >= min_years && nr >= min_recorders)
+  }
+  res <- rep(FALSE, length(group))
+  for (g in unique(stats::na.omit(group))) {
+    i <- which(group == g)
+    if (length(i) < 2L) {
+      res[i] <- ok_rule(i)
+      next
+    }
+    u <- unique(data.frame(lon = lon[i], lat = lat[i]))
+    sub <- if (nrow(u) > 1L)
+      stats::cutree(stats::hclust(stats::as.dist(gc_distance_matrix(u$lon, u$lat)),
+                                  method = "single"), h = radius_km) else 1L
+    key <- sub[match(paste(lon[i], lat[i]), paste(u$lon, u$lat))]
+    res[i] <- any(vapply(unique(key), function(s) ok_rule(i[key == s]), TRUE))
+  }
+  res
+}
+
+#' Cap outlier removal so that a unit keeps the range minimum
+#'
+#' If removing the flagged records would leave fewer than `min_localities`
+#' unique localities in a unit that had at least that many, flagged groups are
+#' restored in reverse peeling order (highest group id = least extreme first)
+#' until the minimum is met.
+#' @param group Outlier-group id per record (NA = not an outlier); ids follow
+#'   the peeling order of flag_outlier_groups().
+#' @param remove Logical per record: currently scheduled for removal.
+#' @param lon,lat Record coordinates (unique localities are distinct pairs).
+#' @param min_localities Minimum number of unique localities to keep.
+#' @return List: `remove` (updated logical) and `restored` (restored group ids).
+cap_outlier_removal <- function(group, remove, lon, lat, min_localities = 5L) {
+  # Number of unique localities among the selected records
+  uloc <- function(sel) nrow(unique(data.frame(lon = lon[sel], lat = lat[sel])))
+  restored <- integer(0)
+  if (any(remove) && uloc(rep(TRUE, length(remove))) >= min_localities) {
+    for (g in sort(unique(group[remove]), decreasing = TRUE)) {
+      if (uloc(!remove) >= min_localities) break
+      remove[group %in% g] <- FALSE
+      restored <- c(restored, g)
+    }
+  }
+  list(remove = remove, restored = restored)
+}
+```
+
+```{r flag_outliers}
+# --- Outlier groups of one unit ---
+# Coarser grid for units that occupy many 25-km cells
+grid50 <- global_thinning_grid(parameters$outlier_cell_km_large)
+
+# Flag the outlier groups among the records `rec` of one unit (a data.table with the
+# column cell25) with the gap rule `f` and `floor_km`. `corroborate` sets whether
+# corroborated groups are kept (main) or not (strict_plus). Returns a list: `remove`
+# (logical per record), `restored` (groups restored to keep the minimum of localities),
+# `rec` (the records with their group and corroboration) and `cells` (the localities with
+# their group and gap).
+detect <- function(rec, f, floor_km, corroborate) {
+  # One locality per cell; cells of 50 km if the unit occupies many 25-km cells
+  cl <- rec[, .(lon = decimalLongitude[1], lat = decimalLatitude[1]), by = cell25]
+  cell_col <- "cell25"
+  if (nrow(cl) > parameters$outlier_large_cells) {
+    pts <- project(vect(as.matrix(rec[, .(decimalLongitude, decimalLatitude)]),
+                        crs = "EPSG:4326"),
+                   crs(grid50))
+    rec[, cell50 := cellFromXY(grid50, crds(pts))]
+    cl <- rec[, .(lon = decimalLongitude[1], lat = decimalLatitude[1]), by = cell50]
+    cell_col <- "cell50"
+  }
+
+  # Outlier groups among the localities, carried back to the records of their cells
+  r <- flag_outlier_groups(cl$lon, cl$lat, f = f, floor_km = floor_km,
+                           minority_share = parameters$outlier_minority_share)
+  cl$group <- r$group
+  cl$gap_km <- r$gap_km
+  cl$rest_diameter_km <- r$rest_diameter_km
+  rec$group <- cl$group[match(rec[[cell_col]], cl[[cell_col]])]
+
+  # Corroboration by independent sources (only when `corroborate` is TRUE)
+  rec$corroborated <- if (corroborate && any(!is.na(rec$group))) corroborated_groups(
+    rec$group, rec$datasetKey, rec$year, rec$recordedBy,
+    min_datasets = parameters$corroboration_min_datasets,
+    min_years = parameters$corroboration_single_dataset_years,
+    min_recorders = parameters$corroboration_single_dataset_recorders,
+    lon = rec$decimalLongitude, lat = rec$decimalLatitude,
+    radius_km = parameters$corroboration_radius_km) else FALSE
+
+  # Removal must not take a unit below the range minimum of unique localities
+  remove <- !is.na(rec$group) & !rec$corroborated
+  cap <- cap_outlier_removal(rec$group, remove, rec$decimalLongitude, rec$decimalLatitude,
+                             min_localities = parameters$min_unique_localities)
+  list(remove = cap$remove, restored = cap$restored, rec = rec, cells = cl)
+}
+
+# --- Detect the outliers of every unit ---
+x[, `:=`(outlier_main = FALSE, outlier_strict = FALSE)]
+x[, row_id := .I]
+
+# Records entering the outlier rule: base_main records that are not removed by the
+# native-region filter or as introduced, split by unit
+pre_main <- x[base_main & !remove_native_main & !flag_introduced]
+pre_strict <- x[base_main & !remove_native_strict & !flag_introduced]
+groups_out <- list()
+main_by_unit <- split(pre_main, by = "pool_key")
+strict_by_unit <- split(pre_strict, by = "pool_key")
+units <- sort(names(main_by_unit))
+for (j in seq_along(units)) {
+  pk <- units[j]
+  for (variant in c("main", "strict")) {
+    rec <- if (variant == "main") main_by_unit[[pk]] else strict_by_unit[[pk]]
+    if (is.null(rec)) next
+    rec <- copy(rec)
+    if (nrow(rec) < 3L) next
+
+    # main: its gap rule with corroboration; strict: its gap rule without corroboration
+    r <- if (variant == "main") detect(rec, parameters$outlier_f_main,
+                                       parameters$outlier_floor_main_km, TRUE) else
+      detect(rec, parameters$outlier_f_strict, parameters$outlier_floor_strict_km, FALSE)
+
+    # Mark the records to remove
+    if (any(r$remove)) set(x, i = r$rec$row_id[r$remove], j = paste0("outlier_", variant),
+                           value = TRUE)
+
+    # One row per outlier group: size, sources, centroid, gap and number of cells
+    g <- r$rec[!is.na(group), .(records = .N, datasets = uniqueN(datasetKey),
+                                years = uniqueN(year), recorders = uniqueN(recordedBy),
+                                corroborated = corroborated[1],
+                                lon = mean(decimalLongitude), lat = mean(decimalLatitude)),
+               by = group]
+    if (nrow(g)) {
+      cg <- r$cells[!is.na(group), .(gap_km = gap_km[1],
+                                     rest_diameter_km = rest_diameter_km[1],
+                                     cells = .N),
+                    by = group]
+      g <- merge(g, cg, by = "group")
+      g[, kept_min_localities := group %in% r$restored]
+
+      # A group is removed unless it is corroborated (main only) or restored to keep the
+      # minimum of localities
+      g[, `:=`(pool_key = pk, variant = variant,
+               removed = (!corroborated | variant == "strict") & !kept_min_localities)]
+      groups_out[[length(groups_out) + 1L]] <- g
+    }
+  }
+  if (j %% 250 == 0) cat("outliers:", j, "of", length(units), "\n")
+}
+
+# --- Outlier groups table ---
+og <- rbindlist(groups_out, fill = TRUE)
+og[, species := x$rep_species[match(pool_key, x$pool_key)]]
+write_table(og, file.path(dir_data_intermediate, "outlier_groups.csv"))
+
+# --- The three datasets and the record counts ---
+x[, in_inclusive := base_inclusive]
+x[, in_main := base_main & !remove_native_main & !flag_introduced & !outlier_main]
+x[, in_strict_plus := base_main & !remove_native_strict & !flag_introduced &
+      !outlier_strict]
+counts <- data.frame(
+  stage = c("all_records_with_coordinates", "base_inclusive", "base_main",
+            "native_removed_main", "introduced_removed", "outlier_removed_main",
+            "final_main", "final_strict_plus", "final_inclusive"),
+  records = c(nrow(x), sum(x$base_inclusive), sum(x$base_main),
+              sum(x$base_main & x$remove_native_main),
+              sum(x$base_main & !x$remove_native_main & x$flag_introduced),
+              sum(x$outlier_main), sum(x$in_main), sum(x$in_strict_plus),
+              sum(x$in_inclusive)))
+write_table(counts, file.path(dir_data_intermediate, "dataset_counts.csv"))
+print(counts, row.names = FALSE)
+cat("outlier groups (main):", og[variant == "main", .N],
+    "; removed:", og[variant == "main" & removed == TRUE, .N],
+    "; corroborated kept:", og[variant == "main" & corroborated == TRUE, .N],
+    "; kept to stay >= minimum localities:",
+    og[variant == "main" & kept_min_localities == TRUE, .N],
+    "(strict:", og[variant == "strict" & kept_min_localities == TRUE, .N], ")\n")
+
+# --- Save the final records ---
+x[, row_id := NULL]
+saveRDS(x, file.path(dir_data_intermediate, "records_final.rds"), compress = "gzip")
+```
+
+```{r clear_flag_introductions_outliers, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Range measurement
+
+Species with at least five unique localities are thinned (50-km Equal Earth cells for species spanning more than five cells, then 10-km great-circle distance, with MCP vertices restored) and measured: latitudinal extent, circular longitudinal extent, MCP area in a species-specific cylindrical equal-area projection and the stability of each measure (mean of 1,000 random 80% subsamples divided by the full estimate; Gupta et al. 2020). Seeds are derived from each species' GBIF key, so results do not depend on the other species or on the number of parallel workers (`n_workers`). Per-species checkpoints in `ranges/checkpoints/` let an interrupted run resume.
+
+*Inputs:* records_final.rds  
+*Outputs:* ranges/range_main.csv, ranges/thinning_audit.csv, ranges/range_inclusive.csv, ranges/range_strict_plus.csv
+
+```{r prepare_range_workers}
+out_dir <- file.path(dir_data_intermediate, "ranges")
+
+# --- Unique localities per unit ---
+# Unique localities of each dataset, for units with enough of them
+localities <- local({
+  x <- readRDS(file.path(dir_data_intermediate, "records_final.rds"))
+  occ_list <- function(flag) {
+    y <- x[get(flag) == TRUE, .(pool_key, decimalLongitude, decimalLatitude)]
+    y <- unique(y)
+    s <- split(as.data.frame(y[, .(decimalLongitude, decimalLatitude)]), y$pool_key)
+    s[vapply(s, nrow, 1L) >= parameters$min_unique_localities]
+  }
+  list(main = occ_list("in_main"),
+       inclusive = occ_list("in_inclusive"),
+       strict = occ_list("in_strict_plus"))
+})
+invisible(gc())
+main <- localities$main[order(names(localities$main))]
+cat("eligible units: main", length(main), "; inclusive", length(localities$inclusive),
+    "; strict_plus", length(localities$strict), "\n")
+
+# --- Worker setup ---
+# Each worker sources the range helpers and builds the coarse thinning grid once. Their md5
+# sums enter the checkpoint fingerprints, so editing them invalidates the checkpoints.
+helper_files <- here::here("code", "R", c("range_metrics.R", "projections.R", "thinning.R"))
+code_hash <- unname(tools::md5sum(helper_files))
+setup_worker <- function(helper_files, cell_km) {
+  for (f in helper_files) source(f)
+  assign("thin_grid", global_thinning_grid(cell_km), envir = globalenv())
+  TRUE
+}
+
+# --- Checkpoints ---
+# A unit's checkpointed result if its fingerprint matches; otherwise compute and save it.
+# `ck` is the checkpoint file and `compute` a function that returns the result.
+cached_result <- function(ck, fingerprint, compute) {
+  old <- if (file.exists(ck)) tryCatch(readRDS(ck), error = function(e) NULL)
+  if (identical(old$fingerprint, fingerprint)) return(old$result)
+  out <- compute()
+
+  # Write, then rename: no truncated checkpoints
+  tmp <- paste0(ck, ".tmp")
+  saveRDS(list(fingerprint = fingerprint, result = out), tmp)
+  unlink(ck)
+  file.rename(tmp, ck)
+  out
+}
+
+# --- Functions run on the workers ---
+# Thinning, full-range metrics and 80% rarefaction stability of unit i (run on a worker). The
+# unit is element i of the list called `units_name` on the worker. Returns a list with the
+# metrics, the thinning audit and the number of unique localities.
+main_one <- function(i, ck_dir, thin_seed, range_seed, n_rep, cell_km, distance_km, code_hash,
+                     units_name) {
+  units <- get(units_name, envir = globalenv())
+  pk <- names(units)[i]
+  y <- units[[i]]
+
+  # The pool key is added to the seeds (GBIF keys < 2^31 - seed base)
+  k <- as.numeric(pk)
+  if (is.na(k)) stop("non-numeric pool key ", pk)
+  fingerprint <- rlang::hash(list(y$decimalLongitude, y$decimalLatitude,
+                                  thin_seed, range_seed, n_rep,
+                                  cell_km, distance_km, code_hash))
+  cached_result(file.path(ck_dir, paste0(pk, ".rds")), fingerprint, function() {
+    # Thinned localities and the audit of the thinning
+    th <- thin_species(y, thin_grid, cell_km = cell_km, distance_km = distance_km,
+                       seed = thin_seed + k)
+    au <- cbind(pool_key = pk, attr(th, "thinning_audit"))
+
+    # Range metrics and stability of the thinned points
+    rm_ <- range_metrics(stats::setNames(list(th), pk), n_rep = n_rep, seed = range_seed + k,
+                         metric_function = projected_mcp_extent_area,
+                         fixed_longitude_reference = TRUE, fixed_projection = TRUE)
+    rm_$range_basis <- "thinned_points"
+    if (nrow(th) < 5L) {
+      # range_metrics() needs >= 5 points after the random thinning; the full-range
+      # metrics do not depend on thinning, so they come from the unique localities exactly
+      # as range_metrics() computes them.
+      prj <- species_cea_crs(y$decimalLongitude)
+      full <- projected_mcp_extent_area(
+        project_species_cea(y, prj),
+        longitude_reference_latitude = mean(range(y$decimalLatitude)),
+        projection = prj,
+        include_s2_audit = TRUE)
+      rm_ <- data.frame(species = pk, t(full), occurrence_count = nrow(th),
+                        asympt_prop_lat = NA, asympt_prop_lon = NA, asympt_prop_area = NA,
+                        range_basis = "unique_localities", check.names = FALSE)
+    }
+    list(metrics = rm_, audit = au, unique_localities = nrow(y))
+  })
+}
+
+# Full-range metrics of unit i without thinning (run on a worker). Returns a one-row data
+# frame.
+full_one <- function(i, ck_dir, code_hash) {
+  units <- get("units_full", envir = globalenv())
+  pk <- names(units)[i]
+  y <- units[[i]]
+  fingerprint <- rlang::hash(list(y$decimalLongitude, y$decimalLatitude, code_hash))
+  cached_result(file.path(ck_dir, paste0(pk, ".rds")), fingerprint, function() {
+    m <- projected_mcp_extent_area(y, include_s2_audit = FALSE)
+    data.frame(pool_key = pk,
+               t(m[c("latitudinal_extent", "longitudinal_extent", "range_area",
+                     "midpoint_latitude", "midpoint_longitude")]),
+               unique_localities = nrow(y))
+  })
+}
+
+# --- Functions run on the main process ---
+# Checkpoint folder of one run, without files of units that no longer exist
+checkpoint_dir <- function(name, units) {
+  d <- file.path(out_dir, "checkpoints", name)
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+  unlink(setdiff(list.files(d, full.names = TRUE),
+                 file.path(d, paste0(names(units), ".rds"))))
+  d
+}
+
+# Thin, measure and rarefy units on the workers; results follow the order of `ord`
+# (largest units first). `units_name` is the name under which the workers receive the
+# units and `ck_name` the name of the checkpoint folder.
+rarefy_units <- function(units, units_name, ck_name) {
+  assign(units_name, units, envir = globalenv())
+  parallel::clusterExport(cl, units_name)
+
+  # Large units first so that workers stay balanced
+  ord <- order(-vapply(units, nrow, 1L))
+  parallel::clusterApplyLB(cl, ord, main_one, ck_dir = checkpoint_dir(ck_name, units),
+                           thin_seed = parameters$thin_seed,
+                           range_seed = parameters$rarefaction_seed,
+                           n_rep = parameters$rarefaction_reps,
+                           cell_km = parameters$thin_cell_km,
+                           distance_km = parameters$thin_distance_km,
+                           code_hash = code_hash,
+                           units_name = units_name)
+}
+
+# --- Start the workers ---
+cl <- parallel::makeCluster(n_workers)
+invisible(parallel::clusterCall(cl, setup_worker, helper_files, parameters$thin_cell_km))
+parallel::clusterExport(cl, "cached_result")
+```
+
+## Main: thinning, range metrics and stability
+
+```{r measure_main_ranges}
+# --- Measure the main dataset ---
+t0 <- Sys.time()
+res <- rarefy_units(main, "units_main", "main")
+cat("main done in", format(Sys.time() - t0), "\n")
+
+# --- Collect and save the results ---
+range_main <- rbindlist(
+  lapply(res, function(r) cbind(r$metrics, unique_localities = r$unique_localities)),
+  fill = TRUE)
+setnames(range_main, "species", "pool_key")
+audit <- rbindlist(lapply(res, `[[`, "audit"), fill = TRUE)
+write_table(range_main, file.path(out_dir, "range_main.csv"))
+write_table(audit, file.path(out_dir, "thinning_audit.csv"))
+```
+
+## Inclusive and strict_plus
+
+The full-range metrics of both datasets are computed without thinning; `strict_plus` also gets the stability measures, with the thinning, rarefaction and seeds of `main`.
+
+```{r measure_other_ranges}
+# Full-range metrics of inclusive and strict_plus, computed without thinning
+for (v in c("inclusive", "strict_plus")) {
+  units <- if (v == "inclusive") localities$inclusive else localities$strict
+  units <- units[order(names(units))]
+  units_full <- units
+  parallel::clusterExport(cl, "units_full")
+  r <- rbindlist(parallel::clusterApplyLB(cl, seq_along(units), full_one,
+                                          ck_dir = checkpoint_dir(v, units),
+                                          code_hash = code_hash))
+
+  # strict_plus also gets the stability measures
+  if (v == "strict_plus") {
+    # Same thinning, rarefaction and per-unit seeds as main, so units whose strict and main
+    # localities are identical get identical stability values.
+    rs <- rarefy_units(units, "units_strict", "strict_plus_rarefaction")
+    st <- rbindlist(lapply(rs, `[[`, "metrics"), fill = TRUE)
+    st <- st[, .(pool_key = species, asympt_prop_lat, asympt_prop_lon, asympt_prop_area)]
+    r <- merge(r, st, by = "pool_key", all.x = TRUE, sort = FALSE)
+  }
+  write_table(r, file.path(out_dir, paste0("range_", v, ".csv")))
+  cat(v, "done\n")
+}
+
+# Stop the workers
+parallel::stopCluster(cl)
+```
+
+```{r clear_measure_ranges, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Range table
+
+One row per species of the trait table combines record counts per cleaning stage, the range measures of the three datasets, the native-region rule and documented introductions; internal consistency checks stop the notebook if they fail. The cleaning parameters are saved beside the table.
+
+*Inputs:* records_final.rds; ranges/*.csv; native/species_native_summary.csv; geometry/pinkert_species_realms.csv; s01/species_traits.csv; taxonomy/{genus_subfamily,riodinid_genera}.csv; occurrence_cleaning/introduced_populations.csv  
+*Outputs:* range_metrics.csv, parameters.csv
+
+```{r range_table_species}
+# --- Units of the range table ---
+# One row per representative species of the trait table, except riodinids
+traits <- as.data.table(read_chr(file.path(dir_s01, "species_traits.csv")))
+rio <- read_chr(file.path(dir_data_raw, "taxonomy", "riodinid_genera.csv"))$genus
+U <- traits[universe_status == "gbif_accepted" & gbif_key == representative_key &
+              !genus %in% rio,
+            .(species, gbif_key, genus)]
+
+# Subfamily from the genus table
+gs <- read_chr(file.path(dir_data_raw, "taxonomy", "genus_subfamily.csv"))
+U[, subfamily := gs$combined_subfamily[match(genus, gs$genus_unique)]]
+
+# Each species starts as its own pool, with no other species pooled with it
+U[, pool_key := gbif_key]
+U[, pooled_with := ""]
+```
+
+## Record counts and range measures per unit
+
+```{r range_table_columns}
+# --- Record counts per unit ---
+x <- readRDS(file.path(dir_data_intermediate, "records_final.rds"))
+cnt <- x[!is.na(pool_key), .(
+  n_records_assigned = .N,
+  n_base_main = sum(base_main),
+  n_removed_native_main = sum(base_main & remove_native_main),
+  n_removed_introduced = sum(base_main & !remove_native_main & flag_introduced),
+  n_removed_outlier_main = sum(outlier_main),
+  n_main = sum(in_main),
+  n_inclusive = sum(in_inclusive),
+  n_strict_plus = sum(in_strict_plus),
+  n_datasets_main = uniqueN(datasetKey[in_main]),
+  n_living_specimen_excluded = sum(basisOfRecord == "LIVING_SPECIMEN")),
+  by = pool_key]
+
+# --- Antimeridian crossing ---
+# TRUE if the occupied longitudes wrap across -180/180 degrees: the shortest circular occupied
+# arc is narrower than the ordinary minimum-to-maximum interval.
+range_crosses_antimeridian <- function(longitude) {
+  longitude <- longitude[is.finite(longitude)]
+  if (length(longitude) < 2L) return(FALSE)
+  circular_span <- unname(circular_longitude_extent(longitude,
+                                                    reference_latitude = 0)["angular_span"])
+  circular_span + 1e-10 < diff(range(longitude))
+}
+anti <- x[in_main == TRUE,
+          .(crosses_antimeridian = range_crosses_antimeridian(unique(decimalLongitude))),
+          by = pool_key]
+rm(x)
+invisible(gc())
+
+# --- Range tables of the datasets ---
+rg <- file.path(dir_data_intermediate, "ranges")
+main <- fread(file.path(rg, "range_main.csv"), colClasses = c(pool_key = "character"))
+audit <- fread(file.path(rg, "thinning_audit.csv"),
+               colClasses = c(pool_key = "character"))
+inc <- fread(file.path(rg, "range_inclusive.csv"), colClasses = c(pool_key = "character"))
+strict <- fread(file.path(rg, "range_strict_plus.csv"),
+                colClasses = c(pool_key = "character"))
+
+# --- Native-region summary, realms and introductions ---
+nat <- fread(file.path(dir_data_intermediate, "native", "species_native_summary.csv"),
+             colClasses = c(pool_key = "character"))
+sr <- fread(file.path(dir_data_intermediate, "geometry", "pinkert_species_realms.csv"),
+            colClasses = "character")
+intro <- read_chr(file.path(dir_data_raw, "occurrence_cleaning",
+                            "introduced_populations.csv"))
+
+# --- Combine the tables ---
+# Record counts, then the main range measures and the thinning audit
+out <- merge(U, cnt, by = "pool_key", all.x = TRUE, sort = FALSE)
+out <- merge(out, main, by = "pool_key", all.x = TRUE, sort = FALSE)
+out <- merge(out,
+             audit[, .(pool_key, n_thinned = after_distance,
+                       coarse_cell_thinning = cell_applied)],
+             by = "pool_key", all.x = TRUE, sort = FALSE)
+
+# Range measures of inclusive and strict_plus, with the dataset as column suffix
+for (v in c("inclusive", "strict_plus")) {
+  r <- if (v == "inclusive") inc else strict
+
+  # Stability columns exist for strict_plus only
+  cols <- intersect(c("pool_key", "latitudinal_extent", "longitudinal_extent", "range_area",
+                      "unique_localities", "asympt_prop_lat", "asympt_prop_lon",
+                      "asympt_prop_area"), names(r))
+  r <- r[, ..cols]
+  setnames(r, -1, paste0(names(r)[-1], "_", v))
+  out <- merge(out, r, by = "pool_key", all.x = TRUE, sort = FALSE)
+}
+
+# Native-region rule, antimeridian crossing, supported realms and introduced regions
+out <- merge(out, nat[, .(pool_key, native_rule, pinkert_status, pinkert_coverage,
+                          cells_removed_native_main = cells_removed_main,
+                          cells_removed_native_strict = cells_removed_strict)],
+             by = "pool_key", all.x = TRUE, sort = FALSE)
+out <- merge(out, anti, by = "pool_key", all.x = TRUE, sort = FALSE)
+out[, pinkert_supported_realms :=
+      sr$supported_realms[match(gbif_key, sr$representative_key)]]
+out[, introduced_regions := intro$introduced_range_note[match(gbif_key, intro$gbif_key)]]
+
+# Low-data species, and species with a main range
+out[, low_data := !is.na(unique_localities) &
+      unique_localities < parameters$low_data_localities]
+out[, has_range := is.finite(range_area) & range_area > 0]
+
+# --- Column order and save ---
+setcolorder(out, c("species", "gbif_key", "genus", "subfamily", "pool_key", "pooled_with",
+                   "latitudinal_extent", "longitudinal_extent", "range_area",
+                   "asympt_prop_lat", "asympt_prop_lon", "asympt_prop_area",
+                   "occurrence_count", "unique_localities", "low_data", "has_range"))
+out <- out[order(species)]
+write_table(out, file.path(dir_data_intermediate, "range_metrics.csv"))
+
+# --- Parameters table ---
+# Numbers without scientific notation; several values of one parameter separated by ";"
+parameter_values <- vapply(parameters, function(v)
+  paste(if (is.numeric(v)) format(v, scientific = FALSE, trim = TRUE) else v,
+        collapse = ";"), "")
+write_table(data.frame(parameter = names(parameters), value = parameter_values),
+            file.path(dir_data_intermediate, "parameters.csv"))
+```
+
+## Consistency checks
+
+```{r check_range_table}
+# --- Checks ---
+# Each check is a row with its name, whether it passed and a detail
+chk <- list()
+add <- function(check, passed, detail = "") chk[[length(chk) + 1L]] <<-
+  data.frame(check, passed, detail)
+
+add("one row per representative species", !anyDuplicated(out$gbif_key),
+    paste(nrow(out), "rows"))
+add("rarefaction proportions <= 1",
+    all(out[, c(asympt_prop_lat, asympt_prop_lon, asympt_prop_area)] <= 1 + 1e-10,
+        na.rm = TRUE))
+add("range area positive where computed", all(out$range_area[is.finite(out$range_area)] > 0))
+add("main records are a subset of inclusive records (counts)",
+    all(out$n_main <= out$n_inclusive, na.rm = TRUE))
+add("main MCP area <= inclusive MCP area (subset hull)",
+    all(out$range_area <= out$range_area_inclusive * (1 + 1e-6), na.rm = TRUE),
+    paste(sum(out$range_area > out$range_area_inclusive * (1 + 1e-6), na.rm = TRUE),
+          "violations"))
+add("main latitudinal extent <= inclusive",
+    all(out$latitudinal_extent <= out$latitudinal_extent_inclusive + 1e-6, na.rm = TRUE))
+add("units with >= 5 localities keep >= 3 thinned points",
+    all(out$n_thinned[out$unique_localities >= 5] >= 3, na.rm = TRUE))
+add("species with a main range", TRUE, as.character(sum(out$has_range)))
+
+# --- Report ---
+# The notebook stops if a check failed
+val <- do.call(rbind, chk)
+print(val, row.names = FALSE)
+cat("\nspecies rows:", nrow(out), "; with main range:", sum(out$has_range),
+    "; low_data:", sum(out$low_data & out$has_range), "\n")
+if (!all(val$passed)) stop("A range-table consistency check failed.", call. = FALSE)
+```
+
+```{r clear_build_range_table, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Expert-range validation
+
+The ranges are compared with the independent expert range polygons of Hausharter et al. (2023) for mostly European species: the share of occupied cells inside the polygons (100-km buffer) and the correlation of log10 MCP area with expert range size.
+
+*Inputs:* records_final.rds; range_metrics.csv; s01/species_traits.csv; gbif_backbone/ snapshot; taxonomy/riodinid_genera.csv; expert_ranges/{Butterfly_ranges/Butterfly_ranges.shp, Butterfly_data.csv, expert_species_correspondence.csv}  
+*Outputs:* expert_validation_species.csv, expert_validation_summary.csv
+
+```{r validate_expert_ranges}
+# --- Occupied cells ---
+# One row per occupied 25-km cell of the records in the inclusive or main base sets: the
+# coordinates of its first record, whether it is in main or inclusive, and whether any of its
+# records was removed by the native-region rule, as an outlier or as introduced
+x <- readRDS(file.path(dir_data_intermediate, "records_final.rds"))
+cells <- x[!is.na(pool_key) & base_inclusive | (!is.na(pool_key) & base_main),
+           .(lon = decimalLongitude[1], lat = decimalLatitude[1],
+             main = any(in_main), inclusive = any(in_inclusive),
+             removed_native = any(base_main & remove_native_main),
+             removed_outlier = any(outlier_main),
+             removed_introduced = any(base_main & flag_introduced)),
+           by = .(pool_key, cell25)]
+rm(x)
+invisible(gc())
+
+# --- Range table and lookups ---
+fin <- fread(file.path(dir_data_intermediate, "range_metrics.csv"),
+             colClasses = c(gbif_key = "character", pool_key = "character"))
+traits <- read_chr(file.path(dir_s01, "species_traits.csv"))
+rep_of <- setNames(traits$representative_key, traits$gbif_key)
+pool_of <- setNames(fin$pool_key, fin$gbif_key)
+
+# --- Share of cells inside an expert range ---
+# Share of the cell points `pts` (columns lon and lat) inside the expert polygon `poly`
+# buffered by `buffer_m` metres; NA if there are no cells
+inside_share <- function(pts, poly, buffer_m = 1e5) {
+  if (!nrow(pts)) return(NA_real_)
+  pb <- buffer(poly, buffer_m)
+  v <- vect(as.matrix(pts[, .(lon, lat)]), crs = "EPSG:4326")
+  mean(relate(v, aggregate(pb), "intersects")[, 1])
+}
+
+# --- Expert polygons and name correspondence ---
+poly <- vect(file.path(dir_data_raw, "expert_ranges", "Butterfly_ranges",
+                       "Butterfly_ranges.shp"))
+poly <- project(poly, "EPSG:4326")
+expert <- read.csv(file.path(dir_data_raw, "expert_ranges", "Butterfly_data.csv"))
+corr <- read_chr(file.path(dir_data_raw, "expert_ranges",
+                           "expert_species_correspondence.csv"))
+snapshot <- read_backbone_snapshot(dir_data_raw)
+
+# GBIF key and pool key of each expert species: its GBIF name resolved in the snapshot (an
+# accepted name or a synonym of one accepted species)
+corr$gbif_key <- unname(rep_of[resolve_accepted_key(gsub("_", " ", corr$Hau2023_names_GBIF),
+                                                    snapshot)])
+corr$pool_key <- unname(pool_of[corr$gbif_key])
+
+# --- Comparison per species ---
+# For each expert species with a polygon: the share of its cells inside the buffered polygon
+# (main, inclusive and removed cells), the number of removed cells and the expert range size
+ev <- rbindlist(lapply(seq_len(nrow(corr)), function(i) {
+  pk <- corr$pool_key[i]
+  if (is.na(pk)) return(NULL)
+  p <- poly[poly$species == corr$Hau2023_names[i], ]
+  if (!nrow(p)) return(NULL)
+  ce <- cells[pool_key == pk]
+  data.table(species = corr$Hau2023_names_GBIF[i],
+             pool_key = pk,
+             share_inside_main = inside_share(ce[main == TRUE], p),
+             share_inside_inclusive = inside_share(ce[inclusive == TRUE], p),
+             share_inside_removed = inside_share(ce[removed_native | removed_outlier |
+                                                      removed_introduced], p),
+             n_removed_cells = ce[removed_native | removed_outlier | removed_introduced, .N],
+             expert_area = expert$Range_size[match(gsub(" ", "_", corr$Hau2023_names[i]),
+                                                   expert$Species)])
+}))
+
+# Range areas of the three datasets
+ev <- merge(ev, fin[, .(pool_key, range_area, range_area_inclusive,
+                        range_area_strict_plus)][!duplicated(pool_key)],
+            by = "pool_key", all.x = TRUE)
+write_table(ev, file.path(dir_data_intermediate, "expert_validation_species.csv"))
+
+# --- Summary ---
+# Species with a positive main range area and expert range size, and a finite inclusive area
+ok <- ev[is.finite(range_area) & is.finite(expert_area) & range_area > 0 & expert_area > 0 &
+         is.finite(range_area_inclusive)]
+
+# Number of species compared, median and mean shares inside, and correlations of range area
+# with expert range size
+es <- data.frame(
+  species = nrow(ok),
+  median_share_inside_main = median(ev$share_inside_main, na.rm = TRUE),
+  median_share_inside_inclusive = median(ev$share_inside_inclusive, na.rm = TRUE),
+  mean_share_inside_main = mean(ev$share_inside_main, na.rm = TRUE),
+  mean_share_inside_inclusive = mean(ev$share_inside_inclusive, na.rm = TRUE),
+  share_inside_removed_cells = mean(ev$share_inside_removed, na.rm = TRUE),
+  pearson_log_area_main = cor(log10(ok$range_area), log10(ok$expert_area)),
+  pearson_log_area_inclusive = cor(log10(ok$range_area_inclusive), log10(ok$expert_area)),
+  pearson_log_area_strict_plus = cor(log10(ok$range_area_strict_plus),
+                                     log10(ok$expert_area), use = "complete.obs"),
+  spearman_area_main = cor(ok$range_area, ok$expert_area, method = "spearman"),
+  spearman_area_inclusive = cor(ok$range_area_inclusive, ok$expert_area, method = "spearman"))
+write_table(es, file.path(dir_data_intermediate, "expert_validation_summary.csv"))
+print(t(es))
+```
+
+```{r clear_validate_expert_ranges, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Outlier-rule check
+
+The share of outlier groups whose centroid lies inside the buffered expert polygons shows how often each rule removes plausibly genuine records: groups removed by the main rule, corroborated groups kept by it, and groups removed only by the strict rule (reported in Appendix S2).
+
+*Inputs:* outlier_groups.csv; expert_validation_species.csv; expert_ranges/{Butterfly_ranges/Butterfly_ranges.shp, expert_species_correspondence.csv}  
+*Output:* outlier_expert_check.csv
+
+```{r check_outlier_rule}
+# --- Outlier groups and expert polygons ---
+og <- fread(file.path(dir_data_intermediate, "outlier_groups.csv"),
+            colClasses = c(pool_key = "character"))
+ev <- fread(file.path(dir_data_intermediate, "expert_validation_species.csv"),
+            colClasses = c(pool_key = "character"))
+corr <- read_chr(file.path(dir_data_raw, "expert_ranges",
+                           "expert_species_correspondence.csv"))
+poly <- project(vect(file.path(dir_data_raw, "expert_ranges", "Butterfly_ranges",
+                               "Butterfly_ranges.shp")),
+                "EPSG:4326")
+
+# Groups of the species with an expert comparison, with the expert name of each species
+og <- og[pool_key %in% ev$pool_key]
+og[, hau := corr$Hau2023_names[match(ev$species[match(pool_key, ev$pool_key)],
+                                     corr$Hau2023_names_GBIF)]]
+main <- og[variant == "main"]
+strict <- og[variant == "strict"]
+
+# --- Strict groups that the main rule also finds ---
+# TRUE if a main group of the unit lies within 100 km of the centroid of the strict group
+strict[, also_main := mapply(function(pk, lo, la) {
+  m <- main[pool_key == pk]
+  if (!nrow(m)) return(FALSE)
+  any(geosphere::distHaversine(cbind(m$lon, m$lat), c(lo, la)) < 1e5)
+}, pool_key, lon, lat)]
+
+# --- Centroids inside the buffered expert polygon ---
+# Logical per row of the group table g (NA if the species has no expert polygon); the polygon
+# is buffered by 100 km
+inside <- function(g) vapply(seq_len(nrow(g)), function(i) {
+  p <- poly[poly$species == g$hau[i], ]
+  if (!nrow(p)) return(NA)
+  v <- vect(cbind(g$lon[i], g$lat[i]), crs = "EPSG:4326")
+  relate(v, aggregate(buffer(p, 1e5)), "intersects")[1, 1]
+}, TRUE)
+main[, inside_expert := inside(main)]
+strict_only <- strict[also_main == FALSE]
+strict_only[, inside_expert := inside(strict_only)]
+
+# --- Summary table ---
+# Share of group centroids inside the expert range for the three sets of groups
+res <- rbind(
+  data.table(set = "main: removed (uncorroborated)", groups = main[removed == TRUE, .N],
+             share_inside_expert = main[removed == TRUE, mean(inside_expert, na.rm = TRUE)]),
+  data.table(set = "main: corroborated, kept", groups = main[removed == FALSE, .N],
+             share_inside_expert = main[removed == FALSE, mean(inside_expert, na.rm = TRUE)]),
+  data.table(set = "strict only (f 0.25, not flagged at f 0.5)", groups = nrow(strict_only),
+             share_inside_expert = strict_only[, mean(inside_expert, na.rm = TRUE)]))
+write_table(res, file.path(dir_data_intermediate, "outlier_expert_check.csv"))
+print(res)
+```
+
+```{r clear_check_outlier_rule, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+The R version and packages used to render this notebook are printed below, with the versions of the geospatial libraries (GDAL, PROJ, GEOS) used by `sf` and `terra` when the notebook loaded them.
+
+```{r save_r_environment}
+print(sessionInfo())
+
+# Geospatial libraries bundled with (Windows) or linked by (Linux, macOS) sf and terra
+if ("sf" %in% loadedNamespaces()) print(sf::sf_extSoftVersion())
+if ("terra" %in% loadedNamespaces()) print(terra::gdal(lib = "all"))
+```

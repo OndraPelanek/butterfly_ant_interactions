@@ -1,0 +1,1126 @@
+---
+title: "Butterfly-ant interactions 04 - model fitting"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+This is the fourth of six R Markdown notebooks. It fits the range-size models of the paper: the main taxonomic mixed models, their geographic adjustments (regional range-size background and spherical GAM), phylogenetic models on matched and genus-grafted trees, joint phylogenetic-spatial models, and the lineage checks (leave-one-genus-out and genus-level PGLS).
+
+The inputs are the species tables and Daru range cells of `s03_build_species_tables`, the occurrence records and range metrics of `s02_prepare_ranges`, the duplicate-species clusters of `s01_prepare_traits`, the GBIF Backbone snapshot and the published trees. The outputs (fitted main models, coefficient, contrast and metadata tables, tree crosswalks, grafted trees, presence cells and species centres) are used by `s05_check_robustness`, `s06_summarise_results` and the report. Model tables keep a `table` column: `MAIN_subtype` is the main species table and `MAIN_daru_subtype` the modelled-range table. A full run takes about 2.5 h, mostly the phylogenetic spatial models and the leave-one-genus-out refits.
+
+# Setup
+
+## Packages
+
+`lmerTest` fits the mixed models and `mgcv` the GAMs; `ape`, `nlme`, `phytools` and `emmeans` are called with `::` (mostly in `code/R`).
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(lmerTest)
+library(mgcv)
+```
+
+## Variables
+
+The three range measures, the main table's label in the model tables, the two trees, and the model formulas and branch lengths of the phylogenetic models are shared by the sections below. The Yumnam tree keeps its published branch lengths, and the Schär tree gets Grafen lengths after pruning.
+
+```{r setup_variables}
+# Range measures: short name -> column of the species table
+measures <- c(area = "range_area",
+              lat = "latitudinal_extent",
+              lon = "longitudinal_extent")
+
+# Label of the main species table in the model tables
+main_table <- "MAIN_subtype"
+
+# The two trees and the branch lengths each one gets in the phylogenetic models
+studies <- c("yumnam_2025", "schar_2018")
+branch <- c(yumnam_2025 = "published", schar_2018 = "grafen")
+
+# Formulas of the phylogenetic models: type only, and type plus centred partner breadth
+formulas <- list(type = log10_range ~ interaction_type,
+                 breadth = log10_range ~ interaction_type + partner_breadth_centered)
+```
+
+## Folders
+
+Raw inputs are read from the versioned raw data and earlier results from the folders of `s01_prepare_traits` to `s03_build_species_tables`; outputs are written to this notebook's folder in the versioned intermediate data. The input and output lists of the sections below give paths relative to these folders (`s01/` to `s03/` for the earlier notebooks).
+
+```{r setup_folders}
+# Raw data and the outputs of s01 to s03
+dir_data_raw <- path_resrepo("data/raw")
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_traits")
+dir_s02 <- path_resrepo("data/intermediate/s02_prepare_ranges")
+dir_s03 <- path_resrepo("data/intermediate/s03_build_species_tables")
+
+# Outputs of this notebook
+dir_data_intermediate <- path_resrepo("data/intermediate/s04_fit_models")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+
+# The two published trees: Yumnam & Kodandaramaiah (2025) and Schär et al. (2018)
+tree_files <- c(
+  yumnam_2025 = file.path(
+    dir_data_raw, "phylogenies", "yumnam_2025",
+    "21Jan2025_30June23_SubfamAdded_RelTime_DivergenceTime_928sp.nwk"),
+  schar_2018 = file.path(dir_data_raw, "phylogenies", "schar_2018", "treemacro.nex"))
+```
+
+## Functions
+
+`write_table()` writes the output tables. `models.R` fits the taxonomic mixed models and their contrasts, `geography.R` the presence cells, regional background and spherical GAMs, `projections.R` the Equal Earth grids, `name_matching.R` the GBIF Backbone snapshot and `phylogeny.R` the matching of tree tips and the PGLS.
+
+```{r load_functions}
+# Output tables
+source(here::here("code", "R", "write_table.R"))
+
+# Taxonomic mixed models and their contrasts
+source(here::here("code", "R", "models.R"))
+
+# Presence cells, regional background and spherical GAMs
+source(here::here("code", "R", "geography.R"))
+
+# Equal Earth grids
+source(here::here("code", "R", "projections.R"))
+
+# Published trees, their tip names and PGLS
+source(here::here("code", "R", "phylogeny.R"))
+
+# Strict name matching to the GBIF Backbone snapshot
+source(here::here("code", "R", "name_matching.R"))
+```
+
+The main species table is read with the pool keys as text and the interaction types as factors with the levels n, f, m and p.
+
+```{r define_reader}
+# Read the main species table, keeping the pool keys as text and the interaction types as
+# a factor with the levels n, f, m and p; returns a data frame
+read_species_table <- function() {
+  d <- read.csv(file.path(dir_s03, "species_table.csv"),
+                na.strings = c("", "NA"),
+                colClasses = c(pool_key = "character"))
+  d$interaction_type <- factor(d$interaction_type, levels = c("n", "f", "m", "p"))
+  d
+}
+```
+
+Each section below reads its inputs from disk and ends by removing its objects (in a hidden chunk), so only the objects defined in this setup carry over from one section to the next.
+
+```{r keep_setup_objects}
+# Objects of the setup, kept when each section clears its own objects
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Taxonomic mixed models
+
+Log10 range area, latitudinal extent and longitudinal extent are modelled with interaction type, and with type plus recorded partner breadth (raw count, centred), and nested subfamily/genus random intercepts (lme4, lmerTest). Pairwise type contrasts are Tukey-adjusted (emmeans). The main table is fitted on all ranges and on the 80, 90 and 95 % range-stability subsets; the modelled-range table on all ranges.
+
+*Inputs:* s03/species_table.csv, s03/species_table_daru.csv  
+*Outputs:* lmm_coefficients.csv, lmm_contrasts.csv, lmm_metadata.csv (rows tagged by `table`: MAIN_subtype = main table, MAIN_daru_subtype = modelled ranges; and by `analysis`)
+
+```{r fit_taxonomic_models}
+# --- Tables and analyses ---
+# The main table and the modelled-range table. Analyses use all ranges (main) or the
+# 80, 90 and 95 % range-stability subsets (the threshold NULL keeps all ranges)
+tables <- c(MAIN_subtype = "species_table.csv",
+            MAIN_daru_subtype = "species_table_daru.csv")
+analyses <- list(main = NULL,
+                 stability_80 = 0.80,
+                 stability_90 = 0.90,
+                 stability_95 = 0.95)
+
+# Coefficient, contrast and metadata tables of all fits
+res <- list(coefficients = list(), contrasts = list(), metadata = list())
+
+# --- Fit the models of every table and analysis ---
+for (k in names(tables)) {
+  d <- read.csv(file.path(dir_s03, tables[[k]]), na.strings = c("", "NA"))
+  d$interaction_type <- factor(d$interaction_type, levels = c("n", "f", "m", "p"))
+
+  for (a in names(analyses)) {
+    # Modelled ranges have no stability values, so they get the main models only
+    if (!is.null(analyses[[a]]) && !any(is.finite(d$asympt_prop_area))) next
+
+    fit <- fit_log_range_models(d, measures = measures,
+                                stability_threshold = analyses[[a]],
+                                breadth_scale = "raw")
+
+    # Tag the result tables with the table and the analysis
+    for (comp in names(res)) {
+      x <- fit[[comp]]
+      x$table <- k
+      x$analysis <- a
+      res[[comp]][[paste(k, a)]] <- x
+    }
+    cat(k, a, "done\n")
+  }
+}
+
+# --- Write the result tables ---
+for (comp in names(res))
+  write_table(rbindlist(res[[comp]], fill = TRUE),
+              file.path(dir_data_intermediate, paste0("lmm_", comp, ".csv")))
+```
+
+```{r clear_fit_taxonomic_models, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Main models for the report
+
+The main models are refitted and saved with their coefficient, estimated-mean, contrast and metadata tables for the report tables and figures; the section checks that the contrasts reproduce those of the taxonomic mixed models.
+
+*Inputs:* s03/species_table.csv; lmm_contrasts.csv  
+*Outputs:* main_models.rds (list of six lmerModLmerTest fits named area_type, area_breadth, lat_type, lat_breadth, lon_type, lon_breadth), main_coefficients.csv, main_estimated_means.csv, main_contrasts.csv, main_metadata.csv
+
+```{r save_main_models}
+# --- Refit the main models ---
+# The saved models carry their input data, which the report and the later notebooks use.
+d <- read_species_table()
+fit <- fit_log_range_models(d, measures = measures, breadth_scale = "raw")
+
+# --- Save the models and their tables ---
+saveRDS(fit$models, file.path(dir_data_intermediate, "main_models.rds"))
+for (comp in c("coefficients", "estimated_means", "contrasts", "metadata"))
+  write_table(fit[[comp]],
+              file.path(dir_data_intermediate, paste0("main_", comp, ".csv")))
+
+# --- Check against the taxonomic mixed models ---
+# The contrasts must reproduce those of the main analysis in lmm_contrasts.csv
+ref <- fread(file.path(dir_data_intermediate, "lmm_contrasts.csv"))[
+  table == main_table & analysis == "main"]
+chk <- merge(as.data.table(fit$contrasts)[, .(measure, predictors, contrast,
+                                              r1 = range_ratio)],
+             ref[, .(measure, predictors, contrast, r2 = range_ratio)],
+             by = c("measure", "predictors", "contrast"))
+stopifnot(nrow(chk) == nrow(ref), max(abs(chk$r1 / chk$r2 - 1)) < 1e-8)
+cat("main models saved; n (area, type model):", nrow(fit$model_data$area_type), "\n")
+```
+
+```{r clear_save_main_models, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Geographic models
+
+Range units occupy 200-km and 500-km Equal Earth cells, and each gets an equal-cell-weighted centre. The regional background is the mean log10 modelled range of all co-occurring butterflies (Daru 2025) except the focal genus, in 500-km cells with at least five comparison species; it enters the mixed models as a covariate. The spherical GAM adds an isotropic smooth of the species centre on the sphere (mgcv `sos` basis) to subfamily and genus random effects.
+
+*Inputs:* s02/records_final.rds, s02/range_metrics.csv; s03/species_table.csv, s03/analysis_units.csv, s03/daru_all_species.csv, s03/daru_cells_500km.csv  
+*Outputs:* presence_200km.csv, presence_500km.csv, species_centres.csv, background_{coefficients,contrasts,metadata}.csv, gam_{coefficients,contrasts,metadata}.csv (rows tagged table = MAIN_subtype and analysis)
+
+## Presence cells and species centres
+
+Equal Earth cells occupied by the records of the main cleaning are listed at 200 and 500 km. Each range unit's centre is the equal-cell-weighted spherical centre of its 200-km cells: the normalised vector mean of the cells, or their spherical medoid (among at most 500 evenly spaced candidate cells) when the mean vector is shorter than 0.05, as for very widespread or symmetric distributions.
+
+```{r presence_cells_and_centres}
+# --- Records of the main cleaning, by range pool ---
+# Unique record coordinates of each pool (a list of data frames named by pool key)
+x <- readRDS(file.path(dir_s02, "records_final.rds"))
+x <- unique(x[in_main == TRUE & !is.na(pool_key),
+              .(pool_key, decimalLongitude, decimalLatitude)])
+occ <- split(as.data.frame(x[, .(decimalLongitude, decimalLatitude)]), x$pool_key)
+rm(x)
+invisible(gc())
+
+# --- Occupied cells at 200 and 500 km ---
+presence_200 <- equal_area_species_cells(occ, cell_km = 200)
+write_table(presence_200, file.path(dir_data_intermediate, "presence_200km.csv"))
+
+# The 500-km cells have their own grid: they do not nest in the 200-km cells
+presence_500 <- equal_area_species_cells(occ, cell_km = 500)
+write_table(presence_500, file.path(dir_data_intermediate, "presence_500km.csv"))
+rm(occ)
+invisible(gc())
+
+# --- Range pools with a range area ---
+# One row per pool; only these pools get a centre
+ranges <- read.csv(file.path(dir_s02, "range_metrics.csv"),
+                   colClasses = c(pool_key = "character"))
+ranges <- ranges[!duplicated(ranges$pool_key) & is.finite(ranges$range_area), ]
+ranges$species <- ranges$pool_key
+
+# --- Species centres ---
+# One row per pool: the equal-cell-weighted spherical centre of its 200-km cells, the
+# method used, the length of the mean vector (resultant) and the number of occupied cells
+centre_cells <- presence_200[presence_200$species %in% ranges$species, ]
+centres <- do.call(rbind, lapply(split(centre_cells, centre_cells$species), function(d) {
+  # Cell centres as unit vectors on the sphere
+  lon <- d$cell_longitude * pi / 180
+  lat <- d$cell_latitude * pi / 180
+  xyz <- cbind(cos(lat) * cos(lon), cos(lat) * sin(lon), sin(lat))
+
+  # Mean vector and its length
+  vector <- colMeans(xyz)
+  resultant <- sqrt(sum(vector^2))
+
+  if (is.finite(resultant) && resultant >= 0.05) {
+    # Normalised mean vector, converted back to longitude and latitude
+    centre <- vector / resultant
+    centre_lon <- atan2(centre[2], centre[1]) * 180 / pi
+    centre_lat <- atan2(centre[3], sqrt(sum(centre[1:2]^2))) * 180 / pi
+    method <- "spherical_centroid"
+  } else {
+    # Spherical medoid when the mean vector is short (very widespread or symmetric
+    # distributions): the candidate cell with the smallest summed angular distance to all
+    # cells, among at most 500 evenly spaced candidates
+    candidate_id <- if (nrow(xyz) <= 500L) seq_len(nrow(xyz)) else
+      unique(round(seq(1, nrow(xyz), length.out = 500L)))
+    distances <- acos(pmax(-1, pmin(1, xyz[candidate_id, , drop = FALSE] %*% t(xyz))))
+    medoid <- candidate_id[which.min(rowSums(distances))]
+    centre_lon <- d$cell_longitude[medoid]
+    centre_lat <- d$cell_latitude[medoid]
+    method <- if (length(candidate_id) == nrow(xyz)) "spherical_medoid" else
+      "candidate_spherical_medoid"
+  }
+
+  data.frame(species = d$species[1],
+             geo_longitude = centre_lon, geo_latitude = centre_lat,
+             centre_method = method, centre_resultant = resultant,
+             occupied_cells = nrow(d))
+}))
+write_table(centres, file.path(dir_data_intermediate, "species_centres.csv"))
+```
+
+## All-butterfly regional background (500-km cells)
+
+The background of a unit is the mean log10 modelled range of the co-occurring butterflies (Daru 2025) outside its genus, in cells with at least five comparison species, cells weighted equally. Comparators from all butterfly families dilute the trait under test, which a background of the analysed lycaenids would partly contain. The genus left out is the unit's revised genus as an analysis unit, else its GBIF genus.
+
+```{r regional_background}
+# --- Genus left out of each background ---
+# The revised genus of the analysis unit, else the GBIF genus
+units <- read.csv(file.path(dir_s03, "analysis_units.csv"),
+                  colClasses = c(pool_key = "character"))
+unit_genus <- units$genus[match(ranges$pool_key, units$pool_key)]
+genus_of <- setNames(ifelse(is.na(unit_genus), ranges$genus, unit_genus), ranges$species)
+
+# --- Background of each unit ---
+# Mean log10 modelled range of the co-occurring butterflies outside the unit's genus, in
+# 500-km cells with at least five comparison species
+background <- butterfly_range_background(
+  presence_500[presence_500$species %in% ranges$species, ], genus_of,
+  fread(file.path(dir_s03, "daru_all_species.csv")),
+  fread(file.path(dir_s03, "daru_cells_500km.csv")),
+  measures = measures, min_other = 5L)
+```
+
+## Models
+
+The background enters the mixed models as a covariate; the spherical GAM adds an isotropic smooth of the species centre to subfamily and genus random effects.
+
+```{r fit_geographic_models}
+# --- Species table with the regional background and the species centres ---
+d <- read_species_table()
+
+# Geographic values only where the unit kept its range
+has_range <- is.finite(d$range_area)
+
+# Regional background columns, matched to the units by pool key
+key <- match(d$pool_key, background$species)
+d_background <- d
+for (cc in grep("^regional_background_", names(background), value = TRUE))
+  d_background[[cc]] <- ifelse(has_range, background[[cc]][key], NA)
+
+# Species-centre columns: numeric ones follow the same rule, other columns are copied
+key <- match(d$pool_key, centres$species)
+d_centres <- d
+for (cc in setdiff(names(centres), "species"))
+  d_centres[[cc]] <- if (is.numeric(centres[[cc]]))
+    ifelse(has_range, centres[[cc]][key], NA) else centres[[cc]][key]
+
+# Result tables of all fits
+res <- list(background_coefficients = list(),
+            background_contrasts = list(),
+            background_metadata = list(),
+            gam_coefficients = list(),
+            gam_contrasts = list(),
+            gam_metadata = list())
+
+# --- Mixed models with the regional background ---
+rf <- fit_log_range_models(d_background, measures = measures,
+                           regional_background = TRUE, breadth_scale = "raw")
+for (comp in c("coefficients", "contrasts", "metadata")) {
+  x <- rf[[comp]]
+  x$table <- main_table
+  x$analysis <- "regional_background_500_bfly"
+  res[[paste0("background_", comp)]][[1]] <- x
+}
+
+# --- Spherical GAMs ---
+# Isotropic smooth of the species centre on the sphere plus subfamily and genus random
+# effects
+for (m in names(measures)) for (pred in c("type", "breadth")) {
+  g <- fit_species_spatial_gam(d_centres, measures[[m]],
+                               include_breadth = pred == "breadth")
+  for (comp in c("coefficients", "contrasts", "metadata")) {
+    x <- g[[comp]]
+    x$table <- main_table
+    x$measure <- m
+    x$predictors <- pred
+    x$analysis <- "spherical_gam"
+    res[[paste0("gam_", comp)]][[paste(m, pred)]] <- x
+  }
+  cat("spherical GAM", m, pred, "done\n")
+}
+
+# --- Write the result tables ---
+for (comp in names(res))
+  write_table(rbindlist(res[[comp]], fill = TRUE),
+              file.path(dir_data_intermediate, paste0(comp, ".csv")))
+cat("units with a background (area):",
+    sum(is.finite(background$regional_background_area)),
+    "; with a centre:", nrow(centres), "\n")
+```
+
+```{r clear_fit_geographic_models, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Tree-tip crosswalks
+
+Species of the main table are linked to the tips of the Yumnam & Kodandaramaiah (2025) and Schär et al. (2018) trees, first through the GBIF Backbone snapshot (`match_tree_tips()`: the binomial parsed from a tip is an accepted name or a synonym of one accepted species, whose duplicate cluster the unit represents), then by exact binomial; each tip links to one species at most. No taxon names are queried online.
+
+*Inputs:* s03/species_table.csv; s01/species_traits.csv (duplicate clusters); gbif_backbone/ snapshot; taxonomy/riodinid_genera.csv; phylogenies/ trees  
+*Outputs:* crosswalk_yumnam_2025.csv, crosswalk_schar_2018.csv
+
+```{r match_tree_tips}
+# --- Trees, species table and GBIF Backbone snapshot ---
+trees <- lapply(tree_files, read_published_tree)
+d <- read_species_table()
+snapshot <- read_backbone_snapshot(dir_data_raw)
+
+# Representative key of each accepted key (duplicate clusters of s01)
+traits <- read.csv(file.path(dir_s01, "species_traits.csv"), colClasses = "character",
+                   na.strings = c("", "NA"))
+representative_of <- setNames(traits$representative_key, traits$gbif_key)
+
+# --- Match the units to the tips of each tree ---
+for (study in names(trees)) {
+  # Route 1: the tip that the snapshot resolves to the unit (one tip per species)
+  tips <- match_tree_tips(trees[[study]], study, snapshot, representative_of)
+  tips <- tips[tips$matched, ]
+  tip_via_key <- tips$tree_tip_original[match(sprintf("%.0f", d$gbif_key),
+                                              tips$representative_key)]
+
+  # Route 2: exact parsed binomial of the unit's name, ignoring binomials shared by
+  # several tips
+  tip_labels <- trees[[study]]$tip.label
+  parsed <- vapply(tip_labels,
+                   function(t) standardise_species_label(species_name_from_tip(t)),
+                   "")
+  parsed[duplicated(parsed) | duplicated(parsed, fromLast = TRUE)] <- NA
+  tip_exact <- tip_labels[match(standardise_species_label(d$species), parsed)]
+
+  # Route 1 takes precedence
+  tip <- ifelse(is.na(tip_via_key), tip_exact, tip_via_key)
+  map <- data.frame(analysis_species = d$species,
+                    tree_tip_original = tip,
+                    match_route = ifelse(!is.na(tip_via_key), "gbif_key",
+                                         ifelse(!is.na(tip_exact), "exact_binomial", NA)))
+
+  # First unit keeps the tip
+  map$tree_tip_original[duplicated(map$tree_tip_original) &
+                          !is.na(map$tree_tip_original)] <- NA
+  map$matched <- !is.na(map$tree_tip_original)
+  write_table(map, file.path(dir_data_intermediate, paste0("crosswalk_", study, ".csv")))
+  cat(study, ": tips matched to a species ", nrow(tips),
+      "; units matched ", sum(map$matched),
+      " (via GBIF key ", sum(map$matched & map$match_route %in% "gbif_key"),
+      ")\n", sep = "")
+}
+```
+
+```{r clear_match_tree_tips, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Matched-tip PGLS
+
+Pagel-lambda PGLS (REML, lambda profiled over [0, 1]) and the taxonomic mixed models are fitted to the same matched species on each tree; the Yumnam tree keeps its published branch lengths and the Schär tree gets Grafen lengths after pruning.
+
+*Inputs:* s03/species_table.csv; crosswalk_<tree>.csv; phylogenies/ trees  
+*Outputs:* pgls_matched_{coefficients,contrasts,metadata}.csv (PGLS) and pgls_matched_lmm_{contrasts,metadata}.csv (mixed models on the same species); rows tagged table = MAIN_subtype and study
+
+```{r fit_matched_pgls}
+# --- Trees and the main species table ---
+trees <- lapply(tree_files, read_published_tree)
+d_all <- read_species_table()
+
+# PGLS tables, and mixed-model tables for the same species
+res <- list(coefficients = list(),
+            contrasts = list(),
+            metadata = list(),
+            lmm_contrasts = list(),
+            lmm_metadata = list())
+
+# --- Fit the models on the species matched to each tree ---
+for (study in names(branch)) {
+  map <- read.csv(file.path(dir_data_intermediate, paste0("crosswalk_", study, ".csv")),
+                  na.strings = c("", "NA"))
+  matched <- d_all[d_all$species %in% map$analysis_species[map$matched], , drop = FALSE]
+
+  # Taxonomic mixed models on the matched species
+  tax <- fit_log_range_models(matched, measures = measures, breadth_scale = "raw")
+  for (comp in c("contrasts", "metadata")) {
+    x <- tax[[comp]]
+    x$table <- main_table
+    x$study <- study
+    res[[paste0("lmm_", comp)]][[study]] <- x
+  }
+
+  # PGLS of each measure and predictor set, on the data of the corresponding mixed model
+  for (key in names(tax$model_data)) {
+    # The model key is the measure and the predictors
+    fields <- strsplit(key, "_", fixed = TRUE)[[1]]
+    d <- tax$model_data[[key]]
+    meta <- tax$metadata[tax$metadata$measure == fields[1] &
+                           tax$metadata$predictors == fields[2], ]
+
+    # The reference partner breadth of the breadth models is 1 (centred: 1 minus the mean
+    # breadth). A failed fit is reported and skipped.
+    fit <- tryCatch(
+      fit_pagel_pgls(d, trees[[study]], map, formulas[[fields[2]]], study = study,
+                     measure = fields[1], predictors = fields[2],
+                     branch_treatment = branch[[study]],
+                     breadth_reference_centered = if (fields[2] == "breadth")
+                       1 - meta$partner_breadth_mean else 0,
+                     breadth_reference_original = if (fields[2] == "breadth") 1 else NA,
+                     method = "REML"),
+      error = function(e) {
+        message(study, " ", key, ": ", conditionMessage(e))
+        NULL
+      })
+    if (is.null(fit)) next
+
+    for (comp in c("coefficients", "contrasts", "metadata")) {
+      x <- fit[[comp]]
+      x$table <- main_table
+      x$study <- study
+      res[[comp]][[paste(study, key)]] <- x
+    }
+  }
+  cat(study, "done", format(Sys.time(), "%H:%M:%S"), "\n")
+}
+
+# --- Write the result tables ---
+for (comp in names(res))
+  write_table(rbindlist(res[[comp]], fill = TRUE),
+              file.path(dir_data_intermediate, paste0("pgls_matched_", comp, ".csv")))
+```
+
+```{r clear_fit_matched_pgls, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Genus-grafted PGLS
+
+Analysed species missing from a tree are grafted onto their genus, which retains most analysed species and parasites; PGLS as above. The grafted trees are saved for the later phylogenetic analyses.
+
+*Inputs:* s03/species_table.csv; crosswalk_<tree>.csv; phylogenies/ trees  
+*Outputs:* pgls_grafted_{coefficients,contrasts,metadata,coverage}.csv; grafted_trees.rds (list of the two grafted trees, tips = analysis species, attribute `grafted` = grafted species)
+
+`graft_species_to_genus()` adds the analysed species missing from a tree to their genus; it is applied to both trees.
+
+```{r define_graft_species_to_genus}
+#' Graft analysed species that are missing from a tree onto their genus
+#'
+#' Species are added in alphabetical order. A species whose genus has two or
+#' more tips is attached at the most recent common ancestor of its congeners
+#' (a polytomy at the genus node, as in `phytools::add.species.to.genus(where =
+#' "root")`, but matching genera exactly at the start of the label); a species
+#' whose genus has one tip becomes its sister, splitting that tip's branch at
+#' its midpoint. The tree is made ultrametric first (`force.ultrametric`,
+#' method "extend") if necessary, and new branches keep it ultrametric.
+#' Species of genera absent from the tree are not grafted.
+#' @param tree Ultrametric `phylo` tree whose tip labels are analysis names
+#'   (`Genus_species`).
+#' @param species Analysis names that should be on the tree.
+#' @param genus_map Optional named character vector (analysis name -> genus) giving the
+#'   genus of tips and of species to graft, for names whose current genus differs from the
+#'   genus in the name (revised classification). Names not in the map use the genus at the
+#'   start of the label.
+#' @return The grafted tree; attribute `grafted` lists the added species.
+graft_species_to_genus <- function(tree, species, genus_map = NULL) {
+  # Make the tree ultrametric if it is not
+  if (!ape::is.ultrametric(tree))
+    tree <- phytools::force.ultrametric(tree, method = "extend")
+
+  # Genus of tip labels or species names: the genus map where it has an entry, else the
+  # genus at the start of the name
+  genus_of <- function(x) {
+    g <- sub("_.*", "", x)
+    if (!is.null(genus_map)) {
+      m <- unname(genus_map[x])
+      g[!is.na(m)] <- m[!is.na(m)]
+    }
+    g
+  }
+
+  # --- Graft the missing species in alphabetical order ---
+  grafted <- character()
+  for (s in sort(setdiff(species, tree$tip.label))) {
+    # Species of genera absent from the tree are skipped
+    ii <- which(genus_of(tree$tip.label) == genus_of(s))
+    if (!length(ii)) next
+
+    if (length(ii) > 1L) {
+      # Two or more congeners: polytomy at their most recent common ancestor
+      node <- phytools::findMRCA(tree, tree$tip.label[ii])
+      tree <- phytools::bind.tip(tree, s, where = node)
+    } else {
+      # One congener: sister to it, splitting its branch at the midpoint
+      half <- 0.5 * tree$edge.length[tree$edge[, 2] == ii]
+      tree <- phytools::bind.tip(tree, s, where = ii, position = half)
+    }
+    grafted <- c(grafted, s)
+  }
+
+  # The grafted species are recorded as an attribute
+  attr(tree, "grafted") <- grafted
+  tree
+}
+```
+
+```{r fit_grafted_pgls}
+# --- Trees and analysed species ---
+trees <- lapply(tree_files, read_published_tree)
+d_all <- read_species_table()
+
+# Units with a type, genus and subfamily and a range area or latitudinal extent
+analysed <- d_all$species[!is.na(d_all$interaction_type) & !is.na(d_all$genus) &
+                            !is.na(d_all$subfamily) &
+                            (is.finite(d_all$range_area) |
+                               is.finite(d_all$latitudinal_extent))]
+
+# Result tables and the grafted tree of each study
+res <- list(coefficients = list(),
+            contrasts = list(),
+            metadata = list(),
+            coverage = list())
+grafted_trees <- list()
+
+# --- Graft each tree and fit the models ---
+for (study in names(branch)) {
+  map <- read.csv(file.path(dir_data_intermediate, paste0("crosswalk_", study, ".csv")),
+                  na.strings = c("", "NA"))
+  matched <- intersect(analysed, map$analysis_species[map$matched])
+
+  # A missing species joins its congeners' most recent common ancestor as a polytomy, or
+  # becomes sister to a single congener at the midpoint of its branch; species of genera
+  # absent from the tree are omitted. Grafen lengths (Schär) are computed on the pruned
+  # matched tree before grafting. Tips and grafted species take the revised genus of the
+  # analysis table.
+  tr <- graft_species_to_genus(
+    prepare_analysis_tree(trees[[study]], map, matched, branch[[study]]),
+    analysed,
+    genus_map = setNames(d_all$genus, d_all$species))
+  grafted_trees[[study]] <- tr
+
+  # Crosswalk of the grafted tree (every tip is its own analysis species) and its coverage
+  cw <- data.frame(analysis_species = tr$tip.label,
+                   tree_tip_original = tr$tip.label,
+                   matched = TRUE)
+  res$coverage[[study]] <- data.frame(study = study,
+                                      analysed = length(analysed),
+                                      matched = length(matched),
+                                      grafted = length(attr(tr, "grafted")),
+                                      on_tree = length(tr$tip.label))
+
+  # Taxonomic mixed models on the species of the grafted tree
+  d <- d_all[d_all$species %in% tr$tip.label, ]
+  tax <- fit_log_range_models(d, measures = measures, breadth_scale = "raw")
+
+  # PGLS of each measure and predictor set
+  for (key in names(tax$model_data)) {
+    # The model key is the measure and the predictors
+    fields <- strsplit(key, "_", fixed = TRUE)[[1]]
+    dm <- tax$model_data[[key]]
+    meta <- tax$metadata[tax$metadata$measure == fields[1] &
+                           tax$metadata$predictors == fields[2], ]
+
+    # The grafted tree already has its final branch lengths, so they are used as given
+    # ("published"). A failed fit is reported and skipped.
+    fit <- tryCatch(
+      fit_pagel_pgls(dm, tr, cw, formulas[[fields[2]]], study = study,
+                     measure = fields[1], predictors = fields[2],
+                     branch_treatment = "published", method = "REML",
+                     breadth_reference_centered = if (fields[2] == "breadth")
+                       1 - meta$partner_breadth_mean else 0,
+                     breadth_reference_original = if (fields[2] == "breadth") 1 else NA),
+      error = function(e) {
+        message(study, " ", key, ": ", conditionMessage(e))
+        NULL
+      })
+    if (is.null(fit)) next
+
+    # Tag the result tables; the metadata also records the number of grafted species
+    n_graft <- sum(dm$species %in% attr(tr, "grafted"))
+    for (comp in c("coefficients", "contrasts", "metadata")) {
+      x <- fit[[comp]]
+      x$table <- main_table
+      x$study <- study
+      x$tree_set <- "grafted"
+
+      # Record the branch lengths actually used
+      if ("branch_treatment" %in% names(x)) x$branch_treatment <- branch[[study]]
+      if (comp == "metadata") x$n_grafted <- n_graft
+      res[[comp]][[paste(study, key)]] <- x
+    }
+    cat(study, key, "n =", nrow(dm), "grafted =", n_graft,
+        format(Sys.time(), "%H:%M:%S"), "\n")
+  }
+}
+
+# --- Write the result tables and the grafted trees ---
+for (comp in names(res))
+  write_table(rbindlist(res[[comp]], fill = TRUE),
+              file.path(dir_data_intermediate, paste0("pgls_grafted_", comp, ".csv")))
+saveRDS(grafted_trees, file.path(dir_data_intermediate, "grafted_trees.rds"))
+print(rbindlist(res$coverage))
+```
+
+```{r clear_fit_grafted_pgls, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Joint phylogenetic and spatial models
+
+On the grafted trees, a GAM combines the spherical smooth with a species random effect with phylogenetic covariance, and a PGLS includes the all-butterfly regional background. Moran's I of the residuals between species centres within 500 km is recorded for these models and the plain grafted PGLS.
+
+*Inputs:* grafted_trees.rds, presence_500km.csv, species_centres.csv; s02/range_metrics.csv; s03/species_table.csv, s03/analysis_units.csv, s03/daru_all_species.csv, s03/daru_cells_500km.csv  
+*Outputs:* phylo_geography_contrasts.csv, phylo_geography_moran.csv
+
+```{r fit_phylo_spatial_models}
+# --- Grafted trees ---
+grafted <- readRDS(file.path(dir_data_intermediate, "grafted_trees.rds"))
+
+# --- All-butterfly background, as in the geographic models ---
+ranges <- read.csv(file.path(dir_s02, "range_metrics.csv"),
+                   colClasses = c(pool_key = "character"))
+ranges <- ranges[!duplicated(ranges$pool_key) & is.finite(ranges$range_area), ]
+p5 <- read.csv(file.path(dir_data_intermediate, "presence_500km.csv"),
+               colClasses = c(species = "character"))
+p5 <- p5[p5$species %in% ranges$pool_key, ]
+units <- read.csv(file.path(dir_s03, "analysis_units.csv"),
+                  colClasses = c(pool_key = "character"))
+unit_genus <- units$genus[match(ranges$pool_key, units$pool_key)]
+bg <- butterfly_range_background(
+  p5,
+  setNames(ifelse(is.na(unit_genus), ranges$genus, unit_genus), ranges$pool_key),
+  fread(file.path(dir_s03, "daru_all_species.csv")),
+  fread(file.path(dir_s03, "daru_cells_500km.csv")),
+  measures = measures)
+
+# --- Species centres and Moran's I ---
+ce <- fread(file.path(dir_data_intermediate, "species_centres.csv"),
+            colClasses = c(species = "character"))
+
+# Moran's I of residuals `res` with neighbours defined as species centres within 500 km
+# (binary weights). `keys` are the pool keys of the residuals, in the same order;
+# residuals of units without a centre are dropped. Returns the observed statistic.
+moran500 <- function(keys, res) {
+  k <- match(keys, ce$species)
+  ok <- !is.na(k)
+  D <- gc_km(ce$geo_latitude[k[ok]], ce$geo_longitude[k[ok]])
+  ape::Moran.I(res[ok], (D > 0 & D <= 500) * 1)$observed
+}
+
+# --- Species table with the background and the species centres ---
+d0 <- read_species_table()
+for (cc in grep("^regional_background_", names(bg), value = TRUE))
+  d0[[cc]] <- bg[[cc]][match(d0$pool_key, bg$species)]
+d0 <- merge(d0, ce, by.x = "pool_key", by.y = "species", all.x = TRUE, sort = FALSE)
+
+# --- Fit the models on each grafted tree ---
+# `out` collects the contrast tables and `mor` the Moran's I values
+out <- list()
+mor <- list()
+for (study in studies) {
+  tr <- grafted[[study]]
+  cw <- data.frame(analysis_species = tr$tip.label,
+                   tree_tip_original = tr$tip.label,
+                   matched = TRUE)
+  on_tree <- d0[d0$species %in% tr$tip.label, ]
+
+  for (m in names(measures)) for (pred in c("type", "breadth")) {
+    # --- 1. Phylogenetic spatial GAM ---
+    # log10 range ~ type (+ breadth) + s(lat, lon, bs = "sos", k = 100) + a species random
+    # effect with phylogenetic covariance (tree correlation matrix C, penalised with C^-1
+    # through paraPen) and an independent residual, i.e. a REML analogue of Pagel's lambda
+    # plus a spatial smooth. k = 100 removes residual spatial autocorrelation (Moran's I
+    # near 0); smaller k leave some. Type contrasts: single-step Tukey p-values (normal
+    # approximation).
+
+    # Units with a positive measure, a type and a centre
+    g0 <- on_tree[is.finite(on_tree[[measures[[m]]]]) &
+                    on_tree[[measures[[m]]]] > 0 &
+                    !is.na(on_tree$interaction_type) &
+                    is.finite(on_tree$geo_latitude), ]
+
+    # The breadth model leaves out type n and units without a finite breadth
+    if (pred == "breadth")
+      g0 <- g0[g0$interaction_type != "n" & is.finite(g0$host_breadth), ]
+
+    # One row per species, the tree pruned to them and their correlation matrix C
+    g0 <- g0[!duplicated(g0$species), ]
+    gtr <- ape::keep.tip(tr, g0$species)
+    g0 <- g0[match(gtr$tip.label, g0$species), ]
+    C <- ape::vcv(gtr, corr = TRUE)[g0$species, g0$species]
+
+    # Response, type levels in use, centred breadth, and the species design matrix Z
+    # (identity; penalised with the inverse of C in the fit)
+    g0$y <- log10(g0[[measures[[m]]]])
+    g0$interaction_type <- droplevels(g0$interaction_type)
+    g0$hb <- g0$host_breadth - mean(g0$host_breadth)
+    Z <- diag(nrow(g0))
+
+    # Model formula and fit
+    fo <- if (pred == "type")
+      y ~ interaction_type + s(geo_latitude, geo_longitude, bs = "sos", k = 100) + Z else
+      y ~ interaction_type + hb + s(geo_latitude, geo_longitude, bs = "sos", k = 100) + Z
+    g <- gam(fo, data = c(as.list(g0), list(Z = Z)),
+             paraPen = list(Z = list(solve(C))), method = "REML")
+
+    # Coefficients, their covariance matrix and the type levels
+    b <- coef(g)
+    V <- vcov(g)
+    lev <- levels(g0$interaction_type)
+
+    # Contrast vector selecting the coefficient of type `a` (the first level is the
+    # reference)
+    cvec <- function(a) {
+      v <- setNames(rep(0, length(b)), names(b))
+      if (a != lev[1]) v[paste0("interaction_type", a)] <- 1
+      v
+    }
+
+    if (pred == "type") {
+      # All pairwise type contrasts as range ratios, with single-step Tukey intervals and
+      # p-values (q975 is the critical value of the 95 % interval)
+      gt <- rbindlist(lapply(combn(lev, 2, simplify = FALSE), function(q) {
+        L <- cvec(q[1]) - cvec(q[2])
+        e <- sum(L * b)
+        se <- sqrt(drop(t(L) %*% V %*% L))
+        q975 <- qtukey(0.95, nmeans = length(lev), df = Inf) / sqrt(2)
+        data.table(contrast = paste(q, collapse = " - "),
+                   ratio = 10^e,
+                   lower = 10^(e - q975 * se),
+                   upper = 10^(e + q975 * se),
+                   p = ptukey(abs(e / se) * sqrt(2), nmeans = length(lev), df = Inf,
+                              lower.tail = FALSE))
+      }))
+
+      # Moran's I of the residuals of the model
+      mor[[paste("gam", study, m)]] <- data.table(
+        model = "phylo_spatial_gam", study = study, measure = m, n = nrow(g0),
+        moran_500 = moran500(g0$pool_key, residuals(g)))
+    } else {
+      # Breadth coefficient as a range ratio, with a normal-approximation interval and
+      # p-value
+      se <- sqrt(V["hb", "hb"])
+      gt <- data.table(contrast = "breadth",
+                       ratio = 10^b[["hb"]],
+                       lower = 10^(b[["hb"]] - 1.96 * se),
+                       upper = 10^(b[["hb"]] + 1.96 * se),
+                       p = 2 * pnorm(-abs(b[["hb"]] / se)))
+    }
+    out[[paste("gam", study, m, pred)]] <- cbind(
+      model = "phylo_spatial_gam", study = study, measure = m, predictors = pred,
+      n = nrow(g0), n_parasite = sum(g0$interaction_type == "p"),
+      n_grafted = sum(g0$species %in% attr(tr, "grafted")), gt)
+
+    # --- 2. PGLS with the butterfly background ---
+    # Adjusts for regional range-size structure, but its residuals stay spatially
+    # autocorrelated, so its intervals are too narrow
+    tax <- fit_log_range_models(on_tree, measures = measures[m],
+                                regional_background = TRUE, breadth_scale = "raw")
+    d <- tax$model_data[[paste(m, pred, sep = "_")]]
+    meta <- tax$metadata[tax$metadata$predictors == pred, ]
+    fo <- if (pred == "type")
+      log10_range ~ interaction_type + regional_background_centered else
+      log10_range ~ interaction_type + partner_breadth_centered +
+        regional_background_centered
+    fit <- fit_pagel_pgls(d, tr, cw, fo, study = study, measure = m, predictors = pred,
+                          branch_treatment = "published", method = "REML",
+                          breadth_reference_centered = if (pred == "breadth")
+                            1 - meta$partner_breadth_mean else 0)
+
+    # Type contrasts (type model) or the breadth coefficient (breadth model)
+    ct <- as.data.table(fit$contrasts)[, .(contrast, ratio = range_ratio,
+                                           lower = ratio_lower, upper = ratio_upper,
+                                           p = p.value)]
+    co <- as.data.table(fit$coefficients)[term == "partner_breadth_centered",
+                                          .(contrast = "breadth", ratio = range_ratio,
+                                            lower = ratio_lower, upper = ratio_upper,
+                                            p = p_value)]
+    out[[paste("bg", study, m, pred)]] <- cbind(
+      model = "pgls_background", study = study, measure = m, predictors = pred,
+      n = nrow(d), n_parasite = sum(d$interaction_type == "p"),
+      n_grafted = sum(d$species %in% attr(tr, "grafted")),
+      if (pred == "type") ct else co)
+
+    # Moran's I of the normalised residuals (range-area type model only)
+    if (pred == "type" && m == "area") {
+      keys <- d$pool_key[match(fit$diagnostics$species, d$species)]
+      mor[[paste("bg", study)]] <- data.table(
+        model = "pgls_background_normalised_residuals", study = study, measure = m,
+        n = nrow(d), moran_500 = moran500(keys, fit$diagnostics$normalized_residual))
+    }
+    cat(study, m, pred, "done", format(Sys.time(), "%H:%M:%S"), "\n")
+  }
+
+  # --- 3. Residual autocorrelation of the plain grafted PGLS (area, type model) ---
+  tax0 <- fit_log_range_models(on_tree, measures = c(area = "range_area"),
+                               breadth_scale = "raw")
+  d <- tax0$model_data$area_type
+  fit0 <- fit_pagel_pgls(d, tr, cw, log10_range ~ interaction_type, study = study,
+                         measure = "area", predictors = "type",
+                         branch_treatment = "published", method = "REML")
+  keys <- d$pool_key[match(fit0$diagnostics$species, d$species)]
+  mor[[paste("pgls", study)]] <- rbind(
+    data.table(model = "pgls_raw_residuals", study = study, measure = "area", n = nrow(d),
+               moran_500 = moran500(keys, fit0$diagnostics$residual)),
+    data.table(model = "pgls_normalised_residuals", study = study, measure = "area",
+               n = nrow(d),
+               moran_500 = moran500(keys, fit0$diagnostics$normalized_residual)))
+}
+
+# --- Write the result tables ---
+write_table(rbindlist(out, fill = TRUE),
+            file.path(dir_data_intermediate, "phylo_geography_contrasts.csv"))
+write_table(rbindlist(mor, fill = TRUE),
+            file.path(dir_data_intermediate, "phylo_geography_moran.csv"))
+print(rbindlist(mor, fill = TRUE))
+```
+
+```{r clear_fit_phylo_spatial_models, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Leave-one-genus-out
+
+The range-area type model (mixed model and grafted PGLS on both trees) is refitted after omitting each genus with at least three parasites in the main model.
+
+*Inputs:* s03/species_table.csv; grafted_trees.rds, lmm_contrasts.csv, pgls_grafted_contrasts.csv  
+*Output:* leave_genus_out.csv (one row per omitted genus x model x contrast; dropped = "none" is the full model and must reproduce the main mixed model and the grafted PGLS)
+
+```{r fit_leave_genus_out}
+# --- Grafted trees and species table ---
+grafted <- readRDS(file.path(dir_data_intermediate, "grafted_trees.rds"))
+d_all <- read_species_table()
+
+# Contrasts kept in the output
+keep_contrasts <- c("f-p", "n-p", "m-p", "f-m")
+
+# --- Genera to omit ---
+# Parasitic genera of the main range-area type model
+fit0 <- fit_log_range_models(d_all, measures = c(area = "range_area"),
+                             breadth_scale = "raw")
+md0 <- fit0$model_data$area_type
+pgen <- sort(table(md0$genus[md0$interaction_type == "p"]), decreasing = TRUE)
+
+# Omission sets: none (the full model) and each genus with at least three parasites
+drops <- c(list(none = character()),
+           setNames(as.list(names(pgen)[pgen >= 3]), names(pgen)[pgen >= 3]))
+print(pgen)
+
+# --- Contrast table of a model ---
+# Kept contrasts of a model as a table with ratio, interval and p-value; spaces are
+# removed from the contrast labels
+tidy <- function(ct) {
+  x <- as.data.table(ct)[, contrast := gsub(" ", "", contrast)][
+    contrast %in% keep_contrasts]
+  x[, .(contrast, ratio = range_ratio, lower = ratio_lower, upper = ratio_upper,
+        p = p.value)]
+}
+
+# --- Refit the models omitting each genus ---
+res <- list()
+for (k in names(drops)) {
+  d <- d_all[!d_all$genus %in% drops[[k]], ]
+
+  # Taxonomic mixed model
+  tax <- fit_log_range_models(d, measures = c(area = "range_area"), breadth_scale = "raw")
+  md <- tax$model_data$area_type
+  res[[paste(k, "lmm")]] <- cbind(
+    dropped = k, model = "lmm", n = nrow(md),
+    n_parasite = sum(md$interaction_type == "p"), lambda = NA_real_,
+    tidy(tax$contrasts[tax$contrasts$predictors == "type", ]))
+
+  # Grafted PGLS on each tree
+  for (study in studies) {
+    tr <- grafted[[study]]
+    cw <- data.frame(analysis_species = tr$tip.label,
+                     tree_tip_original = tr$tip.label,
+                     matched = TRUE)
+    taxp <- fit_log_range_models(d[d$species %in% tr$tip.label, ],
+                                 measures = c(area = "range_area"), breadth_scale = "raw")
+    dm <- taxp$model_data$area_type
+    fit <- fit_pagel_pgls(dm, tr, cw, log10_range ~ interaction_type, study = study,
+                          measure = "area", predictors = "type",
+                          branch_treatment = "published", method = "REML")
+    res[[paste(k, study)]] <- cbind(dropped = k, model = paste0("pgls_", study),
+                                    n = nrow(dm),
+                                    n_parasite = sum(dm$interaction_type == "p"),
+                                    lambda = fit$metadata$lambda, tidy(fit$contrasts))
+    cat(k, study, "n =", nrow(dm), "lambda =", round(fit$metadata$lambda, 2),
+        format(Sys.time(), "%H:%M:%S"), "\n")
+  }
+}
+
+# --- Collect the results ---
+out <- rbindlist(res, fill = TRUE)
+out[, dropped_genera := vapply(dropped,
+                               function(k) paste(drops[[k]], collapse = ";"),
+                               "")]
+
+# --- Check the full fits ---
+# The full fits (dropped = "none") must reproduce the main mixed models and the grafted
+# PGLS above
+ref_lmm <- fread(file.path(dir_data_intermediate, "lmm_contrasts.csv"))[
+  table == main_table & analysis == "main" & measure == "area" & predictors == "type"]
+ref_pg <- fread(file.path(dir_data_intermediate, "pgls_grafted_contrasts.csv"))[
+  measure == "area" & predictors == "type"]
+chk <- rbind(
+  merge(out[dropped == "none" & model == "lmm", .(contrast, ratio)],
+        ref_lmm[, .(contrast = gsub(" ", "", contrast), ref = range_ratio)],
+        by = "contrast"),
+  rbindlist(lapply(studies, function(s)
+    merge(out[dropped == "none" & model == paste0("pgls_", s), .(contrast, ratio)],
+          ref_pg[study == s, .(contrast = gsub(" ", "", contrast), ref = range_ratio)],
+          by = "contrast"))))
+# Four contrasts for the mixed model and for each tree
+stopifnot(nrow(chk) == 4L * (1L + length(studies)),
+          max(abs(chk$ratio / chk$ref - 1)) < 1e-6)
+
+# --- Write and print the results ---
+write_table(out, file.path(dir_data_intermediate, "leave_genus_out.csv"))
+print(out[, .(dropped, model, n_parasite, contrast, ratio = round(ratio, 2),
+              p = signif(p, 2))])
+```
+
+```{r clear_fit_leave_genus_out, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Genus-level PGLS
+
+Genus by interaction-type units, represented by one species each on the grafted trees, test whether small ranges recur across parasitic lineages; with all genera and without *Lepidochrysops*.
+
+*Inputs:* s03/species_table.csv; grafted_trees.rds  
+*Output:* genus_level_pgls.csv (n-f stored as f-n, as in the other result tables)
+
+```{r fit_genus_level_pgls}
+# --- Species table, grafted trees and omission sets ---
+d_all <- read_species_table()
+grafted <- readRDS(file.path(dir_data_intermediate, "grafted_trees.rds"))
+
+# All genera, and without Lepidochrysops
+drops <- list(none = character(), Lepidochrysops = "Lepidochrysops")
+
+# All six contrasts of the Tukey family
+keep <- c("f-p", "n-p", "m-p", "f-m", "n-f", "n-m")
+
+# --- Main mixed models and contrast table ---
+# Main mixed models of the three measures; their type-model data give the genus-level units
+fit0 <- fit_log_range_models(d_all, measures = measures, breadth_scale = "raw")
+
+# Kept contrasts of a model as a table with ratio, interval and p-value. Spaces are
+# removed from the contrast labels, and n-f is stored as f-n (ratio inverted), as in the
+# other result tables.
+tidy <- function(x) {
+  x <- as.data.table(x)[, contrast := gsub(" ", "", contrast)][contrast %in% keep]
+  x <- x[, .(contrast, ratio = range_ratio, lower = ratio_lower, upper = ratio_upper,
+             p = p.value)]
+  x[contrast == "n-f",
+    `:=`(contrast = "f-n", ratio = 1 / ratio, lower = 1 / upper, upper = 1 / lower)]
+  x
+}
+
+# --- Fit a PGLS to the genus-level units of each measure, omission set and tree ---
+res <- list()
+for (m in names(measures)) {
+  # Units of genus x subfamily x type: mean log10 range and member species
+  md <- as.data.table(fit0$model_data[[paste0(m, "_type")]])
+  u0 <- md[, .(y = mean(log10_range),
+               species_list = paste(sort(species), collapse = ";")),
+           by = .(genus, subfamily, interaction_type)]
+
+  for (k in names(drops)) {
+    u <- u0[!genus %in% drops[[k]]]
+    u[, interaction_type := factor(interaction_type, levels = c("n", "f", "m", "p"))]
+
+    for (study in studies) {
+      # One species represents each unit: a matched tip if the unit has one, otherwise its
+      # grafted tip (which sits at the genus node), so no relationship within genera is
+      # assumed; units of genera absent from the tree are omitted
+      tr <- grafted[[study]]
+      gr <- attr(tr, "grafted")
+      rep <- vapply(u$species_list, function(s) {
+        sp <- intersect(strsplit(s, ";", fixed = TRUE)[[1]], tr$tip.label)
+        if (!length(sp)) return(NA_character_)
+        mt <- setdiff(sp, gr)
+        if (length(mt)) sort(mt)[1] else sort(sp)[1]
+      }, "")
+      ud <- data.frame(species = unname(rep), log10_range = u$y,
+                       interaction_type = u$interaction_type, genus = u$genus)
+      ud <- ud[!is.na(ud$species), ]
+
+      # Tree pruned to the representatives, and the PGLS of the units
+      gt <- ape::keep.tip(tr, ud$species)
+      cw <- data.frame(analysis_species = gt$tip.label,
+                       tree_tip_original = gt$tip.label,
+                       matched = TRUE)
+      f2 <- fit_pagel_pgls(ud, gt, cw, log10_range ~ interaction_type, study = study,
+                           measure = m, predictors = "type",
+                           branch_treatment = "published", method = "REML")
+      res[[paste(m, k, study)]] <- cbind(
+        analysis = "genus_pgls", tree = study, measure = m, dropped = k,
+        n_units = nrow(ud), n_p_units = sum(ud$interaction_type == "p"),
+        lambda = f2$metadata$lambda, tidy(f2$contrasts))
+    }
+    cat(m, k, "done", format(Sys.time(), "%H:%M:%S"), "\n")
+  }
+}
+
+# --- Write the result table ---
+write_table(rbindlist(res, fill = TRUE),
+            file.path(dir_data_intermediate, "genus_level_pgls.csv"))
+```
+
+```{r clear_fit_genus_level_pgls, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+The R version and packages used to render this notebook are printed below, with the versions of the geospatial libraries (GDAL, PROJ, GEOS) used by `sf` and `terra` when the notebook loaded them.
+
+```{r save_r_environment}
+print(sessionInfo())
+
+# Geospatial libraries bundled with (Windows) or linked by (Linux, macOS) sf and terra
+if ("sf" %in% loadedNamespaces()) print(sf::sf_extSoftVersion())
+if ("terra" %in% loadedNamespaces()) print(terra::gdal(lib = "all"))
+```

@@ -1,0 +1,536 @@
+---
+title: "Butterfly-ant interactions 03 - species table building"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+This is the third of six R Markdown notebooks. It builds the species tables analysed in the paper by combining the species trait table and evidence ledger of `s01_prepare_traits` with the occurrence range metrics of `s02_prepare_ranges`, curated genus and subfamily tables and the modelled native ranges of Daru (2025).
+
+The outputs are the analysis units (`analysis_units.csv`), the main species table (`species_table.csv`, the published analysis table), the same types with modelled ranges (`species_table_daru.csv`), an alternative subtype coding (`species_table_assumed_subtype.csv`), the Daru range metrics of the units (`daru_ranges.csv`) and the all-butterfly comparison set of the regional range-size background (`daru_all_species.csv`, `daru_cells_500km.csv`). They are used by `s04_fit_models`, `s05_check_robustness` and `s06_summarise_results`. The notebook takes about 15 min, most of it to read the Daru rasters.
+
+# Setup
+
+## Packages
+
+`data.table` handles the tables and `terra` and `sf` the Daru polygons and rasters.
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(terra)
+library(sf)
+```
+
+## Folders
+
+Raw inputs are read from the versioned raw data and earlier results from the folders of `s01_prepare_traits` and `s02_prepare_ranges`; outputs are written to this notebook's folder in the versioned intermediate data. The input and output lists of the sections below give paths relative to these folders (`s01/` and `s02/` for the earlier notebooks).
+
+```{r setup_folders}
+# Raw data and the outputs of s01 and s02
+dir_data_raw <- path_resrepo("data/raw")
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_traits")
+dir_s02 <- path_resrepo("data/intermediate/s02_prepare_ranges")
+
+# Outputs of this notebook
+dir_data_intermediate <- path_resrepo("data/intermediate/s03_build_species_tables")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+`write_table()` writes the output tables, `trait_evidence_corrections.R` removes the ant records that do not count towards partner breadth, `name_matching.R` resolves Daru polygon names in the GBIF Backbone snapshot, and `projections.R` and `range_metrics.R` provide the Equal Earth projection and the circular longitudinal extent.
+
+```{r load_functions}
+# Output tables
+source(here::here("code", "R", "write_table.R"))
+
+# Partner breadth without the attack and questionable records
+source(here::here("code", "R", "trait_evidence_corrections.R"))
+
+# Strict name matching to the GBIF Backbone snapshot
+source(here::here("code", "R", "name_matching.R"))
+
+# Equal Earth projection and circular longitudinal extent
+source(here::here("code", "R", "projections.R"))
+source(here::here("code", "R", "range_metrics.R"))
+```
+
+Each section below reads its inputs from disk and ends by removing its objects (in a hidden chunk), so only the objects defined in this setup carry over from one section to the next.
+
+The tables of `s02_prepare_ranges` and of this notebook are read with the GBIF and pool keys as text.
+
+```{r define_reader}
+# Read a table of s02 or of this notebook, keeping the GBIF and pool keys as text
+read_keyed <- function(path) {
+  fread(path,
+        na.strings = c("", "NA"),
+        colClasses = c(gbif_key = "character", pool_key = "character"))
+}
+```
+
+```{r keep_setup_objects}
+# Objects of the setup, kept when each section clears its own objects
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Analysis units
+
+One accepted, non-riodinid species represents each occurrence range unit (pool), preferring a member with direct interaction-type evidence. Genera follow current classification where the GBIF Backbone keeps outdated combinations or junior synonyms (`taxonomy/genus_revisions.csv`, evidence in `genus_revision_evidence.csv`); subfamilies come from curated tables. Types presumed from the phylogeny are removed because they would be circular in the phylogenetic models.
+
+*Inputs:* s01/species_traits.csv; s02/range_metrics.csv; taxonomy/{genus_revisions, genus_subfamily, genus_subfamily_additions, riodinid_genera}.csv  
+*Output:* analysis_units.csv (range columns from the main cleaning; the species tables below replace them)
+
+```{r range_columns}
+# Main-cleaning range columns carried by the analysis units
+range_cols <- c("latitudinal_extent", "longitudinal_extent", "range_area",
+                "asympt_prop_lat", "asympt_prop_lon", "asympt_prop_area", "occurrence_count")
+```
+
+## Inputs
+
+Each GBIF key is linked to the representative key of its duplicate cluster and to its range pool.
+
+```{r read_unit_inputs}
+# --- Earlier results ---
+traits <- fread(file.path(dir_s01, "species_traits.csv"),
+                na.strings = c("", "NA"),
+                colClasses = c(gbif_key = "character", representative_key = "character"))
+ranges <- read_keyed(file.path(dir_s02, "range_metrics.csv"))
+
+# --- Curated taxonomy tables ---
+# Read with fread's default missing-value handling: blank subfamilies stay ""
+genus_subfamily <- fread(file.path(dir_data_raw, "taxonomy", "genus_subfamily.csv"))
+riodinid_genera <- fread(file.path(dir_data_raw, "taxonomy", "riodinid_genera.csv"))$genus
+revisions <- fread(file.path(dir_data_raw, "taxonomy", "genus_revisions.csv"),
+                   na.strings = c("", "NA"),
+                   colClasses = c(gbif_key = "character"))
+subfamily_additions <- fread(file.path(dir_data_raw, "taxonomy", "genus_subfamily_additions.csv"))
+
+# --- Key lookups ---
+# GBIF key -> representative of its duplicate cluster, and GBIF key -> range pool
+representative_of <- setNames(traits$representative_key, traits$gbif_key)
+pool_of <- setNames(ranges$pool_key, ranges$gbif_key)
+```
+
+## Units
+
+The accepted, non-riodinid representatives receive their current genus and subfamily, and one unit is kept per range pool.
+
+```{r build_units}
+# --- Accepted, non-riodinid representatives ---
+units <- traits[universe_status == "gbif_accepted" &
+                  is_representative == TRUE &
+                  !genus %in% riodinid_genera]
+
+# --- Current genus ---
+# The GBIF Backbone keeps outdated combinations for some species and junior synonyms beside their
+# senior genus. Genus-level synonymies are applied first, then species-level corrections. Species
+# identity (key, name, pool, range) is unchanged; genus_gbif keeps the Backbone genus.
+units[, genus_gbif := genus]
+genus_level <- revisions[level == "genus"]
+species_level <- revisions[level == "species"]
+
+# A species-level correction applies to the representative of its key's duplicate cluster
+species_level[, gbif_key := unname(representative_of[gbif_key])]
+
+i <- match(units$genus_gbif, genus_level$genus_gbif)
+units[!is.na(i), genus := genus_level$genus_revised[i[!is.na(i)]]]
+
+j <- match(units$gbif_key, species_level$gbif_key)
+units[!is.na(j), genus := species_level$genus_revised[j[!is.na(j)]]]
+
+# Every species-level revision must apply to a unit
+stopifnot(all(species_level$gbif_key %in% units$gbif_key))
+cat("units with a revised genus:", sum(units$genus != units$genus_gbif), "\n")
+
+# --- Subfamily ---
+# In order of precedence: (1) curated additions and corrections, (2) the genus table. Revised
+# genera take the subfamily of the revision table.
+units[, subfamily := subfamily_additions$subfamily[match(genus, subfamily_additions$genus)]]
+units[is.na(subfamily),
+      subfamily := genus_subfamily$combined_subfamily[match(genus, genus_subfamily$genus_unique)]]
+
+# Revised genera take the subfamily of the revision table
+k <- match(units$genus, revisions$genus_revised)
+h <- units$genus != units$genus_gbif & !is.na(k)
+units[h, subfamily := revisions$subfamily_revised[k[h]]]
+
+# --- Interaction types and range pools ---
+# Types presumed from the phylogeny would be circular in the phylogenetic models.
+units[interaction_type_basis == "presumed_phylogeny", interaction_type := NA]
+
+# Range pool of each unit (its own key when it is not in the range table)
+units[, pool_key := unname(pool_of[gbif_key])]
+units[is.na(pool_key), pool_key := gbif_key]
+
+# One unit per pool: prefer a member with direct type evidence, then any type, then the pool key
+# itself
+units[, rank := fifelse(interaction_type_basis %in% c("direct", "direct_class_inferred_subtype"),
+                        1L,
+                        fifelse(!is.na(interaction_type), 2L, 3L))]
+units[, is_pool_key := gbif_key == pool_key]
+setorder(units, pool_key, rank, -is_pool_key)
+units <- units[!duplicated(pool_key)]
+
+# --- Unit table ---
+# Unit columns and the main-cleaning range of the pool
+units <- units[, .(species, gbif_key, pool_key, genus, subfamily, interaction_type,
+                   interaction_type_basis, host_breadth, genus_gbif,
+                   wingspan_mm = as.numeric(wingspan_mm), wingspan_basis)]
+pools <- ranges[!duplicated(pool_key)]
+m <- match(units$pool_key, pools$pool_key)
+for (cc in range_cols) units[[cc]] <- pools[[cc]][m]
+units[, interaction_type := factor(interaction_type, levels = c("n", "f", "m", "p"))]
+
+write_table(units, file.path(dir_data_intermediate, "analysis_units.csv"))
+cat("analysis units:", nrow(units), "; typed:", sum(!is.na(units$interaction_type)),
+    "; with a main-cleaning range:", sum(is.finite(units$range_area)), "\n")
+```
+
+```{r clear_build_analysis_units, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Modelled ranges of the units
+
+Range area and latitudinal and longitudinal extents (km) of the Daru (2025) modelled native-range polygons, for units whose accepted name matches a polygon name exactly or to which a polygon name resolves in the GBIF Backbone snapshot (an accepted name or a synonym of one accepted species). The raw `daru_2024/polygons/` folder holds the polygons selected when the data bundle was assembled (one per matched unit); deposit names that resolve to further units only through GBIF synonyms are not in it, so those units have no modelled range.
+
+*Inputs:* analysis_units.csv; s01/species_traits.csv; daru_2024/polygons/*.gpkg; gbif_backbone/ snapshot; taxonomy/riodinid_genera.csv  
+*Output:* daru_ranges.csv
+
+```{r measure_daru_ranges}
+# --- Match units to Daru polygons ---
+# A unit matches by its accepted name or, failing that, by a polygon name that the snapshot
+# resolves to the unit
+polygon_dir <- file.path(dir_data_raw, "daru_2024", "polygons")
+daru_names <- sub("[.]gpkg$", "", list.files(polygon_dir))
+units <- fread(file.path(dir_data_intermediate, "analysis_units.csv"),
+               colClasses = c(gbif_key = "character", pool_key = "character"))
+
+# Unit (representative key) to which each polygon name resolves
+traits <- fread(file.path(dir_s01, "species_traits.csv"), na.strings = c("", "NA"),
+                colClasses = c(gbif_key = "character", representative_key = "character"))
+representative_of <- setNames(traits$representative_key, traits$gbif_key)
+daru_unit <- unname(representative_of[resolve_accepted_key(daru_names,
+                                                           read_backbone_snapshot(dir_data_raw))])
+units[, daru_name := fifelse(gsub("_", " ", species) %in% daru_names,
+                             gsub("_", " ", species),
+                             daru_names[match(gbif_key, daru_unit)])]
+todo <- units[!is.na(daru_name), .(pool_key, daru_name)]
+
+# --- Range metrics of each matched polygon ---
+res <- rbindlist(lapply(seq_len(nrow(todo)), function(i) {
+  # Polygon in geographic coordinates (skipped when unreadable or empty)
+  p <- tryCatch(vect(file.path(polygon_dir, paste0(todo$daru_name[i], ".gpkg"))),
+                error = function(e) NULL)
+  if (is.null(p) || !nrow(p)) return(NULL)
+  if (is.na(crs(p)) || !nzchar(crs(p))) crs(p) <- "EPSG:4326"
+  p <- project(p, "EPSG:4326")
+
+  # Latitudinal extent: mean Earth radius x latitude span; longitudinal extent: the shortest
+  # circular arc covering the vertex longitudes, converted at the midpoint of the latitude limits
+  e <- ext(p)
+  xy <- crds(as.points(p))
+  if (i %% 200 == 0) cat("Daru polygons:", i, "of", nrow(todo),
+                         format(Sys.time(), "%H:%M:%S"), "\n")
+  data.table(pool_key = todo$pool_key[i],
+             daru_name = todo$daru_name[i],
+             range_area = sum(expanse(p, unit = "km")),
+             latitudinal_extent = 6371.0088 * (e$ymax - e$ymin) * pi / 180,
+             longitudinal_extent = unname(circular_longitude_extent(
+               ((xy[, 1] + 180) %% 360) - 180, mean(c(e$ymin, e$ymax)))["extent"]))
+}))
+
+write_table(res, file.path(dir_data_intermediate, "daru_ranges.csv"))
+cat("units matched to a Daru polygon:", nrow(todo), "; with Daru range metrics:", nrow(res), "\n")
+```
+
+```{r clear_measure_daru_ranges, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Species tables
+
+Interaction types are kept when they rest on direct evidence or on a source statement for the species or its genus. In the main table, mutualist and parasite subtypes must rest on evidence for the subtype: assumed subtypes and genus-wide mutualist presumptions are dropped unless larval-food evidence (Heath & Claassens 2003 feeding categories), a non-inferred mutualist claim, a stated parasitic genus or a genus stated to be non-parasitic supports them. Partner breadth excludes the attack and questionable records of Fiedler (1991, Table 19). Ranges are the strict-cleaning occurrence ranges with at least 10 unique localities, or the Daru ranges in the modelled-range table. The alternative table keeps assumed subtypes and drops types resting only on field ant-attendance records; it is one of the alternative codings compared in the Supporting Information.
+
+*Inputs:* analysis_units.csv, daru_ranges.csv; s01/species_traits.csv, s01/evidence_ledger.csv; s02/range_metrics.csv; trait_evidence/decisions/parasitic_genera.csv  
+*Outputs:* species_table.csv, species_table_daru.csv, species_table_assumed_subtype.csv
+
+## Units with trait status, corrected partner breadth and strict-cleaning ranges
+
+`publication_trait_correction()` recounts partner breadth without the attack and questionable records of Fiedler (1991, Table 19).
+
+```{r prepare_units}
+# --- Units with their trait status and note ---
+units <- read_keyed(file.path(dir_data_intermediate, "analysis_units.csv"))
+# copy(): data.table updates names() by reference when columns are added
+unit_columns <- copy(names(units))
+traits <- fread(file.path(dir_s01, "species_traits.csv"),
+                na.strings = c("", "NA"), colClasses = "character")
+units[, status := traits$interaction_type_status[match(gbif_key, traits$gbif_key)]]
+units[, note := traits$interaction_type_note[match(gbif_key, traits$gbif_key)]]
+
+# --- Partner breadth without the attack and questionable records ---
+ledger <- fread(file.path(dir_s01, "evidence_ledger.csv"),
+                na.strings = c("", "NA"), colClasses = "character")
+units <- as.data.table(publication_trait_correction(as.data.frame(units), as.data.frame(ledger)))
+
+# --- Strict-cleaning occurrence ranges (one row per pool) ---
+ranges <- read_keyed(file.path(dir_s02, "range_metrics.csv"))
+ranges <- ranges[!duplicated(pool_key)]
+for (m in c("latitudinal_extent", "longitudinal_extent", "range_area", "unique_localities",
+            "asympt_prop_lat", "asympt_prop_lon", "asympt_prop_area"))
+  units[, (paste0(m, "_strict_plus")) :=
+          ranges[[paste0(m, "_strict_plus")]][match(pool_key, ranges$pool_key)]]
+
+# --- Daru modelled ranges ---
+daru <- fread(file.path(dir_data_intermediate, "daru_ranges.csv"),
+              colClasses = c(pool_key = "character"))
+```
+
+## Evidence on the mutualist / parasite subtype
+
+At species level, Heath & Claassens (2003) feeding category H (herbivorous) supports m and E (entomophagous) supports p, and a mutualist class claim that is neither inferred from relatives nor marked as presumed ("(p)") supports m. At genus level, a stated parasitic genus supports p, and *Orachrysops*, whose larvae are stated not to be parasites of ants (Fiedler 2012), supports m.
+
+```{r subtype_evidence}
+# --- Species-level evidence ---
+# Heath & Claassens (2003) feeding category of each species
+heath <- ledger[source_id == "heath2003" & claim_type == "carnivory",
+                .(accepted_key, code = sub("feeding category = ", "", reported_value_verbatim))]
+
+# m: feeding category H, or a mutualist claim neither inferred from relatives nor presumed ("(p)")
+subtype_m_keys <- unique(c(heath[grepl("^H$", trimws(code)), accepted_key],
+                           ledger[claim_type == "interaction_category" & class == "m" &
+                                    evidence_kind != "inferred-from-relatives" &
+                                    !grepl("[(]p[)]", reported_value_verbatim), accepted_key]))
+
+# p: feeding category E
+subtype_p_keys <- unique(heath[grepl("(^|[ ,])E", code), accepted_key])
+
+# --- Genus-level evidence ---
+subtype_m_genera <- "Orachrysops"
+parasitic_genera <- fread(file.path(dir_data_raw, "trait_evidence", "decisions",
+                                    "parasitic_genera.csv"))$genus
+```
+
+## Table builder
+
+`build_table()` applies the evidence and range rules of one table; it builds the three tables.
+
+```{r build_tables}
+# --- Evidence and range rules ---
+direct_basis <- c("direct", "direct_class_inferred_subtype")
+species_specific <- c("single_source", "agreed", "resolved_conflict")
+range_columns <- c("latitudinal_extent", "longitudinal_extent", "range_area",
+                   "asympt_prop_lat", "asympt_prop_lon", "asympt_prop_area")
+
+# --- Table builder ---
+# exclusion: "subtype_evidence" drops subtypes without subtype evidence (main coding);
+#   "attendance_only" drops types resting only on field ant-attendance records
+# range_data: strict-cleaning occurrence ranges or Daru modelled ranges
+# min_localities: fewest unique localities of an occurrence range
+build_table <- function(exclusion = c("subtype_evidence", "attendance_only"),
+                        range_data = c("strict_plus", "daru"),
+                        min_localities = 10) {
+  exclusion <- match.arg(exclusion)
+  range_data <- match.arg(range_data)
+  d <- copy(units)
+
+  # Direct evidence, or a presumption stated in a cited source for the species or for its genus
+  keep <- d$interaction_type_basis %in% direct_basis |
+    (d$interaction_type_basis == "presumed_relatives" &
+       d$status %in% c(species_specific, "presumed_genus_level"))
+  d[!keep, interaction_type := NA]
+
+  # Alternative coding: drop types resting only on field ant-attendance records
+  if (exclusion == "attendance_only") d[note %like% "R6", interaction_type := NA]
+
+  # Main coding
+  if (exclusion == "subtype_evidence") {
+    # Drop m and p whose subtype was assumed (obligate association documented, subtype not), and
+    # genus-wide m presumptions, unless subtype evidence above supports them. Genus-wide p
+    # presumptions stay: their sources state parasitism for the genus.
+    keep_m <- d$gbif_key %in% subtype_m_keys | d$genus %in% subtype_m_genera
+    keep_p <- d$gbif_key %in% subtype_p_keys | d$genus %in% parasitic_genera
+    d[interaction_type_basis == "direct_class_inferred_subtype" &
+        ((interaction_type == "m" & !keep_m) | (interaction_type == "p" & !keep_p)),
+      interaction_type := NA]
+    d[interaction_type == "m" & status == "presumed_genus_level" & !keep_m,
+      interaction_type := NA]
+  }
+
+  # Range metrics and unique-locality count of the chosen range data
+  if (range_data == "daru") {
+    # Modelled ranges have no locality count or stability; a large finite count passes the
+    # threshold
+    i <- match(d$pool_key, daru$pool_key)
+    for (m in c("latitudinal_extent", "longitudinal_extent", "range_area"))
+      d[, (m) := daru[[m]][i]]
+    d[, c("asympt_prop_lat", "asympt_prop_lon", "asympt_prop_area") := NA_real_]
+    d[, ul := fifelse(is.na(i), NA_real_, 1e9)]
+  } else {
+    for (m in range_columns) d[, (m) := get(paste0(m, "_strict_plus"))]
+    d[, ul := unique_localities_strict_plus]
+  }
+
+  # Ranges with too few unique localities are missing
+  d[!is.finite(ul) | ul < min_localities, (range_columns) := NA]
+
+  # Unit columns only, with the type as text
+  d[, interaction_type := as.character(factor(interaction_type, levels = c("n", "f", "m", "p")))]
+  d <- d[, ..unit_columns]
+
+  # Empty strings (e.g. no interaction-type basis) are missing values; write them as NA, as
+  # read.csv reads them
+  for (j in names(d)) if (is.character(d[[j]])) set(d, which(d[[j]] == ""), j, NA_character_)
+  d
+}
+
+# --- Build and write the three tables ---
+tables <- list(species_table = build_table("subtype_evidence", "strict_plus"),
+               species_table_daru = build_table("subtype_evidence", "daru"),
+               species_table_assumed_subtype = build_table("attendance_only", "strict_plus"))
+for (k in names(tables)) {
+  write_table(tables[[k]], file.path(dir_data_intermediate, paste0(k, ".csv")))
+
+  # Typed units with a range, in total and by type
+  d <- tables[[k]]
+  cat(k, ": typed units with a range ", sum(!is.na(d$interaction_type) & is.finite(d$range_area)),
+      " (n/f/m/p ",
+      paste(table(factor(d$interaction_type[is.finite(d$range_area)],
+                         levels = c("n", "f", "m", "p"))),
+            collapse = "/"),
+      ")\n", sep = "")
+}
+```
+
+```{r clear_build_species_tables, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# All-butterfly range cells
+
+Range metrics and occupied 500-km Equal Earth cells of all 10,372 butterfly species with a Daru (2025) modelled range raster. They provide the comparison species of the all-butterfly regional range-size background (`s04`) and the background map (`s06`). Area is computed at full resolution; cells and extents from a 6-fold aggregated copy. Extents are in degrees, unlike the km extents of the occurrence ranges, and enter only the latitude and longitude backgrounds. The section is resumable in batches of 250 rasters.
+
+*Inputs:* daru_2024/rasters/*.tif  
+*Outputs:* daru_all_species.csv, daru_cells_500km.csv
+
+```{r summarise_daru_rasters}
+# --- Files and earlier progress ---
+terraOptions(memfrac = 0.3, progress = 0)
+species_file <- file.path(dir_data_intermediate, "daru_all_species.csv")
+cells_file <- file.path(dir_data_intermediate, "daru_cells_500km.csv")
+files <- list.files(file.path(dir_data_raw, "daru_2024", "rasters"),
+                    pattern = "[.]tif$", full.names = TRUE)
+
+# Species already summarised; the cells of an interrupted batch are written again with that batch
+done <- if (file.exists(species_file))
+  fread(species_file, select = "daru_name")$daru_name else character(0)
+if (file.exists(cells_file)) {
+  cells <- fread(cells_file)
+  if (!all(cells$daru_name %in% done)) fwrite(cells[daru_name %in% done], cells_file)
+  rm(cells)
+}
+todo <- files[!sub("[.]tif$", "", basename(files)) %in% done]
+cat("rasters:", length(files), "; done:", length(done), "; to do:", length(todo), "\n")
+
+# --- Raster summary ---
+# Smallest arc (degrees) covering the occupied longitudes
+circular_extent <- function(lon) {
+  b <- sort(unique(round(lon, 1)))
+  if (length(b) < 2) return(0)
+  gaps <- c(diff(b), 360 - (b[length(b)] - b[1]))
+  360 - max(gaps)
+}
+crs_ee <- global_equal_area_crs()
+
+# Area (km2) is the expanse of the presence cells at full resolution (1/12 degree). Extents and
+# cells use a 6x aggregated copy (about 0.5 degree, maximum) to limit memory; a cell is occupied
+# when an aggregated presence-cell centre falls in it. Extents are in degrees, unlike the km
+# extents of the occurrence ranges; they enter only the latitude and longitude backgrounds.
+summarise_raster <- function(f) {
+  nm <- sub("[.]tif$", "", basename(f))
+  r <- tryCatch(rast(f), error = function(e) NULL)
+  if (is.null(r)) return(NULL)
+
+  # Range area from the presence cells at full resolution
+  r1 <- classify(r, cbind(1, 1), others = NA)   # presence cells only
+  ex <- expanse(r1, unit = "km")
+  area <- if (is.data.frame(ex)) sum(ex$area) else sum(ex)
+  if (!is.finite(area) || area <= 0) return(NULL)
+
+  # Occupied cells of the aggregated copy
+  a <- aggregate(r1, fact = 6, fun = "max", na.rm = TRUE)
+  p <- which(!is.na(values(a, mat = FALSE)))
+  if (!length(p)) return(NULL)
+  xy <- xyFromCell(a, p)
+
+  # 500-km cells: the projection call of project_occurrences(), so cells share the grid of the
+  # occurrence cells
+  pr <- sf::st_coordinates(sf::st_transform(sf::st_as_sf(data.frame(x = xy[, 1], y = xy[, 2]),
+                                                         coords = c("x", "y"), crs = 4326),
+                                            crs_ee)) / 1000
+  cell_id <- unique(paste(floor(pr[, 1] / 500), floor(pr[, 2] / 500), sep = ":"))
+
+  list(cells = data.table(daru_name = nm, cell_id = cell_id),
+       species = data.table(daru_name = nm, genus = sub(" .*", "", nm), range_area = area,
+                            latitudinal_extent = diff(range(xy[, 2])),
+                            longitudinal_extent = circular_extent(xy[, 1])))
+}
+
+# --- Summarise the remaining rasters in batches of 250 ---
+batches <- split(todo, ceiling(seq_along(todo) / 250))
+for (b in seq_along(batches)) {
+  res <- lapply(batches[[b]], summarise_raster)
+  res <- res[!vapply(res, is.null, TRUE)]
+
+  # Append the batch; the species file is written last, so it lists completed batches only
+  if (length(res)) {
+    fwrite(rbindlist(lapply(res, `[[`, "cells")), cells_file, append = file.exists(cells_file))
+    fwrite(rbindlist(lapply(res, `[[`, "species")), species_file,
+           append = file.exists(species_file))
+  }
+  rm(res)
+  invisible(gc())
+  cat("Daru rasters: batch", b, "of", length(batches), format(Sys.time(), "%H:%M:%S"), "\n")
+}
+
+# --- Summary ---
+species <- fread(species_file)
+cells <- fread(cells_file)
+cat("species:", nrow(species), "; species-cell rows:", nrow(cells),
+    "; 500-km cells:", uniqueN(cells$cell_id), "\n")
+```
+
+```{r clear_summarise_daru_rasters, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+The R version and packages used to render this notebook are printed below, with the versions of the geospatial libraries (GDAL, PROJ, GEOS) used by `sf` and `terra` when the notebook loaded them.
+
+```{r save_r_environment}
+print(sessionInfo())
+
+# Geospatial libraries bundled with (Windows) or linked by (Linux, macOS) sf and terra
+if ("sf" %in% loadedNamespaces()) print(sf::sf_extSoftVersion())
+if ("terra" %in% loadedNamespaces()) print(terra::gdal(lib = "all"))
+```

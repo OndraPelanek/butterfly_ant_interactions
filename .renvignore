@@ -1,0 +1,5 @@
+# Data, results and rendered documents contain no analysis code; skipping them
+# keeps renv's implicit-snapshot dependency scan fast.
+versions/
+data/
+results/

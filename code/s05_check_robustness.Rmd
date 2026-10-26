@@ -1,0 +1,1486 @@
+---
+title: "Butterfly-ant interactions 05 - robustness checks"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+This is the fifth of six R Markdown notebooks. It runs the robustness checks of the main range-size models reported in the Supporting Information: the scale and consistency of the partner-breadth effect, ranges rarefied to equal numbers of localities, regional subsets and genus omissions, residual diagnostics (Figure S3), larval carnivory, the number of origins of parasitism, occurrence-cleaning sensitivity and a Box-Cox transformation. None of the checks changes the main data or models.
+
+The inputs are the species table of `s03_build_species_tables`, the fitted main models, species centres, grafted trees and matched-tip PGLS tables of `s04_fit_models`, the occurrence records, range metrics and expert validation of `s02_prepare_ranges`, and the trait table and evidence ledger of `s01_prepare_traits`. The output tables and Figure S3 are read by the report, and `rarefied_models.csv` is also drawn in Figure 4 by `s06_summarise_results`. A full run takes about 50 min.
+
+# Setup
+
+## Packages
+
+`lmerTest` fits the mixed models, `mgcv` the GAMs and `ape` handles the trees; `emmeans` uses Kenward-Roger degrees of freedom from `pbkrtest`.
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(lmerTest)
+library(mgcv)
+library(sf)
+library(ape)
+library(pbkrtest)
+library(emmeans)
+```
+
+## Variables
+
+The three range measures and the two trees are shared by the sections below. The Box-Cox powers are fixed in their section; setting `profile_powers` to `TRUE` re-derives them from the profile likelihood (slow), and the notebook stops if they differ.
+
+```{r setup_variables}
+# The three range measures, named as in the output tables, and the two trees
+measures <- c(area = "range_area", lat = "latitudinal_extent",
+              lon = "longitudinal_extent")
+studies <- c("yumnam_2025", "schar_2018")
+
+# Re-derive the Box-Cox powers from the profile likelihood (slow) when TRUE
+profile_powers <- FALSE
+```
+
+## Folders
+
+Earlier results are read from the folders of `s01_prepare_traits` to `s04_fit_models`; outputs are written to this notebook's folder in the versioned intermediate data. The input and output lists of the sections below give paths relative to these folders (`s01/` to `s04/` for the earlier notebooks).
+
+```{r setup_folders}
+# Results of s01 to s04
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_traits")
+dir_s02 <- path_resrepo("data/intermediate/s02_prepare_ranges")
+dir_s03 <- path_resrepo("data/intermediate/s03_build_species_tables")
+dir_s04 <- path_resrepo("data/intermediate/s04_fit_models")
+
+# Outputs of this notebook
+dir_data_intermediate <- path_resrepo("data/intermediate/s05_check_robustness")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+`write_table()` writes the output tables and `report_figures.R` copies the report figure to `results/`. `models.R` fits the taxonomic mixed models, `geography.R` the spherical GAMs and `phylogeny.R` the PGLS; `trait_evidence_corrections.R`, `projections.R` and `range_metrics.R` provide the corrected ant records, the Equal Earth projection and the range measures.
+
+```{r load_functions}
+# Output tables and report figures
+source(here::here("code", "R", "write_table.R"))
+source(here::here("code", "R", "report_figures.R"))
+
+# Taxonomic mixed models, spherical GAMs and PGLS
+source(here::here("code", "R", "models.R"))
+source(here::here("code", "R", "geography.R"))
+source(here::here("code", "R", "phylogeny.R"))
+
+# Corrected ant records, Equal Earth projection and range measures
+source(here::here("code", "R", "trait_evidence_corrections.R"))
+source(here::here("code", "R", "projections.R"))
+source(here::here("code", "R", "range_metrics.R"))
+```
+
+Most sections read the analysed species table, some with the geographic centre of each species, and summarise type contrasts in the same form.
+
+```{r define_helpers}
+# --- Species table ---
+# Returns the species table of s03 (a data frame) with the interaction types as a factor.
+# key_columns: the columns read as text (the GBIF and pool keys).
+# centres: when TRUE, the table also gets each species' geographic centre from s04
+#   (geo_latitude and geo_longitude, matched by pool key).
+read_species_table <- function(key_columns = "pool_key", centres = FALSE) {
+  d <- read.csv(file.path(dir_s03, "species_table.csv"), na.strings = c("", "NA"),
+                colClasses = setNames(rep("character", length(key_columns)), key_columns))
+
+  d$interaction_type <- factor(d$interaction_type, levels = c("n", "f", "m", "p"))
+
+  # Geographic centre of each species
+  if (centres) {
+    ce <- fread(file.path(dir_s04, "species_centres.csv"),
+                colClasses = c(species = "character"))
+    d$geo_latitude <- ce$geo_latitude[match(d$pool_key, ce$species)]
+    d$geo_longitude <- ce$geo_longitude[match(d$pool_key, ce$species)]
+  }
+  d
+}
+
+# --- Type contrasts ---
+# Returns a contrast table with the contrast written as "a-b" and its range ratio, interval
+# and p-value.
+tidy_contrasts <- function(x) {
+  x <- as.data.table(x)[, contrast := gsub(" ", "", contrast)]
+  x[, .(measure, contrast, ratio = range_ratio, lower = ratio_lower,
+        upper = ratio_upper, p = p.value)]
+}
+
+# Returns the type contrasts of a fit_log_range_models() result with each measure's sample
+# size and number of parasites.
+# label: name of the model, stored in the column `model`.
+fit_contrasts <- function(fit, label) {
+  x <- tidy_contrasts(fit$contrasts[fit$contrasts$predictors == "type", ])
+  md <- as.data.table(fit$metadata)[predictors == "type", .(measure, n)]
+  x <- merge(x, md, by = "measure")
+  x[, model := label]
+
+  # Parasites (type p) in the data of each measure's type model
+  x[, n_parasite := vapply(
+    measure,
+    function(k)
+      sum(fit$model_data[[paste0(k, "_type")]]$interaction_type == "p"),
+    1L)]
+  x
+}
+```
+
+Each section below reads its inputs from disk and ends by removing its objects (in a hidden chunk), so only the objects defined in this setup carry over from one section to the next.
+
+```{r keep_setup_objects}
+# Objects of the setup, kept when each section clears its own objects
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Partner breadth
+
+The breadth effect is fitted on raw counts of recorded ant genera; the section compares raw and log1p breadth (AIC from ML fits), estimates the slope within facultative and within obligate species (mixed models, and a spherical GAM for facultative species), tests type-specific slopes by likelihood ratio, and refits after merging the *Paratrechina* and *Nylanderia* count groups, which sources do not separate consistently.
+
+*Inputs:* s03/species_table.csv; s04/species_centres.csv; s01/evidence_ledger.csv  
+*Outputs:* breadth_scale_comparison.csv, breadth_raw_coefficients.csv, breadth_log1p_coefficients.csv, breadth_within_strategy.csv, breadth_interaction_test.csv, breadth_genus_merge_effects.csv
+
+```{r breadth_main_fit}
+# Species table with geographic centres, and the main fit with raw partner breadth
+d <- read_species_table(centres = TRUE)
+main_fit <- fit_log_range_models(d, measures = measures, breadth_scale = "raw")
+```
+
+## Breadth scale
+
+Raw counts are the main scale; log1p breadth asks whether each further genus adds less (AIC from ML fits).
+
+```{r define_compare_partner_breadth_scales}
+#' Compare raw and log1p partner-breadth parameterisations
+#'
+#' @param data Corrected species table.
+#' @param response Positive range-size response column.
+#' @return AIC table for otherwise identical additive mixed models.
+compare_partner_breadth_scales <- function(data, response = "range_area") {
+  # Species of types f, m and p with a positive range, a finite breadth, a subfamily and a genus
+  d <- data[is.finite(data[[response]]) & data[[response]] > 0 &
+              !is.na(data$interaction_type) & data$interaction_type != "n" &
+              is.finite(data$host_breadth) & !is.na(data$subfamily) &
+              !is.na(data$genus), , drop = FALSE]
+  d$interaction_type <- droplevels(factor(d$interaction_type,
+                                          levels = c("n", "f", "m", "p")))
+
+  # Log10 range and the centred breadth on each scale; unique species names as row names
+  d$log10_range <- log10(d[[response]])
+  d$breadth_raw <- d$host_breadth - mean(d$host_breadth)
+  d$breadth_log1p <- log1p(d$host_breadth) - mean(log1p(d$host_breadth))
+  rownames(d) <- make.unique(as.character(d$species))
+
+  # Otherwise identical additive models, one per breadth scale
+  raw <- lmerTest::lmer(log10_range ~ interaction_type + breadth_raw +
+                          (1 | subfamily/genus), data = d, REML = FALSE)
+  log1p_model <- lmerTest::lmer(log10_range ~ interaction_type + breadth_log1p +
+                                  (1 | subfamily/genus), data = d, REML = FALSE)
+
+  # AIC comparisons between models with different fixed effects require ML.
+  stopifnot(!lme4::isREML(raw), !lme4::isREML(log1p_model))
+
+  # AIC of each scale and its difference from the smaller of the two
+  aic <- c(raw = stats::AIC(raw), log1p = stats::AIC(log1p_model))
+  data.frame(scale = names(aic), AIC = unname(aic),
+             delta_AIC = unname(aic - min(aic)), n = nrow(d))
+}
+```
+
+```{r breadth_scale}
+# --- Raw against log1p breadth, for each range measure ---
+scale_comparison <- rbindlist(lapply(names(measures), function(m)
+  cbind(measure = m,
+        compare_partner_breadth_scales(d, response = measures[[m]]))))
+write_table(scale_comparison,
+            file.path(dir_data_intermediate, "breadth_scale_comparison.csv"))
+
+# --- Breadth slope of the main fit (raw scale) ---
+write_table(
+  main_fit$coefficients[main_fit$coefficients$term == "partner_breadth_centered", ],
+  file.path(dir_data_intermediate, "breadth_raw_coefficients.csv"))
+
+# --- Breadth slope with log1p breadth ---
+log_breadth <- fit_log_range_models(d, measures = measures, breadth_scale = "log1p")
+write_table(
+  log_breadth$coefficients[log_breadth$coefficients$term == "partner_breadth_centered", ],
+  file.path(dir_data_intermediate, "breadth_log1p_coefficients.csv"))
+```
+
+## Slopes within strategies
+
+Obligate species record fewer genera than facultative ones, so the pooled slope could partly repeat the type contrast; slopes are therefore also estimated within facultative species (mixed model and spherical GAM) and within obligate species (type-adjusted mixed model). A likelihood-ratio test (ML fits) compares type-specific slopes among facultative, mutualist and parasite species.
+
+```{r breadth_within_strategies}
+# --- Breadth slope within facultative and within obligate species ---
+# One row per model: mixed models for both strategies and a spherical GAM for facultative
+rows <- list()
+for (m in names(measures)) for (strategy in c("facultative", "obligate")) {
+  # Species of the strategy, with breadth centred within it
+  a <- main_fit$model_data[[paste0(m, "_breadth")]]
+  types <- switch(strategy, facultative = "f", obligate = c("m", "p"))
+  z <- droplevels(a[a$interaction_type %in% types, ])
+  z$hb <- z$host_breadth - mean(z$host_breadth)
+
+  # Obligate species also adjust for the type (m or p)
+  form <- if (strategy == "obligate")
+    log10_range ~ interaction_type + hb + (1 | subfamily/genus) else
+    log10_range ~ hb + (1 | subfamily/genus)
+
+  # Mixed model: range ratio per additional recorded genus, with a t interval.
+  # cc holds the estimate, standard error, df, t value and p-value of the breadth slope.
+  mod <- lmerTest::lmer(form, data = z)
+  cc <- summary(mod)$coefficients["hb", ]
+  rows[[paste(strategy, m)]] <- data.frame(
+    model = paste0("lmm_", strategy), measure = m, n = nrow(z),
+    n_breadth_values = length(unique(z$host_breadth)),
+    singular = lme4::isSingular(mod),
+    ratio = 10^cc[[1]],
+    lower = 10^(cc[[1]] - qt(.975, cc[[3]]) * cc[[2]]),
+    upper = 10^(cc[[1]] + qt(.975, cc[[3]]) * cc[[2]]),
+    p = cc[[5]])
+
+  # Facultative species also get a spherical GAM (geographic centre, random subfamily and
+  # genus); co holds the estimate, standard error, t value and p-value, with a normal interval
+  if (strategy == "facultative") {
+    z$genus <- factor(z$genus)
+    z$subfamily <- factor(z$subfamily)
+    gm <- mgcv::gam(log10_range ~ hb +
+                      s(geo_latitude, geo_longitude, bs = "sos", k = 160) +
+                      s(subfamily, bs = "re") + s(genus, bs = "re"),
+                    data = z, method = "REML")
+    co <- summary(gm)$p.table["hb", ]
+    rows[[paste("spatial", m)]] <- data.frame(
+      model = "spherical_gam_facultative", measure = m, n = nrow(z),
+      n_breadth_values = length(unique(z$host_breadth)), singular = NA,
+      ratio = 10^co[[1]],
+      lower = 10^(co[[1]] - 1.96 * co[[2]]),
+      upper = 10^(co[[1]] + 1.96 * co[[2]]),
+      p = co[[4]])
+  }
+}
+
+write_table(rbindlist(rows),
+            file.path(dir_data_intermediate, "breadth_within_strategy.csv"))
+
+# --- Likelihood-ratio test of type-specific slopes ---
+# Facultative, mutualist and parasite species with a positive range area and a finite breadth
+z <- d[is.finite(d$range_area) & d$range_area > 0 &
+         d$interaction_type %in% c("f", "m", "p") &
+         is.finite(d$host_breadth) & !is.na(d$subfamily) &
+         !is.na(d$genus), , drop = FALSE]
+z$interaction_type <- droplevels(factor(z$interaction_type, levels = c("f", "m", "p")))
+z$log10_range <- log10(z$range_area)
+z$partner_breadth_centered <- z$host_breadth - mean(z$host_breadth)
+rownames(z) <- make.unique(as.character(z$species))
+
+# Additive and interaction models, both fitted by ML
+additive <- lmerTest::lmer(log10_range ~ interaction_type + partner_breadth_centered +
+                             (1 | subfamily/genus), data = z, REML = FALSE)
+interaction <- lmerTest::lmer(log10_range ~ interaction_type * partner_breadth_centered +
+                                (1 | subfamily/genus), data = z, REML = FALSE)
+
+# Likelihood-ratio test between the two, with a note on how to read it
+comparison <- as.data.frame(stats::anova(additive, interaction, refit = TRUE))
+comparison$model <- rownames(comparison)
+comparison$note <- paste(
+  "Slope heterogeneity is tested across facultative, mutualist and parasite species.",
+  "Parasite counts span only one to two genera, limiting the information on its slope.")
+rownames(comparison) <- NULL
+write_table(comparison,
+            file.path(dir_data_intermediate, "breadth_interaction_test.csv"))
+```
+
+## Merged *Paratrechina* and *Nylanderia*
+
+Sources name either genus for what may be one lineage, so a species recorded with both counts them twice. The two count groups are merged for every species alike, without choosing species by result.
+
+```{r breadth_merged_genera}
+# --- Evidence ledger with the corrected ant records ---
+ledger <- read.csv(file.path(dir_s01, "evidence_ledger.csv"), colClasses = "character",
+                   na.strings = c("", "NA"))
+corrected <- publication_trait_correction(d, ledger)
+ledger <- as.data.table(attr(corrected, "corrected_evidence_ledger"))
+
+# --- Breadth lost by merging the two count groups ---
+# A species recorded with both counts them twice: the decrement is the number of distinct
+# count groups among the merged ones, minus one
+merge_groups <- c("Paratrechina", "Nylanderia", "Paratrechina+Nylanderia")
+changes <- ledger[as.character(ant_qualifies) == "TRUE" &
+                    ant_count_group %in% merge_groups,
+                  .(decrement = max(0L, uniqueN(ant_count_group) - 1L)),
+                  by = accepted_key]
+decrement <- changes$decrement[match(as.character(d$pool_key), changes$accepted_key)]
+decrement[is.na(decrement)] <- 0
+
+# Species table with the merged breadth (never below one genus)
+merged <- d
+merged$host_breadth <- merged$host_breadth - decrement
+stopifnot(all(is.na(merged$host_breadth) | merged$host_breadth >= 1))
+cat("species whose breadth drops after the merge:", sum(decrement > 0), "\n")
+
+# --- Refit on the merged breadth ---
+# Pooled models: breadth slope of each measure
+merge_fit <- fit_log_range_models(merged, measures = measures, breadth_scale = "raw")
+merged_rows <- as.data.table(merge_fit$coefficients)[
+  term == "partner_breadth_centered",
+  .(model = "lmm_pooled", measure, n, ratio = range_ratio, lower = ratio_lower,
+    upper = ratio_upper, p = p_value)]
+
+# Slope within facultative species, with a t interval
+for (m in names(measures)) {
+  a <- merge_fit$model_data[[paste0(m, "_breadth")]]
+  z <- droplevels(a[a$interaction_type == "f", ])
+  z$hb <- z$host_breadth - mean(z$host_breadth)
+  mod <- lmerTest::lmer(log10_range ~ hb + (1 | subfamily/genus), data = z)
+  co <- summary(mod)$coefficients["hb", ]
+  merged_rows <- rbind(
+    merged_rows,
+    data.table(model = "lmm_facultative", measure = m, n = nrow(z),
+               ratio = 10^co[[1]],
+               lower = 10^(co[[1]] - qt(.975, co[[3]]) * co[[2]]),
+               upper = 10^(co[[1]] + qt(.975, co[[3]]) * co[[2]]),
+               p = co[[5]]))
+}
+
+write_table(merged_rows,
+            file.path(dir_data_intermediate, "breadth_genus_merge_effects.csv"))
+
+# --- Print the scale comparison and the slopes within strategies ---
+print(scale_comparison)
+print(rbindlist(rows)[, .(model, measure, n, ratio, lower, upper, p)], digits = 3)
+```
+
+```{r clear_check_partner_breadth, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Rarefied ranges
+
+Range size grows with the number of localities, so for each species of the main range-area model the ranges are re-estimated from 200 random draws of 10 or 20 localities, or of 10 localities from different 25-km cells, and averaged geometrically. Each species has its own seed, so the draws are reproducible.
+
+*Inputs:* s03/species_table.csv; s02/records_final.rds  
+*Outputs:* rarefied_ranges.csv (one row per species: lat10, lon10, area10, then the 20-locality and the cell-based (suffix c) values; missing when a species has too few localities or cells)
+
+```{r rarefy_ranges}
+# --- Species of the main range-area type model ---
+d <- read_species_table()
+main_sample <- fit_log_range_models(d, measures = c(area = "range_area"),
+                                    breadth_scale = "raw")$model_data$area_type
+
+# --- Unique strict-cleaning localities of those species, by pool key ---
+x <- readRDS(file.path(dir_s02, "records_final.rds"))
+x <- unique(x[in_strict_plus == TRUE & pool_key %in% main_sample$pool_key,
+              .(pool_key, decimalLongitude, decimalLatitude)])
+occurrences <- split(x[, .(decimalLongitude, decimalLatitude)], x$pool_key)
+rm(x)
+invisible(gc())
+
+# --- Rarefied ranges of each species ---
+equal_earth <- global_equal_area_crs()
+n_replicates <- 200L
+rare <- rbindlist(lapply(names(occurrences), function(pk) {
+  # Localities projected to the species-specific equal-area projection (for the area) and to
+  # the global Equal Earth projection (for the 25-km cells)
+  u <- as.data.frame(occurrences[[pk]])
+  points <- st_as_sf(u, coords = c("decimalLongitude", "decimalLatitude"), crs = 4326)
+  xy <- st_coordinates(st_transform(points, species_cea_crs(u$decimalLongitude)))
+  eqxy <- st_coordinates(st_transform(points, equal_earth))
+
+  # Locality indices grouped by 25-km cell
+  cells <- split(seq_len(nrow(u)),
+                 paste(floor(eqxy[, 1] / 25000), floor(eqxy[, 2] / 25000)))
+  reference_lat <- mean(range(u$decimalLatitude))
+  n <- nrow(u)
+
+  # Seed per species, so each species' draws do not depend on the others.
+  set.seed(20261008 + as.numeric(pk) %% 1e6)
+
+  # Draws index_function(k) (k locality indices) in each replicate and returns the geometric
+  # mean over replicates of the latitudinal extent, longitudinal extent and area
+  draw <- function(index_function, k) {
+    a <- t(vapply(seq_len(n_replicates), function(b) {
+      j <- index_function(k)
+      c(lat = 6371.0088 * diff(range(u$decimalLatitude[j])) * pi / 180,
+        lon = unname(circular_longitude_extent(u$decimalLongitude[j],
+                                               reference_lat)["extent"]),
+        area = planar_mcp_area(xy[j, 1], xy[j, 2]))
+    }, numeric(3)))
+
+    # Non-positive values are left out of the geometric mean
+    a[a <= 0] <- NA_real_
+    10^colMeans(log10(a), na.rm = TRUE)
+  }
+
+  # Row of the species: numbers of localities, cells and replicates
+  row <- data.table(pool_key = pk, n_localities = n, n_cells = length(cells),
+                    n_replicates = n_replicates)
+
+  # Draws of 10 and of 20 localities, and of 10 localities from different cells. The draws
+  # run in this order from the species' seed.
+  if (n >= 10) row[, c("lat10", "lon10", "area10") :=
+    as.list(draw(function(k) sample.int(n, k), 10L))]
+  if (n >= 20) row[, c("lat20", "lon20", "area20") :=
+    as.list(draw(function(k) sample.int(n, k), 20L))]
+  if (length(cells) >= 10) row[, c("lat10c", "lon10c", "area10c") :=
+    as.list(draw(function(k)
+      vapply(sample(cells, k), function(j) j[sample.int(length(j), 1L)], 1L),
+      10L))]
+  row
+}), fill = TRUE)
+
+write_table(rare, file.path(dir_data_intermediate, "rarefied_ranges.csv"))
+cat("species rarefied:", nrow(rare),
+    "; with 10 localities:", sum(is.finite(rare$area10)),
+    "; 20 localities:", sum(is.finite(rare$area20)),
+    "; 10 cells:", sum(is.finite(rare$area10c)), "\n")
+```
+
+```{r clear_rarefy_ranges, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Models on rarefied ranges
+
+The taxonomic models (and the spherical GAM for range area) are refitted to the rarefied ranges and to the full ranges of the same species, so the comparison isolates the rarefaction.
+
+*Inputs:* rarefied_ranges.csv; s03/species_table.csv; s04/species_centres.csv  
+*Outputs:* rarefied_models.csv (type contrasts and breadth slopes by model, sampling and range estimate)
+
+```{r fit_rarefied_models}
+# --- Species table with the rarefied ranges ---
+d <- read_species_table(centres = TRUE)
+rare <- fread(file.path(dir_data_intermediate, "rarefied_ranges.csv"),
+              colClasses = c(pool_key = "character"))
+dr <- as.data.table(merge(d, rare, by = "pool_key", all.x = TRUE))
+
+# Range columns of each sampling: 10 or 20 localities, or 10 localities from different cells
+range_sets <- list(k10 = c(area = "area10", lat = "lat10", lon = "lon10"),
+                   k20 = c(area = "area20", lat = "lat20", lon = "lon20"),
+                   k10_cells = c(area = "area10c", lat = "lat10c", lon = "lon10c"))
+
+# --- Mixed models on the rarefied and on the full ranges of the same species ---
+# Type contrasts and breadth slope for each sampling and each range estimate
+rare_rows <- list()
+for (k in names(range_sets)) {
+  # Species with a rarefied range area
+  zz <- as.data.frame(dr[is.finite(get(range_sets[[k]][["area"]]))])
+  for (range_method in c("rarefied", "full_same_species")) {
+    rf <- fit_log_range_models(
+      zz,
+      measures = if (range_method == "rarefied") range_sets[[k]] else measures,
+      breadth_scale = "raw")
+
+    # Type contrasts, and the breadth slope in the same table
+    rr <- fit_contrasts(rf, "lmm")
+    rr[, `:=`(sampling = k, ranges = range_method)]
+    bb <- as.data.table(rf$coefficients)[
+      term == "partner_breadth_centered",
+      .(measure, contrast = "breadth", ratio = range_ratio, lower = ratio_lower,
+        upper = ratio_upper, p = p_value, n, model = "lmm", sampling = k,
+        ranges = range_method)]
+    rare_rows[[paste(k, range_method)]] <- rbind(rr, bb, fill = TRUE)
+  }
+}
+
+# --- Spherical GAM on range area (10 localities) ---
+for (range_method in c("rarefied", "full_same_species")) {
+  # Species with a 10-locality rarefied range area
+  zz <- as.data.frame(dr[is.finite(area10)])
+  gm <- fit_species_spatial_gam(
+    zz, if (range_method == "rarefied") "area10" else "range_area")
+  cc <- as.data.table(gm$contrasts)[,
+    .(measure = "area", contrast = gsub(" ", "", contrast), ratio = range_ratio,
+      lower = ratio_lower, upper = ratio_upper, p = p.value, n = nrow(gm$data),
+      n_parasite = sum(gm$data$interaction_type == "p"), model = "spherical_gam",
+      sampling = "k10", ranges = range_method)]
+  rare_rows[[paste("gam", range_method)]] <- cc
+}
+
+# --- Combine and write ---
+rarefied <- rbindlist(rare_rows, fill = TRUE)
+write_table(rarefied, file.path(dir_data_intermediate, "rarefied_models.csv"))
+print(rarefied[measure == "area" & contrast %in% c("f-p", "n-p", "breadth"),
+               .(model, sampling, ranges, contrast, n, ratio, lower, upper, p)],
+      digits = 3)
+```
+
+```{r clear_fit_rarefied_models, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Regions and genera
+
+Parasites concentrate in southern Africa and in *Lepidochrysops* and *Thestor*. The type contrasts are refitted within and outside southern Africa, in the Old World and without the two genera (mixed models, and PGLS on the genus-grafted trees), and with a genus-level PGLS without the two genera; the matched-tip PGLS tables are collected beside mixed models of the same species.
+
+*Inputs:* s03/species_table.csv; s04/species_centres.csv, s04/grafted_trees.rds, s04/pgls_matched_{contrasts,metadata}.csv, s04/pgls_matched_lmm_{contrasts,metadata}.csv  
+*Outputs:* regional_and_pair_omissions.csv, genus_pair_omission.csv, matched_sample_contrasts.csv, matched_sample_metadata.csv
+
+```{r regions_main_fit}
+# Species table with geographic centres, the main fit and the genus-grafted trees
+d <- read_species_table(centres = TRUE)
+main_fit <- fit_log_range_models(d, measures = measures, breadth_scale = "raw")
+trees <- readRDS(file.path(dir_s04, "grafted_trees.rds"))
+```
+
+## Regional subsets and the two-genus omission
+
+Southern Africa (species centre south of 15 S, between 10 and 55 E) is tested both alone and excluded, so the contrast is checked within and outside the region holding most parasites.
+
+```{r regional_subsets}
+# --- Regional subsets ---
+# Southern Africa: species centre south of 15 S and between 10 and 55 E
+# Old World: species centre at 30 W or further east
+la <- d$geo_latitude
+lo <- d$geo_longitude
+in_southern_Africa <- is.finite(la) & is.finite(lo) & la < -15 & lo > 10 & lo < 55
+subsets <- list(all = rep(TRUE, nrow(d)),
+                excluding_southern_Africa = is.finite(la) &
+                  !(la < -15 & lo > 10 & lo < 55),
+                southern_Africa_only = in_southern_Africa,
+                Old_World_only = is.finite(lo) & lo >= -30)
+
+# Genera dropped from each subset: none, and for the whole sample also the two genera
+cases <- list(all = list(none = character(),
+                         `Lepidochrysops + Thestor` = c("Lepidochrysops", "Thestor")),
+              excluding_southern_Africa = list(none = character()),
+              southern_Africa_only = list(none = character()),
+              Old_World_only = list(none = character()))
+
+# --- Type contrasts in each subset ---
+# Mixed models for every subset and omission; PGLS on each tree for the subsets within and
+# outside southern Africa, and for the genus omission
+region_rows <- list()
+for (region in names(cases)) for (dropped in names(cases[[region]])) {
+  zz <- d[subsets[[region]] & !d$genus %in% cases[[region]][[dropped]], ]
+  rf <- fit_log_range_models(zz, measures = measures, breadth_scale = "raw")
+  rr <- fit_contrasts(rf, "lmm")
+  rr[, `:=`(subset = region, dropped = dropped, tree = NA_character_,
+            lambda = NA_real_)]
+  region_rows[[paste(region, dropped, "lmm")]] <- rr
+
+  if (region %in% c("excluding_southern_Africa", "southern_Africa_only") ||
+        dropped != "none")
+    for (study in studies) for (m in names(measures)) {
+      # Species of the model that are tips of the tree
+      md <- rf$model_data[[paste0(m, "_type")]]
+      md <- md[md$species %in% trees[[study]]$tip.label, ]
+
+      # Crosswalk in which every tip is matched to the species of the same name
+      cw <- data.frame(analysis_species = trees[[study]]$tip.label,
+                       tree_tip_original = trees[[study]]$tip.label,
+                       matched = TRUE)
+      pf <- fit_pagel_pgls(md, trees[[study]], cw, log10_range ~ interaction_type,
+                           study = study, measure = m, predictors = "type",
+                           method = "REML", branch_treatment = "published")
+      cc <- tidy_contrasts(pf$contrasts)
+      cc[, `:=`(model = "pgls", subset = region, dropped = dropped, tree = study,
+                lambda = pf$metadata$lambda, n = nrow(md),
+                n_parasite = sum(md$interaction_type == "p"))]
+      region_rows[[paste(region, dropped, study, m)]] <- cc
+    }
+}
+
+write_table(rbindlist(region_rows, fill = TRUE),
+            file.path(dir_data_intermediate, "regional_and_pair_omissions.csv"))
+```
+
+## Genus-level PGLS without the two genera
+
+Genus x interaction-type means are weighted equally; each unit takes a deterministic representative species (the first matched tip, else the first grafted tip) for the phylogenetic covariance.
+
+```{r genus_pgls_without_pair}
+# --- PGLS of genus x type means without Lepidochrysops and Thestor ---
+genus_rows <- list()
+for (m in names(measures)) {
+  # Mean log10 range of each genus x type unit, with the names of its species
+  md <- as.data.table(main_fit$model_data[[paste0(m, "_type")]])
+  units <- md[!genus %in% c("Lepidochrysops", "Thestor"),
+              .(log10_range = mean(log10_range),
+                species_list = paste(sort(species), collapse = ";")),
+              by = .(genus, subfamily, interaction_type)]
+
+  for (study in studies) {
+    tr <- trees[[study]]
+    grafted <- attr(tr, "grafted")
+
+    # Representative species of each unit: the first matched tip, else the first grafted tip
+    # (missing when no species of the unit is on the tree)
+    representatives <- vapply(units$species_list, function(v) {
+      eligible <- intersect(strsplit(v, ";", fixed = TRUE)[[1]], tr$tip.label)
+      if (!length(eligible)) return(NA_character_)
+      matched <- setdiff(eligible, grafted)
+      if (length(matched)) sort(matched)[[1]] else sort(eligible)[[1]]
+    }, "")
+
+    # Units with a representative, and the tree pruned to the representatives
+    ud <- as.data.frame(units)
+    ud$species <- representatives
+    ud <- ud[!is.na(ud$species), ]
+    gt <- ape::keep.tip(tr, ud$species)
+    cw <- data.frame(analysis_species = gt$tip.label,
+                     tree_tip_original = gt$tip.label, matched = TRUE)
+
+    # PGLS of the unit means on interaction type
+    gf <- fit_pagel_pgls(ud, gt, cw, log10_range ~ interaction_type, study = study,
+                         measure = m, predictors = "type", method = "REML",
+                         branch_treatment = "published")
+    cc <- tidy_contrasts(gf$contrasts)
+    cc[, `:=`(tree = study, dropped = "Lepidochrysops + Thestor", n_units = nrow(ud),
+              n_p_units = sum(ud$interaction_type == "p"),
+              lambda = gf$metadata$lambda)]
+    genus_rows[[paste(study, m)]] <- cc
+  }
+}
+
+write_table(rbindlist(genus_rows),
+            file.path(dir_data_intermediate, "genus_pair_omission.csv"))
+```
+
+## Matched-tip PGLS beside mixed models of the same species
+
+```{r matched_tip_tables}
+# --- Matched-tip tables of s04 ---
+# Rows of the MAIN_subtype table for the two trees: PGLS and mixed models of the same species
+pgls_contrasts <- fread(file.path(dir_s04, "pgls_matched_contrasts.csv"))[
+  table == "MAIN_subtype" & study %in% studies & predictors == "type"]
+lmm_contrasts <- fread(file.path(dir_s04, "pgls_matched_lmm_contrasts.csv"))[
+  table == "MAIN_subtype" & study %in% studies & predictors == "type"]
+pgls_metadata <- fread(file.path(dir_s04, "pgls_matched_metadata.csv"))[
+  table == "MAIN_subtype" & study %in% studies]
+lmm_metadata <- fread(file.path(dir_s04, "pgls_matched_lmm_metadata.csv"))[
+  table == "MAIN_subtype" & study %in% studies]
+
+# Stacked tables; the column `model` tells the PGLS and the mixed-model rows apart
+write_table(rbindlist(list(pgls = pgls_contrasts, matched_lmm = lmm_contrasts),
+                      idcol = "model", fill = TRUE),
+            file.path(dir_data_intermediate, "matched_sample_contrasts.csv"))
+write_table(rbindlist(list(pgls = pgls_metadata, matched_lmm = lmm_metadata),
+                      idcol = "model", fill = TRUE),
+            file.path(dir_data_intermediate, "matched_sample_metadata.csv"))
+
+# --- Print the regional contrasts for range area ---
+print(rbindlist(region_rows, fill = TRUE)[
+        measure == "area" & contrast %in% c("f-p", "n-p"),
+        .(subset, dropped, model, tree, contrast, n, n_parasite, ratio, p)],
+      digits = 3)
+```
+
+```{r clear_check_regions_and_genera, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Model diagnostics (Figure S3)
+
+Normal Q-Q and residual-versus-fitted plots of the main range-area mixed models (saved fits) and spherical GAMs, with interaction type and with type plus breadth.
+
+*Inputs:* s04/main_models.rds, s04/species_centres.csv; s03/species_table.csv  
+*Outputs:* plot_model_diagnostics.png
+
+```{r plot_model_diagnostics}
+# --- Models to inspect ---
+# The saved taxonomic mixed models and the spherical GAMs refitted here
+d <- read_species_table(centres = TRUE)
+main_models <- readRDS(file.path(dir_s04, "main_models.rds"))
+full_gam <- fit_species_spatial_gam(d, "range_area")
+breadth_gam <- fit_species_spatial_gam(d, "range_area", include_breadth = TRUE)
+
+# --- Figure S3: Q-Q and residual-versus-fitted plots of the four models ---
+png(file.path(dir_data_intermediate, "plot_model_diagnostics.png"),
+    width = 2400, height = 2800, res = 300)
+par(mfrow = c(4, 2), mar = c(3.4, 3.6, 2.2, 0.8), mgp = c(2.1, 0.65, 0), cex = .85)
+diagnostic_models <- list("Taxonomic LMM: type" = main_models$area_type,
+                          "Spatial GAM: type" = full_gam$model,
+                          "Taxonomic LMM: breadth" = main_models$area_breadth,
+                          "Spatial GAM: breadth" = breadth_gam$model)
+diagnostic_rows <- list()
+for (label in names(diagnostic_models)) {
+  model <- diagnostic_models[[label]]
+  residual <- residuals(model)
+  fitted <- fitted(model)
+
+  # Normal Q-Q plot, then residuals against fitted values
+  qqnorm(residual, main = paste(label, "Q–Q"), pch = 16, cex = .45, col = "#00000055")
+  qqline(residual, col = "#0072B2")
+  plot(fitted, residual, main = label, xlab = "Fitted log10 area", ylab = "Residual",
+       pch = 16, cex = .45, col = "#00000055")
+  abline(h = 0, col = "grey50")
+  lines(lowess(fitted, residual), col = "#0072B2")
+
+  # Residual spread, skewness and excess kurtosis of the model
+  diagnostic_rows[[label]] <- data.frame(
+    model = label, n = length(residual), residual_sd = sd(residual),
+    skewness = mean((residual - mean(residual))^3) / sd(residual)^3,
+    excess_kurtosis = mean((residual - mean(residual))^4) / sd(residual)^4 - 3)
+}
+
+invisible(dev.off())
+print(rbindlist(diagnostic_rows), digits = 3)
+```
+
+```{r clear_plot_model_diagnostics, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Larval carnivory
+
+Carnivory nearly coincides with obligate parasitism, so the check fits the non-parasites with type plus carnivory, under four codings of uncertain carnivory, to ask whether carnivores that are not ant parasites also have small ranges. The section stops unless the main range-area sample has 914 species.
+
+*Inputs:* s03/species_table.csv; s01/species_traits.csv, s01/evidence_ledger.csv  
+*Outputs:* carnivory_counts.csv (type x carnivory x evidence basis in the main range-area sample), carnivory_check.csv (plant-feeder / carnivore range ratios by measure and coding variant)
+
+```{r check_carnivory}
+# --- Species table with carnivory ---
+d <- read.csv(file.path(dir_s03, "species_table.csv"), na.strings = c("", "NA"),
+              colClasses = c(gbif_key = "character", pool_key = "character"))
+traits <- read.csv(file.path(dir_s01, "species_traits.csv"), colClasses = "character",
+                   na.strings = c("", "NA"))
+ledger <- read.csv(file.path(dir_s01, "evidence_ledger.csv"), colClasses = "character",
+                   na.strings = c("", "NA"))
+d$carnivory <- as.integer(traits$carnivory[match(d$gbif_key, traits$gbif_key)])
+
+# --- Sources coding animal and plant feeding ---
+# Sources behind each carnivory value: the trait table sets carnivory = 1 when any source
+# codes animal feeding, so the number of sources coding animal and plant feeding measures
+# how consistent that is.
+cl <- ledger[ledger$claim_type %in% "carnivory" & !is.na(ledger$accepted_key), ]
+v <- cl$reported_value_verbatim
+
+# A claim codes animal feeding when it is a heath2003 feeding category containing E, a
+# verbatim "carnivory = 1", or a claim of any other form
+cl$animal <- ifelse(cl$source_id %in% "heath2003",
+                    grepl("E", sub("^feeding category = ", "", v)),
+                    ifelse(grepl("^carnivory = ", v), v == "carnivory = 1", TRUE))
+
+# Number of distinct sources coding animal and plant feeding, per species (0 when none)
+n_animal <- tapply(cl$source_id[cl$animal], cl$accepted_key[cl$animal],
+                   function(s) length(unique(s)))
+n_plant <- tapply(cl$source_id[!cl$animal], cl$accepted_key[!cl$animal],
+                  function(s) length(unique(s)))
+d$carnivory_sources <- as.integer(n_animal[d$gbif_key])
+d$carnivory_sources[is.na(d$carnivory_sources)] <- 0L
+d$plant_sources <- as.integer(n_plant[d$gbif_key])
+d$plant_sources[is.na(d$plant_sources)] <- 0L
+
+# Consistent: at least two sources code animal feeding and none codes plant feeding
+d$carnivory_consistent <- d$carnivory %in% 1L & d$carnivory_sources >= 2L &
+  d$plant_sources == 0L
+
+# --- Basis of each carnivory value ---
+# A species-level source or decision, or a genus rule of the trait table (value shared by
+# >= 90 % of >= 3 directly coded congeners, or parasites of brood-predator genera)
+cite <- traits$cite_carnivory[match(d$gbif_key, traits$gbif_key)]
+d$carnivory_basis <- ifelse(
+  is.na(d$carnivory), "none",
+  ifelse(grepl("^genus consensus|^brood-predator genus", cite), "genus", "species"))
+
+# --- Main-model samples ---
+# The carnivory columns are carried through from d. The section stops unless the
+# range-area sample has the size of the main model of s04.
+fitted <- fit_log_range_models(d, measures = measures, breadth_scale = "raw")
+sample_of <- function(m) fitted$model_data[[paste0(m, "_type")]]
+area <- sample_of("area")
+main_n <- read.csv(file.path(dir_s04, "main_metadata.csv"))
+stopifnot(nrow(area) == main_n$n[main_n$measure == "area" & main_n$predictors == "type"],
+          all(c("carnivory", "carnivory_consistent") %in% names(area)))
+
+# --- Counts by type, carnivory and evidence basis ---
+counts <- as.data.frame(table(
+  interaction_type = area$interaction_type,
+  carnivory = factor(ifelse(is.na(area$carnivory), "uncoded",
+                            ifelse(area$carnivory == 1L, "animal", "plant")),
+                     levels = c("plant", "animal", "uncoded")),
+  basis = factor(area$carnivory_basis, levels = c("species", "genus", "none"))),
+  responseName = "n")
+counts <- counts[counts$n > 0L, ]
+write_table(counts, file.path(dir_data_intermediate, "carnivory_counts.csv"))
+
+# --- Mixed models of the non-parasites with type plus carnivory ---
+rows <- list()
+for (m in names(measures)) {
+  a <- sample_of(m)
+  a <- a[a$interaction_type != "p", ]
+  a$interaction_type <- droplevels(a$interaction_type)
+
+  # Four codings: species with coded carnivory; uncoded species as plant feeders; all coded
+  # plant feeders but only the carnivores with consistent evidence; coded species outside the
+  # Miletinae
+  variants <- list(
+    coded = a[!is.na(a$carnivory), ],
+    uncoded_as_plant = within(a, carnivory[is.na(carnivory)] <- 0L),
+    consistent_evidence = a[a$carnivory %in% 0L | a$carnivory_consistent, ],
+    without_miletinae = a[!is.na(a$carnivory) & a$subfamily != "Miletinae", ])
+
+  for (v in names(variants)) {
+    z <- variants[[v]]
+    mod <- lmerTest::lmer(log10_range ~ interaction_type + carnivory +
+                            (1 | subfamily/genus), data = z)
+    cc <- summary(mod)$coefficients["carnivory", ]
+    half <- qt(0.975, cc[["df"]]) * cc[["Std. Error"]]
+    carn <- z$carnivory == 1L
+
+    # ratio = plant feeders / carnivores (below one: larger carnivore ranges)
+    rows[[paste(m, v)]] <- data.frame(
+      analysis = v, measure = m, n = nrow(z), n_carnivore = sum(carn),
+      n_carnivore_miletinae = sum(carn & z$subfamily == "Miletinae"),
+      n_plant_miletinae = sum(!carn & z$subfamily == "Miletinae"),
+      n_carnivore_genera = length(unique(z$genus[carn])),
+      n_carnivore_n = sum(carn & z$interaction_type == "n"),
+      n_carnivore_f = sum(carn & z$interaction_type == "f"),
+      n_carnivore_m = sum(carn & z$interaction_type == "m"),
+      geomean_carnivore = 10^mean(z$log10_range[carn]),
+      geomean_plant = 10^mean(z$log10_range[!carn]),
+      ratio = 10^-cc[["Estimate"]],
+      lower = 10^(-cc[["Estimate"]] - half), upper = 10^(-cc[["Estimate"]] + half),
+      p = cc[["Pr(>|t|)"]], singular = lme4::isSingular(mod))
+  }
+}
+
+out <- do.call(rbind, rows)
+rownames(out) <- NULL
+write_table(out, file.path(dir_data_intermediate, "carnivory_check.csv"))
+
+print(counts)
+print(out[, c("analysis", "measure", "n", "n_carnivore", "ratio", "lower", "upper", "p")],
+      digits = 3)
+```
+
+```{r clear_check_carnivory, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Origins of parasitism
+
+Comparative associations resting on few transitions can look strong (Maddison & FitzJohn 2015), so the minimum number of origins of parasitism is counted by exact two-state Sankoff parsimony with soft polytomies and a non-parasitic root, on the grafted trees and on matched tips only.
+
+*Inputs:* s03/species_table.csv; s04/grafted_trees.rds  
+*Outputs:* parasitism_origins.csv (one row per tree x tip set), parasitism_origin_clades.csv (parasitic clades on the grafted trees with their genera and subfamily)
+
+```{r count_parasitism_origins}
+# --- Main range-area sample and the grafted trees ---
+d <- read_species_table(c("gbif_key", "pool_key"))
+area <- fit_log_range_models(d, measures = c(area = "range_area"),
+                             breadth_scale = "raw")$model_data$area_type
+main_n <- read.csv(file.path(dir_s04, "main_metadata.csv"))
+stopifnot(nrow(area) == main_n$n[main_n$measure == "area" & main_n$predictors == "type"],
+          !anyDuplicated(area$species))
+trees <- readRDS(file.path(dir_s04, "grafted_trees.rds"))
+
+# --- Sankoff parsimony ---
+# Sankoff parsimony for states o (0) / p (1) with soft polytomies. cost[[node]] = c(o, p):
+# least cost of the subtree given the node's state. At a node in state s, children better
+# placed in the other state t can be grouped under one added node in state t, so their
+# change is paid once: cost(s) = sum_i c_i(s) +
+# min(0, w(s->t) + sum_i min(0, c_i(t) - c_i(s))). In a bifurcation this equals the ordinary
+# recursion.
+# Arguments: tr, a tree; p, a logical vector of the parasitic tips (in tip order); gain and
+# loss, the costs of a change from o to p and from p to o. Returns the least total cost
+# with a non-parasitic root.
+sankoff <- function(tr, p, gain, loss) {
+  n <- Ntip(tr)
+  cost <- matrix(0, n + tr$Nnode, 2)
+
+  # Tip costs; 1e6 is the impossible tip state (finite, so differences stay defined)
+  cost[seq_len(n), ] <- cbind(ifelse(p, 1e6, 0), ifelse(p, 0, 1e6))
+  tr <- reorder(tr, "postorder")
+
+  # Costs of the internal nodes, from the tips to the root
+  for (node in unique(tr$edge[, 1])) {
+    ch <- tr$edge[tr$edge[, 1] == node, 2]
+    cc <- cost[ch, , drop = FALSE]
+    grouped <- function(s, t, w)
+      sum(cc[, s]) + min(0, w + sum(pmin(0, cc[, t] - cc[, s])))
+    cost[node, ] <- c(grouped(1, 2, gain), grouped(2, 1, loss))
+  }
+
+  # Root not parasitic
+  cost[n + 1, 1]
+}
+
+# --- Origins of parasitism on one tree ---
+# Returns a list: changes, the least number of changes; min_origins and max_origins, the
+# fewest and the most gains among the most parsimonious histories; clades, the number of
+# maximal all-parasite clades (counted once per parent node); and members, the tips of each
+# maximal all-parasite clade.
+count_origins <- function(tr, p) {
+  # Tie-break weight, small enough that it never outweighs one extra change
+  eps <- 1e-3
+  changes <- sankoff(tr, p, 1, 1)
+  stopifnot(changes * eps < 0.5)
+
+  # Most losses and most gains among the most parsimonious histories, found by making
+  # losses or gains slightly cheaper; the fewest origins follow from the most losses
+  max_losses <- round((changes - sankoff(tr, p, 1, 1 - eps)) / eps)
+  max_gains <- round((changes - sankoff(tr, p, 1 - eps, 1)) / eps)
+
+  # Maximal all-parasite clades; at a polytomy, all-parasite children could form one clade.
+  # allp marks the tips and nodes whose tips are all parasitic.
+  n <- Ntip(tr)
+  desc <- prop.part(tr)
+  allp <- c(p, vapply(seq_len(tr$Nnode), function(i) all(p[desc[[i]]]), TRUE))
+  host <- vapply(split(tr$edge[, 2], tr$edge[, 1]), function(ch) any(allp[ch]), TRUE)
+  host <- host & !allp[as.integer(names(host))]
+  parent <- integer(length(allp))
+  parent[tr$edge[, 2]] <- tr$edge[, 1]
+
+  # Maximal all-parasite tips and nodes
+  top <- which(allp & (parent == 0L | !allp[pmax(parent, 1L)]))
+  list(changes = changes, min_origins = changes - max_losses, max_origins = max_gains,
+       clades = sum(host),
+       members = lapply(top, function(k)
+         if (k <= n) tr$tip.label[k] else tr$tip.label[desc[[k - n]]]))
+}
+
+# --- Check on toy trees ---
+# ((A,B),(C,D)) with A and C parasites needs two gains (with a free root, two losses would
+# also do); in the polytomy (A,B,C,D) with A and B parasites, one gain suffices once the
+# polytomy is resolved
+o1 <- count_origins(read.tree(text = "((A,B),(C,D));"), c(TRUE, FALSE, TRUE, FALSE))
+o2 <- count_origins(read.tree(text = "(A,B,C,D);"), c(TRUE, TRUE, FALSE, FALSE))
+stopifnot(o1$changes == 2, o1$min_origins == 2, o1$clades == 2,
+          o2$changes == 1, o2$min_origins == 1, o2$clades == 1)
+
+# --- Origins on each tree, for grafted and for matched tips ---
+rows <- list()
+clades <- list()
+for (study in studies) for (tips in c("grafted", "matched")) {
+  # Tree pruned to the species of the sample (and, for matched tips, without grafted tips)
+  tr <- trees[[study]]
+  tr <- keep.tip(tr, intersect(tr$tip.label, area$species))
+  if (tips == "matched") tr <- drop.tip(tr, intersect(attr(trees[[study]], "grafted"),
+                                                      tr$tip.label))
+
+  # Parasitic tips and the origin counts of the tree
+  a <- area[match(tr$tip.label, area$species), ]
+  p <- a$interaction_type == "p"
+  o <- count_origins(tr, p)
+  rows[[paste(study, tips)]] <- data.frame(
+    tree = study, tips = tips, n_species = Ntip(tr), n_parasites = sum(p),
+    n_parasite_genera = length(unique(a$genus[p])),
+    n_parasite_subfamilies = length(unique(a$subfamily[p])),
+    changes = o$changes, min_origins = o$min_origins, max_origins = o$max_origins,
+    clades = o$clades)
+
+  # Parasitic clades of the grafted trees, with their genera, subfamily and species
+  if (tips == "grafted") {
+    # No polytomy joins two parasitic clades
+    stopifnot(length(o$members) == o$clades)
+    clades[[study]] <- rbindlist(lapply(seq_along(o$members), function(i) {
+      m <- area[match(o$members[[i]], area$species), ]
+      data.table(tree = study, clade = i, n_species = nrow(m),
+                 genera = paste(sort(unique(m$genus)), collapse = ";"),
+                 subfamily = paste(sort(unique(m$subfamily)), collapse = ";"),
+                 n_grafted = sum(o$members[[i]] %in% attr(trees[[study]], "grafted")),
+                 species = paste(sort(m$species), collapse = ";"))
+    }))
+  }
+}
+
+# --- Write and print ---
+out <- do.call(rbind, rows)
+rownames(out) <- NULL
+clades <- rbindlist(clades)[order(tree, subfamily, genera)]
+write_table(out, file.path(dir_data_intermediate, "parasitism_origins.csv"))
+write_table(clades, file.path(dir_data_intermediate, "parasitism_origin_clades.csv"))
+print(out)
+print(clades[, .(tree, n_species, genera, subfamily, n_grafted)])
+```
+
+```{r clear_count_parasitism_origins, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Occurrence-cleaning sensitivity
+
+The models are refitted with the inclusive, main and strict range estimates (each with at least 10 unique localities), on all eligible species and on the species shared by all three, and each cleaning is validated against the expert range polygons. The strict, all-eligible fit must reproduce the main contrasts.
+
+*Inputs:* s03/species_table.csv; s02/range_metrics.csv, s02/expert_validation_species.csv; s04/main_contrasts.csv  
+*Outputs:* cleaning_contrasts.csv, cleaning_expert_validation.csv
+
+```{r check_cleaning_sensitivity}
+# --- Species table of s03 and range metrics of s02 (one row per pool key) ---
+d <- read.csv(file.path(dir_s03, "species_table.csv"), na.strings = c("", "NA"),
+              colClasses = c(pool_key = "character", gbif_key = "character"))
+r <- read.csv(file.path(dir_s02, "range_metrics.csv"), na.strings = c("", "NA"),
+              colClasses = c(pool_key = "character", gbif_key = "character"))
+r <- r[!duplicated(r$pool_key), ]
+stopifnot(!anyDuplicated(d$pool_key), !anyDuplicated(r$pool_key))
+ri <- match(d$pool_key, r$pool_key)
+
+# --- Species tables with the range measures of each cleaning ---
+# Ranges with fewer than 10 unique localities, or no locality count, are missing
+variants <- c("inclusive", "main", "strict_plus")
+tables <- setNames(lapply(variants, function(v) {
+  x <- d
+  suffix <- if (v == "main") "" else paste0("_", v)
+  loc <- r[[paste0("unique_localities", suffix)]][ri]
+  for (m in unname(measures)) {
+    x[[m]] <- r[[paste0(m, suffix)]][ri]
+    x[[m]][!is.finite(loc) | loc < 10] <- NA_real_
+  }
+  x$cleaning_unique_localities <- loc
+  x
+}), variants)
+
+# The strict reconstruction must reproduce the analysed species table exactly.
+for (m in unname(measures)) {
+  a <- tables$strict_plus[[m]]
+  b <- d[[m]]
+  stopifnot(identical(is.finite(a), is.finite(b)))
+  ok <- is.finite(a)
+  stopifnot(all(abs(a[ok] / b[ok] - 1) < 1e-10))
+}
+
+# --- Species eligible under every cleaning ---
+# Typed species with a genus, a subfamily and a positive range area and extents
+eligible_keys <- lapply(tables, function(x) x$pool_key[
+  !is.na(x$interaction_type) & !is.na(x$genus) & !is.na(x$subfamily) &
+    is.finite(x$range_area) & x$range_area > 0 &
+    is.finite(x$latitudinal_extent) & x$latitudinal_extent > 0 &
+    is.finite(x$longitudinal_extent) & x$longitudinal_extent > 0])
+common_keys <- Reduce(intersect, eligible_keys)
+
+# --- Refit under each cleaning, on all eligible species and on the shared species ---
+all_results <- all_rows <- list()
+for (scope in c("eligible", "identical_species")) for (v in variants) {
+  x <- tables[[v]]
+  if (scope == "identical_species") x <- x[x$pool_key %in% common_keys, ]
+  f <- fit_log_range_models(x, measures = measures, breadth_scale = "raw")
+
+  # Type contrasts, with n-f reversed to f-n (ratio and interval inverted)
+  ct <- as.data.table(f$contrasts)[,
+    .(measure, predictors, contrast = gsub(" ", "", contrast), ratio = range_ratio,
+      lower = ratio_lower, upper = ratio_upper, p = p.value)]
+  ct[contrast == "n-f", `:=`(contrast = "f-n", ratio = 1 / ratio,
+                             lower = 1 / upper, upper = 1 / lower)]
+
+  # Breadth slope as a further contrast
+  co <- as.data.table(f$coefficients)[
+    term == "partner_breadth_centered",
+    .(measure, predictors, contrast = "breadth", ratio = range_ratio,
+      lower = ratio_lower, upper = ratio_upper, p = p_value)]
+
+  # Sample size of each model, with the cleaning and the sample of the fit
+  rr <- merge(rbind(ct, co), as.data.table(f$metadata)[, .(measure, predictors, n)],
+              by = c("measure", "predictors"))
+  rr[, `:=`(cleaning = v, sample = scope)]
+  all_results[[length(all_results) + 1L]] <- rr
+
+  # Species (pool keys) of each model of the fit, to compare the samples below
+  for (k in names(f$model_data)) {
+    z <- f$model_data[[k]]
+    all_rows[[length(all_rows) + 1L]] <- data.table(
+      cleaning = v, sample = scope, model = k, pool_key = z$pool_key)
+  }
+  message(scope, ": ", v, " (area n = ", nrow(f$model_data$area_type), ")")
+}
+
+results <- rbindlist(all_results)
+write_table(results, file.path(dir_data_intermediate, "cleaning_contrasts.csv"))
+
+# --- Checks ---
+# The shared-species samples must contain the same species under every cleaning.
+row_table <- rbindlist(all_rows)
+for (k in unique(row_table$model)) {
+  sets <- lapply(variants, function(v) sort(row_table[
+    sample == "identical_species" & cleaning == v & model == k, pool_key]))
+  stopifnot(identical(sets[[1]], sets[[2]]), identical(sets[[1]], sets[[3]]))
+}
+
+# The strict, all-eligible fit is the main model.
+reference <- fread(file.path(dir_s04, "main_contrasts.csv"))
+check <- merge(results[cleaning == "strict_plus" & sample == "eligible" &
+                         contrast != "breadth"],
+               reference[, .(measure, predictors, contrast = gsub(" ", "", contrast),
+                             reference_ratio = range_ratio)],
+               by = c("measure", "predictors", "contrast"))
+
+# The f-n rows were reversed above, so they are not comparable with the reference row
+check <- check[contrast != "f-n"]
+stopifnot(max(abs(check$ratio / check$reference_ratio - 1)) < 1e-8)
+
+# --- Validation against the expert range polygons ---
+# Species with a positive expert area and a positive range area under every cleaning
+ex <- fread(file.path(dir_s02, "expert_validation_species.csv"))
+expert_columns <- c(inclusive = "range_area_inclusive", main = "range_area",
+                    strict_plus = "range_area_strict_plus")
+expert_ok <- is.finite(ex$expert_area) & ex$expert_area > 0 &
+  Reduce(`&`, lapply(expert_columns, function(m) is.finite(ex[[m]]) & ex[[m]] > 0))
+ex <- ex[expert_ok]
+
+# Agreement of each cleaning with the expert area on the log10 scale (err = cleaning - expert)
+validation <- rbindlist(lapply(variants, function(v) {
+  xx <- log10(ex$expert_area)
+  yy <- log10(ex[[expert_columns[[v]]]])
+  err <- yy - xx
+  data.table(cleaning = v, n = nrow(ex), pearson_log10 = cor(xx, yy),
+             spearman = cor(xx, yy, method = "spearman"),
+             geometric_area_ratio = 10^mean(err), median_area_ratio = 10^median(err),
+             rmse_log10 = sqrt(mean(err^2)),
+             median_absolute_log10_error = median(abs(err)),
+             slope_log10 = unname(coef(lm(yy ~ xx))[2]))
+}))
+write_table(validation,
+            file.path(dir_data_intermediate, "cleaning_expert_validation.csv"))
+print(validation, digits = 3)
+```
+
+```{r clear_check_cleaning_sensitivity, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Box-Cox transformation
+
+The main mixed models and the joint phylogenetic spatial GAM (Yumnam tree) are refitted on a geometric-mean-scaled Box-Cox scale (Box & Cox 1964) at the full-sample maximum-likelihood powers, and contrasts are back-transformed to range ratios. The powers are fixed below; with `profile_powers <- TRUE` (setup) they are re-derived from the profile likelihood, and the notebook stops if they differ.
+
+*Inputs:* s04/main_models.rds, s04/main_{metadata,contrasts,coefficients}.csv, s04/phylo_geography_contrasts.csv, s04/grafted_trees.rds, s04/species_centres.csv; s03/species_table.csv  
+*Outputs:* boxcox_comparison.csv (29 log10 / Box-Cox contrast pairs), boxcox_powers.csv
+
+```{r boxcox_setup}
+# --- Saved models and log10 results of s04 ---
+models <- readRDS(file.path(dir_s04, "main_models.rds"))
+metadata <- read.csv(file.path(dir_s04, "main_metadata.csv"))
+log_ct <- read.csv(file.path(dir_s04, "main_contrasts.csv"))
+log_co <- read.csv(file.path(dir_s04, "main_coefficients.csv"))
+log_joint <- read.csv(file.path(dir_s04, "phylo_geography_contrasts.csv"))
+
+# --- Box-Cox powers ---
+# Full-sample maximum-likelihood powers of the four models; with profile_powers = TRUE
+# they are re-derived from the profile likelihood
+powers <- c(area_type = 0.109711320793908, lat_type = 0.302940235532896,
+            lon_type = 0.148664401022597, area_breadth = 0.138078575010954)
+
+# --- Transformation functions ---
+# Box-Cox transform of y (given as log y) with power lambda. Centring log y on its mean makes
+# the transformation geometric-mean scaled.
+transform_bc <- function(log_y, lambda) {
+  z <- log_y - mean(log_y)
+  if (abs(lambda) < 1e-8) z else expm1(lambda * z) / lambda
+}
+
+# Inverse of the transform: Box-Cox predictions eta back to the centred log scale.
+# Differences of inverse predictions cancel the geometric-mean scale factor.
+inverse_log <- function(eta, lambda) {
+  stopifnot(all(1 + lambda * eta > 0))
+  if (abs(lambda) < 1e-8) eta else log1p(lambda * eta) / lambda
+}
+
+# Derivative of inverse_log() with respect to eta
+derivative <- function(eta, lambda) 1 / (1 + lambda * eta)
+
+# --- Results and helpers ---
+results <- diagnostics <- list()
+
+# Appends to `results` the Box-Cox contrasts bc beside the log10 contrasts old (matched by
+# contrast name), with the model, measure, predictors, sample size n and power lambda
+add_rows <- function(bc, old, model, measure, predictors, n, lambda) {
+  old <- old[match(bc$contrast, old$contrast), ]
+  stopifnot(nrow(old) == nrow(bc), !anyNA(old$contrast))
+  results[[length(results) + 1L]] <<- data.frame(
+    model, measure, predictors, n, lambda, contrast = bc$contrast,
+    log_ratio = old$ratio, log_lower = old$lower, log_upper = old$upper, log_p = old$p,
+    boxcox_ratio = bc$ratio, boxcox_lower = bc$lower,
+    boxcox_upper = bc$upper, boxcox_p = bc$p
+  )
+}
+
+# Residual shape of model m (label names the model, scale the response scale): skewness,
+# excess kurtosis and the correlation of the sorted standardised residuals with normal
+# quantiles (Q-Q correlation)
+shape <- function(m, label, scale) {
+  r <- residuals(m)
+  z <- (r - mean(r)) / sd(r)
+  data.frame(model = label, transformation = scale,
+             skewness = mean(z^3), excess_kurtosis = mean(z^4) - 3,
+             qq_correlation = cor(sort(z), qnorm(ppoints(length(z)))))
+}
+```
+
+## Taxonomic mixed models
+
+```{r boxcox_mixed_models}
+# --- Refit each saved mixed model on the Box-Cox scale ---
+for (key in names(powers)) {
+  cat("START", key, "\n")
+  flush.console()
+  measure <- sub("_.*", "", key)
+  predictors <- sub(".*_", "", key)
+
+  # Saved log10 model, its data and the response on the natural-log scale
+  old <- models[[key]]
+  d <- model.frame(old)
+  log_y <- log(10) * d$log10_range
+
+  # Formula of the saved model with the Box-Cox response (bc_range) as the left-hand side,
+  # and the fixed power of the model
+  fo <- formula(old)
+  fo[[2]] <- as.name("bc_range")
+  environment(fo) <- environment()
+  lambda <- powers[[key]]
+
+  # Fit of the model at a given power, by REML (reml = TRUE) or ML
+  fit_at <- function(power, reml) {
+    d$bc_range <- transform_bc(log_y, power)
+    lmerTest::lmer(fo, data = d, REML = reml,
+                   control = lme4::lmerControl(
+                     optimizer = "bobyqa", optCtrl = list(maxfun = 100000)))
+  }
+
+  # Profile-likelihood power (ML fits), checked against the fixed power
+  if (profile_powers) {
+    # The geometric-mean-centred transformation has log Jacobian -sum(log_y),
+    # independent of power. Retain that term in the original-scale likelihood.
+    ll <- function(power) as.numeric(logLik(fit_at(power, FALSE))) - sum(log_y)
+    grid <- seq(-0.5, 0.75, by = 0.025)
+    grid_ll <- vapply(grid, ll, 1.0)
+    imax <- which.max(grid_ll)
+    stopifnot(imax > 1, imax < length(grid))
+    opt <- optimize(ll, grid[c(imax - 1, imax + 1)], maximum = TRUE, tol = 1e-7)
+    stopifnot(abs(opt$maximum - lambda) < 1e-4)
+    cat(key, ": profile-likelihood power", format(opt$maximum, digits = 8), "\n")
+  }
+
+  # Fit at the fixed power (REML), with the Box-Cox response in the data
+  m <- fit_at(lambda, TRUE)
+  d$bc_range <- transform_bc(log_y, lambda)
+
+  # Breadth models are evaluated at one recorded genus (centred value 1 - mean breadth)
+  at <- list()
+  if (predictors == "breadth") {
+    meta <- metadata[metadata$measure == measure & metadata$predictors == predictors, ]
+    stopifnot(nrow(meta) == 1)
+    at$partner_breadth_centered <- 1 - meta$partner_breadth_mean
+  }
+
+  # Estimated marginal means of the types and their pairwise (Tukey) contrasts
+  em <- emmeans::emmeans(m, ~ interaction_type, data = d,
+                         at = if (length(at)) at else NULL, lmer.df = "kenward-roger")
+  e <- as.data.frame(em)
+  V <- as.matrix(vcov(em))
+  ct <- as.data.frame(summary(emmeans::contrast(em, "pairwise", adjust = "tukey"),
+                              infer = c(TRUE, TRUE)))
+
+  # Contrasts back-transformed to range ratios by the delta method: for each pair, the
+  # difference of the inverse predictions, with its standard error from the gradient g and
+  # the covariance V of the means; the interval uses the critical value of the Tukey contrasts
+  bc <- do.call(rbind, lapply(seq_len(nrow(ct)), function(i) {
+    pair <- strsplit(ct$contrast[i], " - ", fixed = TRUE)[[1]]
+    a <- match(pair[1], e$interaction_type)
+    b <- match(pair[2], e$interaction_type)
+    eta <- e$emmean[c(a, b)]
+    g <- rep(0, nrow(e))
+    g[a] <- derivative(eta[1], lambda)
+    g[b] <- -derivative(eta[2], lambda)
+    lr <- inverse_log(eta[1], lambda) - inverse_log(eta[2], lambda)
+    se <- sqrt(drop(t(g) %*% V %*% g))
+    critical <- (ct$upper.CL[i] - ct$estimate[i]) / ct$SE[i]
+    data.frame(contrast = ct$contrast[i], ratio = exp(lr),
+               lower = exp(lr - critical * se), upper = exp(lr + critical * se),
+               p = ct$p.value[i])
+  }))
+
+  # Log10 contrasts of s04 for comparison
+  ct0 <- log_ct[log_ct$measure == measure & log_ct$predictors == predictors, ]
+  old_rows <- data.frame(contrast = ct0$contrast, ratio = ct0$range_ratio,
+                         lower = ct0$ratio_lower, upper = ct0$ratio_upper,
+                         p = ct0$p.value)
+  add_rows(bc, old_rows, "lmm", measure, predictors, nrow(d), lambda)
+
+  if (predictors == "breadth") {
+    # Breadth effect: range ratio between one and two recorded genera for a facultative species.
+    es <- emmeans::emmeans(
+      m, ~ interaction_type * partner_breadth_centered, data = d,
+      at = list(partner_breadth_centered = c(1, 2) - meta$partner_breadth_mean))
+
+    # Facultative means at one and at two genera (ii, in that order), their ratio and its
+    # delta-method interval with a t critical value
+    ee <- as.data.frame(es)
+    ii <- which(ee$interaction_type == "f")
+    ii <- ii[order(ee$partner_breadth_centered[ii])]
+    stopifnot(length(ii) == 2)
+    eta <- ee$emmean[ii]
+    vv <- as.matrix(vcov(es))[ii, ii]
+    lr <- diff(inverse_log(eta, lambda))
+    g <- c(-derivative(eta[1], lambda), derivative(eta[2], lambda))
+    se <- sqrt(drop(t(g) %*% vv %*% g))
+    co <- coef(summary(m))["partner_breadth_centered", ]
+    critical <- qt(0.975, co["df"])
+    bc <- data.frame(contrast = "breadth", ratio = exp(lr),
+                     lower = exp(lr - critical * se), upper = exp(lr + critical * se),
+                     p = co["Pr(>|t|)"])
+
+    # Log10 breadth coefficient of s04 for comparison
+    co0 <- log_co[log_co$measure == measure & log_co$predictors == predictors &
+                    log_co$term == "partner_breadth_centered", ]
+    old_rows <- data.frame(contrast = "breadth", ratio = co0$range_ratio,
+                           lower = co0$ratio_lower, upper = co0$ratio_upper,
+                           p = co0$p_value)
+    add_rows(bc, old_rows, "lmm", measure, predictors, nrow(d), lambda)
+  }
+
+  # Residual shape on both scales
+  diagnostics[[key]] <- rbind(shape(old, key, "log10"), shape(m, key, "Box-Cox"))
+}
+```
+
+## Joint phylogenetic spatial GAM (Yumnam tree, range area)
+
+The model uses the sample and basis (k = 100) of the log10 joint model.
+
+```{r boxcox_joint_model}
+# --- Data of the log10 joint model (Yumnam tree) ---
+tr <- readRDS(file.path(dir_s04, "grafted_trees.rds"))[["yumnam_2025"]]
+d0 <- read.csv(file.path(dir_s03, "species_table.csv"), na.strings = c("", "NA"),
+               colClasses = c(pool_key = "character"))
+ce <- read.csv(file.path(dir_s04, "species_centres.csv"),
+               colClasses = c(species = "character"))
+d0$interaction_type <- factor(d0$interaction_type, levels = c("n", "f", "m", "p"))
+d0 <- merge(d0, ce, by.x = "pool_key", by.y = "species", all.x = TRUE, sort = FALSE)
+
+# --- Joint model with interaction type, and with type plus breadth ---
+for (pred in c("type", "breadth")) {
+  cat("START joint area", pred, "\n")
+  flush.console()
+
+  # Species on the tree with a positive range area, a type and a geographic centre; the
+  # breadth model keeps the facultative, mutualist and parasite species with a finite breadth
+  d <- d0[d0$species %in% tr$tip.label & is.finite(d0$range_area) & d0$range_area > 0 &
+            !is.na(d0$interaction_type) & is.finite(d0$geo_latitude), ]
+  if (pred == "breadth") d <- d[d$interaction_type != "n" & is.finite(d$host_breadth), ]
+  d <- d[!duplicated(d$species), ]
+  gtr <- ape::keep.tip(tr, d$species)
+  d <- d[match(gtr$tip.label, d$species), ]
+  d$interaction_type <- droplevels(d$interaction_type)
+
+  # Box-Cox response of the range area, and centred breadth (0 in the type model)
+  lambda <- powers[[paste0("area_", pred)]]
+  d$y <- transform_bc(log(d$range_area), lambda)
+  d$hb <- if (pred == "breadth") d$host_breadth - mean(d$host_breadth) else 0
+
+  # Phylogenetic species effect as a penalised identity term with the inverse tree correlation.
+  Z <- diag(nrow(d))
+  C <- ape::vcv(gtr, corr = TRUE)[d$species, d$species]
+  fo <- if (pred == "type")
+    y ~ interaction_type + s(geo_latitude, geo_longitude, bs = "sos", k = 100) + Z else
+    y ~ interaction_type + hb + s(geo_latitude, geo_longitude, bs = "sos", k = 100) + Z
+  g <- gam(fo, data = c(as.list(d), list(Z = Z)), paraPen = list(Z = list(solve(C))),
+           method = "REML")
+  b <- coef(g)
+  V <- vcov(g)
+  lev <- levels(d$interaction_type)
+
+  # Design vector of a type: the intercept plus that type's coefficient, all others 0
+  xvec <- function(a) {
+    v <- setNames(rep(0, length(b)), names(b))
+    v["(Intercept)"] <- 1
+    if (a != lev[1]) v[paste0("interaction_type", a)] <- 1
+    v
+  }
+
+  if (pred == "type") {
+    # Pairwise type contrasts back-transformed to range ratios by the delta method. e and se
+    # are the contrast on the Box-Cox scale and its standard error (for the p-value); selr is
+    # the standard error of the log ratio lr. The interval and p-value use the Tukey
+    # studentised range distribution.
+    bc <- do.call(rbind, lapply(combn(lev, 2, simplify = FALSE), function(q) {
+      xa <- xvec(q[1])
+      xb <- xvec(q[2])
+      L <- xa - xb
+      e <- sum(L * b)
+      se <- sqrt(drop(t(L) %*% V %*% L))
+      ea <- sum(xa * b)
+      eb <- sum(xb * b)
+      lr <- inverse_log(ea, lambda) - inverse_log(eb, lambda)
+      grad <- xa * derivative(ea, lambda) - xb * derivative(eb, lambda)
+      selr <- sqrt(drop(t(grad) %*% V %*% grad))
+      critical <- qtukey(0.95, length(lev), Inf) / sqrt(2)
+      data.frame(contrast = paste(q, collapse = " - "), ratio = exp(lr),
+                 lower = exp(lr - critical * selr), upper = exp(lr + critical * selr),
+                 p = ptukey(abs(e / se) * sqrt(2), length(lev), Inf, lower.tail = FALSE))
+    }))
+  } else {
+    # Breadth effect for a facultative species: range ratio between one and two recorded
+    # genera, with a normal interval
+    x1 <- xvec("f")
+    x1["hb"] <- 1 - mean(d$host_breadth)
+    x2 <- x1
+    x2["hb"] <- x1["hb"] + 1
+    e1 <- sum(x1 * b)
+    e2 <- sum(x2 * b)
+    lr <- inverse_log(e2, lambda) - inverse_log(e1, lambda)
+    grad <- x2 * derivative(e2, lambda) - x1 * derivative(e1, lambda)
+    se <- sqrt(drop(t(grad) %*% V %*% grad))
+    bc <- data.frame(contrast = "breadth", ratio = exp(lr), lower = exp(lr - 1.96 * se),
+                     upper = exp(lr + 1.96 * se),
+                     p = 2 * pnorm(-abs(b["hb"] / sqrt(V["hb", "hb"]))))
+  }
+
+  # Log10 joint model of s04 for the same contrasts, fitted to the same number of species
+  old_rows <- log_joint[log_joint$model == "phylo_spatial_gam" &
+                          log_joint$study == "yumnam_2025" &
+                          log_joint$measure == "area" & log_joint$predictors == pred, ]
+  stopifnot(all(old_rows$n == nrow(d)))
+  add_rows(bc, old_rows, "joint_yumnam", "area", pred, nrow(d), lambda)
+  diagnostics[[paste0("joint_", pred)]] <- shape(g, paste0("joint_", pred), "Box-Cox")
+}
+
+# --- Comparison table ---
+# All 29 contrast pairs with finite results and Box-Cox intervals around the ratios
+comparison <- do.call(rbind, results)
+stopifnot(nrow(comparison) == 29, all(is.finite(as.matrix(comparison[, 7:14]))),
+          all(comparison$boxcox_lower < comparison$boxcox_ratio),
+          all(comparison$boxcox_ratio < comparison$boxcox_upper))
+write_table(comparison, file.path(dir_data_intermediate, "boxcox_comparison.csv"))
+write_table(data.frame(model = names(powers), lambda = unname(powers)),
+            file.path(dir_data_intermediate, "boxcox_powers.csv"))
+cat("Residual shape on the log10 and Box-Cox scales:\n")
+print(do.call(rbind, diagnostics), digits = 3)
+```
+
+```{r clear_fit_boxcox_models, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Export report figures
+
+The report figure drawn here (Figure S3) is copied to `results/s05_check_robustness/`, from where the manuscript includes it; the original stays in this notebook's intermediate folder.
+
+```{r export_report_figures}
+# Copy the report figure (Figure S3) to results/s05_check_robustness/
+copy_report_figures("s05_check_robustness")
+```
+
+# Recording R environment
+
+The R version and packages used to render this notebook are printed below, with the versions of the geospatial libraries (GDAL, PROJ, GEOS) used by `sf` and `terra` when the notebook loaded them.
+
+```{r save_r_environment}
+print(sessionInfo())
+
+# Geospatial libraries bundled with (Windows) or linked by (Linux, macOS) sf and terra
+if ("sf" %in% loadedNamespaces()) print(sf::sf_extSoftVersion())
+if ("terra" %in% loadedNamespaces()) print(terra::gdal(lib = "all"))
+```

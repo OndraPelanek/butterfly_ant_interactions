@@ -1,0 +1,1990 @@
+---
+title: "Butterfly-ant interactions 01 - interaction trait preparation"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+This is the first of six R Markdown notebooks that reproduce the analyses of the paper. It builds the species-level ant-association traits of Lycaenidae (interaction type, partner breadth as the number of associated ant genera, associated ants, carnivory and wingspan) from an evidence ledger in which every row is one claim of one source about one published species name.
+
+The raw inputs are the 15 frozen per-source ledgers, the curated decision tables and the full citations (`trait_evidence/`), a frozen snapshot of the GBIF Backbone Taxonomy with cached name matches (`gbif_backbone/`), the 2024 manual compilation (`legacy_2024/`, used only for the agreement check), the Riodinidae genus list (`taxonomy/`) and two published phylogenies (`phylogenies/`).
+
+The main outputs are the species trait table (`species_traits.csv`) and the evidence ledger (`evidence_ledger.csv`). The notebook also writes the synonym database, the comparison with the 2024 compilation, and the public species-level dataset with its column dictionary (`release/`). The later notebooks read the species table and, depending on the notebook, the ledger, the synonym database and the comparison with the 2024 compilation. Five sections hand working tables to later sections (the raw ledger, the species universe, the 2024 names matched to the snapshot, the duplicate-species clusters, the tree tips matched to species and the species table before the phylogenetic defaults and wingspan); these go to a temporary folder and are not kept. The notebook runs in about one minute.
+
+# Setup
+
+## Packages
+
+The notebook uses base R; `resrepo` locates the versioned data folders, and `ape` (reading the trees) is called with `::`.
+
+```{r load_packages, message=FALSE, warning=FALSE}
+# resrepo provides path_resrepo(), which locates the versioned data folders
+library(resrepo)
+```
+
+## Folders
+
+Raw inputs are read from the versioned raw data, and outputs are written to this notebook's folder in the versioned intermediate data. Working tables passed between sections are written to a temporary folder that is deleted when R closes. The input and output lists of the sections below give paths relative to these folders.
+
+```{r setup_folders}
+# Versioned raw inputs
+dir_data_raw <- path_resrepo("data/raw")
+
+# Outputs of this notebook
+dir_data_intermediate <- path_resrepo("data/intermediate/s01_prepare_traits")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+
+# Working tables passed between sections (deleted when the R session ends)
+dir_working <- file.path(tempdir(), "s01_prepare_traits")
+dir.create(dir_working, showWarnings = FALSE)
+
+# The two published trees: Yumnam & Kodandaramaiah (2025) and Schaer et al. (2018)
+tree_files <- c(
+  yumnam_2025 = file.path(dir_data_raw, "phylogenies", "yumnam_2025",
+                          "21Jan2025_30June23_SubfamAdded_RelTime_DivergenceTime_928sp.nwk"),
+  schar_2018 = file.path(dir_data_raw, "phylogenies", "schar_2018", "treemacro.nex"))
+```
+
+## Functions
+
+`write_table()` writes the output tables, `name_matching.R` normalises names and matches them to the GBIF Backbone snapshot, and `phylogeny.R` reads the published trees and parses their tip labels.
+
+```{r load_functions}
+# Output tables
+source(here::here("code", "R", "write_table.R"))
+
+# Name normalisation and matching to the GBIF Backbone snapshot
+source(here::here("code", "R", "name_matching.R"))
+
+# Reading the published trees and parsing their tip labels
+source(here::here("code", "R", "phylogeny.R"))
+```
+
+Tables are read with every column as character, so that keys and codes keep their exact text.
+
+```{r define_readers}
+# Read a CSV with all columns as character; `na` gives the strings read as missing
+read_chr <- function(file, na = "") read.csv(file, colClasses = "character", na.strings = na)
+
+# Path of a curated decision table (a file of trait_evidence/decisions/)
+decision_file <- function(file) file.path(dir_data_raw, "trait_evidence", "decisions", file)
+```
+
+Each section below reads its inputs from disk and ends by removing its objects (in a hidden chunk), so only the objects defined in this setup carry over from one section to the next.
+
+```{r keep_setup_objects}
+# Objects of the setup, kept when each section clears its own objects
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Frozen inputs
+
+The per-source ledgers were extracted once from published tables and supplements (Fiedler 1991, 1995, 2006, 2012 and 2021; Schär et al. 2018; Eastwood & Fraser 1999; Heath & Claassens 2003; Sujitha et al. 2024; Pierce 1995; Boyle et al. 2015), from the 'Associated ant(s)' fields of the Afrotropical Butterflies chapters, from iNaturalist project 102272 and from hand-read literature (`gap_hunt_ledger.csv`). Most of these inputs are copyrighted PDFs or hand transcriptions, so the extraction code is not part of this repository and the ledgers are the raw data. The Fiedler (1991) Table 19 ledger is the version extracted on 5 October 2026; its questionable ('?') and attack-only ant records are removed from partner breadth later, in `s03_build_species_tables` (records listed in `trait_evidence/publication_ant_record_corrections.csv`). The wingspan extracts (LepTraits 1.0, Shirey et al. 2022; Afrotropical Butterflies specimen captions; Wikipedia text), the GBIF fuzzy-match responses for names without an exact match (`gbif_fuzzy_cache.csv`) and the Catalogue of Life (ChecklistBank 3LR) status of ant genera (`ant_genus_col_check.csv`) are frozen API or text-mining results. The decision tables record curated name resolutions, duplicate-species merges and splits, representative keys, genus-level statements from cited authors and the species-level decisions, each with its evidence and decision maker.
+
+The GBIF Backbone snapshot defines the species universe (all accepted Lycaenidae species). It was downloaded on 2 October 2026 with paged requests of the form below; the chunk documents provenance and is not run.
+
+```{r gbif_backbone_provenance, eval = FALSE}
+# Paged GBIF species-search requests for Lycaenidae (family key 5473) in the Backbone
+# dataset. `offset` pages through the results (1000 per request), and `rank` is added to
+# the request only when it is given.
+backbone_query <- function(status, offset, rank = NULL) paste0(
+  "https://api.gbif.org/v1/species/search?datasetKey=d7dddbf4-2cf0-4f39-9b2a-bb099caae36c",
+  "&highertaxonKey=5473&status=", status, if (!is.null(rank)) paste0("&rank=", rank),
+  "&limit=1000&offset=", offset)
+
+# Requests made (status, and rank where given) and the snapshot file of each
+# ACCEPTED at rank SPECIES -> accepted_species_20261002.csv
+# SYNONYM, HOMOTYPIC_SYNONYM, HETEROTYPIC_SYNONYM, PROPARTE_SYNONYM -> synonyms_20261002.csv
+# DOUBTFUL -> doubtful_20261002.csv
+```
+
+# Names and species universe
+
+The ledgers are combined into one table with a fixed `evidence_id`. Every name string from the ledgers is normalised and matched to the snapshot: exact accepted name, unambiguous synonym, or a gender-ending variant within the same genus. Remaining names receive low-confidence suggestions (a unique epithet in the family or a GBIF fuzzy match within the genus), which the species table ignores unless a curated name decision confirms them; name decisions override every automatic tier. Riodinidae genera that the Backbone files within Lycaenidae are removed.
+
+*Inputs:* trait_evidence/source_ledgers/*_ledger.csv (15 frozen ledgers); gbif_backbone/ snapshot and gbif_fuzzy_cache.csv; taxonomy/riodinid_genera.csv; trait_evidence/decisions/name_decisions.csv; legacy_2024/Aug24_final_dataset.csv (2024 names, for the agreement check only).  
+*Outputs:* synonym_database.csv; working tables evidence_ledger_raw.csv, species_universe_gbif.csv and names_2024_to_gbif.csv.
+
+## Combined ledgers
+
+The 15 source ledgers are stacked in a fixed order, which fixes the `evidence_id` of every row.
+
+```{r combine_ledgers}
+# Per-source ledgers, in the fixed order that fixes the evidence_id of every row
+ledger_sources <- c("atb2026", "boyle2015", "eastwood1999", "fiedler1991",
+                    "fiedler1991_table19", "fiedler1995", "fiedler2006", "fiedler2012",
+                    "fiedler2021", "gap_hunt", "heath2003", "inat_ant_butterfly",
+                    "pierce1995", "schar2018", "sujitha2024")
+lf <- file.path(dir_data_raw, "trait_evidence", "source_ledgers",
+                paste0(ledger_sources, "_ledger.csv"))
+
+# Stack the ledgers and number the rows
+L <- do.call(rbind, lapply(lf, read_chr))
+L$evidence_id <- sprintf("E%06d", seq_len(nrow(L)))
+cat("ledger files:", length(lf), " rows:", nrow(L), "\n")
+
+# Rows by source and claim type
+print(table(L$source_id, L$claim_type))
+```
+
+## GBIF Backbone snapshot
+
+Riodinidae that the Backbone files under Lycaenidae are not part of the study: their accepted species, the synonyms pointing to them (the snapshot's `genus` is the accepted genus) and their doubtful names are dropped, and ledger rows in their genera are set aside.
+
+```{r read_backbone_snapshot}
+# --- GBIF Backbone snapshot ---
+acc <- read_chr(file.path(dir_data_raw, "gbif_backbone", "accepted_species_20261002.csv"))
+syn <- read_chr(file.path(dir_data_raw, "gbif_backbone", "synonyms_20261002.csv"))
+dbt <- read_chr(file.path(dir_data_raw, "gbif_backbone", "doubtful_20261002.csv"))
+cat("GBIF snapshot:", nrow(acc), "accepted;", nrow(syn), "synonyms;", nrow(dbt),
+    "doubtful\n")
+
+# --- Riodinidae filed under Lycaenidae ---
+# Their accepted species, the synonyms pointing to them (the snapshot's genus is the
+# accepted genus) and their doubtful names are dropped
+rio <- read_chr(file.path(dir_data_raw, "taxonomy", "riodinid_genera.csv"))$genus
+rio_keys <- acc$key[acc$genus %in% rio]
+acc <- acc[!acc$genus %in% rio, ]
+syn <- syn[!(syn$genus %in% rio | syn$acceptedKey %in% rio_keys), ]
+dbt <- dbt[!dbt$genus %in% rio, ]
+
+# Ledger rows in their genera are set aside
+L_genus <- normalise_name(L$species_as_published)$genus
+cat("Riodinidae removed:", length(rio_keys),
+    "accepted species; ledger rows in riodinid genera:",
+    sum(L_genus %in% rio, na.rm = TRUE), "\n")
+if (any(L_genus %in% rio)) L <- L[!(L_genus %in% rio), ]
+```
+
+## Name strings
+
+Every species name in the ledgers is collected with the places where it is used, and normalised to a binomial.
+
+```{r collect_name_strings}
+# --- Table of the 2024 compilation ---
+# Its names are matched to the snapshot for the agreement check only; they do not enter the
+# synonym database. Read as text; blank and "NA" are missing
+legacy <- read_chr(file.path(dir_data_raw, "legacy_2024", "Aug24_final_dataset.csv"),
+                   na = c("", "NA"))
+
+# --- Name strings with the places where they are used ---
+# Ledger names, with their sources
+nm <- data.frame(name = L$species_as_published, where = paste0("ledger:", L$source_id))
+nm <- nm[!is.na(nm$name) & nzchar(nm$name), ]
+
+# One row per distinct string, with its sorted places of use
+agg <- aggregate(where ~ name, nm, function(z) paste(sort(unique(z)), collapse = "; "))
+
+# --- Normalise to binomials ---
+N <- normalise_name(agg$name)
+N$where_used <- agg$where
+cat("distinct name strings:", nrow(N), " normalisable:", sum(!is.na(N$normalised)), "\n")
+```
+
+## Exact and orthographic-variant matches
+
+Each distinct binomial is matched to an accepted name, an unambiguous synonym or a gender-ending variant within the same genus (`match_gbif_names()`).
+
+```{r match_exact_names}
+# --- Match the distinct binomials ---
+M <- match_gbif_names(unique(N$normalised[!is.na(N$normalised)]), acc, syn, dbt)
+cat("\nmatch types over distinct normalised binomials:\n")
+print(table(M$match_type))
+
+# --- Name table: every name string with its match ---
+D <- merge(N, M, by = "normalised", all.x = TRUE, sort = FALSE)
+D$name_id <- sprintf("N%06d", seq_len(nrow(D)))
+D <- D[, c("name_id", "input", "normalised", "genus", "epithet", "rank_flag", "where_used",
+           "match_type", "usage_key", "status", "accepted_key", "accepted_name", "note")]
+names(D) <- c("name_id", "name_as_published", "normalised_name", "genus", "epithet",
+              "rank_flag", "where_used", "gbif_match_type", "gbif_usage_key", "gbif_status",
+              "gbif_accepted_key", "gbif_accepted_name", "match_note")
+
+# Strings that could not be normalised to a binomial
+D$gbif_match_type[is.na(D$normalised_name)] <- "not_a_binomial"
+```
+
+## Suggestions for unmatched names
+
+A name that is still unmatched receives a suggestion when its epithet is carried by exactly one accepted species in the family (a genus transfer) or when GBIF returns a fuzzy match within the same genus (a spelling slip). Both are low confidence: the species table ignores them (rule R3) unless `name_decisions.csv` confirms them.
+
+```{r suggest_unmatched_names}
+# --- Epithets and cached GBIF fuzzy matches ---
+acc$epithet <- sub("^[^ ]+ ", "", acc$canonicalName)
+fz <- read_chr(file.path(dir_data_raw, "gbif_backbone", "gbif_fuzzy_cache.csv"))
+
+# --- Resolution of the automatic matches ---
+# Exact and synonym matches are auto_exact; gender-ending variants are auto_variant
+D$resolution <- ifelse(D$gbif_match_type %in% c("accepted_exact", "synonym_resolved",
+                                                "accepted_and_synonym"),
+                       "auto_exact", NA)
+
+# Confidence: high for exact and synonym matches (high_check_homonym when the name is both
+# an accepted name and a synonym), medium for gender-ending variants
+D$resolution_confidence <- ifelse(
+  D$gbif_match_type %in% c("accepted_exact", "synonym_resolved"), "high",
+  ifelse(D$gbif_match_type == "accepted_and_synonym", "high_check_homonym",
+         ifelse(D$gbif_match_type %in% c("gender_variant_accepted", "gender_variant_synonym"),
+                "medium_orthographic_variant", NA)))
+
+# Resolution of the gender-ending variants
+D$resolution[D$gbif_match_type %in% c("gender_variant_accepted",
+                                      "gender_variant_synonym")] <- "auto_variant"
+
+# --- Suggestions for the remaining names ---
+# First a genus transfer (the epithet is carried by exactly one accepted species of the
+# family), else a spelling slip (a GBIF fuzzy match within the same genus)
+for (i in which(D$gbif_match_type == "unmatched" & !is.na(D$normalised_name))) {
+  # Accepted species with this epithet or one of its variants (epithet_variants())
+  ev <- epithet_variants(D$epithet[i])
+  ca <- acc[acc$epithet %in% ev, ]
+
+  # GBIF carries some species twice (an authored record plus an unauthored
+  # duplicate from another source); if exactly one candidate has an authorship
+  # string, prefer it.
+  if (nrow(ca) > 1L && sum(!is.na(ca$authorship) & nzchar(trimws(ca$authorship))) == 1L)
+    ca <- ca[!is.na(ca$authorship) & nzchar(trimws(ca$authorship)), ]
+
+  # Genus transfer: a single candidate key
+  if (length(unique(ca$key)) == 1L) {
+    D$gbif_accepted_key[i] <- ca$key
+    D$gbif_accepted_name[i] <- ca$canonicalName
+    D$gbif_match_type[i] <- "epithet_unique_suggested"
+    D$resolution[i] <- "auto_suggested"
+    D$resolution_confidence[i] <- "low_genus_transfer_suggestion"
+    D$match_note[i] <- "only accepted species in the family with this epithet; genus differs"
+    next
+  }
+
+  # Spelling slip: one fuzzy match to an accepted species of the same genus
+  f <- fz[fz$name == D$normalised_name[i] & fz$rank == "SPECIES" & fz$matchType == "FUZZY" &
+            fz$status == "ACCEPTED", ]
+  if (nrow(f) == 1L && sub(" .*$", "", f$scientificName) == D$genus[i]) {
+    D$gbif_accepted_key[i] <- f$usageKey
+    D$gbif_accepted_name[i] <- sub("^([A-Z][a-z-]+ [a-z-]+).*$", "\\1", f$scientificName)
+    D$gbif_match_type[i] <- "fuzzy_same_genus_suggested"
+    D$resolution[i] <- "auto_suggested"
+    D$resolution_confidence[i] <- "low_spelling_suggestion"
+    D$match_note[i] <- paste("GBIF fuzzy:", f$scientificName)
+  }
+}
+```
+
+## Curated name decisions
+
+Reviewed name decisions override every automatic tier, and the result is the synonym database.
+
+```{r apply_name_decisions}
+# --- Reviewed name decisions ---
+dec <- read_chr(decision_file("name_decisions.csv"))
+stopifnot(all(c("normalised_name", "accepted_key", "decision") %in% names(dec)))
+
+# --- Apply each decision to every name string it names ---
+for (i in seq_len(nrow(dec))) {
+  j <- which(D$normalised_name == dec$normalised_name[i])
+  if (!length(j)) next
+
+  # accepted_key is a GBIF key, "NONE", or "X:Genus_species" (merge into an 'extra',
+  # non-GBIF-accepted taxon so that synonymous names of such taxa share one row)
+  D$gbif_accepted_key[j] <- ifelse(dec$accepted_key[i] == "NONE", NA, dec$accepted_key[i])
+  D$gbif_accepted_name[j] <- ifelse(
+    dec$accepted_key[i] == "NONE", NA,
+    ifelse(grepl("^X:", dec$accepted_key[i]),
+           gsub("_", " ", sub("^X:", "", dec$accepted_key[i])),
+           acc$canonicalName[match(dec$accepted_key[i], acc$key)]))
+
+  # Match type, resolution and confidence of a manual decision
+  D$gbif_match_type[j] <- paste0("manual_", dec$decision[i])
+  D$resolution[j] <- "manual"
+  D$resolution_confidence[j] <-
+    if (dec$decision[i] == "genus_transfer") "medium_reviewed_transfer" else
+      if (dec$accepted_key[i] == "NONE") "unresolved_rejected" else "high_manual"
+  D$match_note[j] <- dec$reason[i]
+}
+
+# --- Summary and synonym database ---
+cat("manual name decisions applied:", nrow(dec), "\n")
+cat("\nmatch types after all tiers:\n")
+print(table(D$gbif_match_type, useNA = "a"))
+cat("distinct normalised names:", length(unique(D$normalised_name)),
+    " resolved to accepted key:",
+    length(unique(D$normalised_name[!is.na(D$gbif_accepted_key)])), "\n")
+write_table(D, file.path(dir_data_intermediate, "synonym_database.csv"))
+```
+
+## Species universe and 2024 names
+
+The species universe holds every accepted species of the snapshot, with its number of ledger rows and whether the 2024 compilation used it. The 2024 names are matched to the snapshot by the automatic exact and orthographic-variant matching only (`match_gbif_names()`), without the suggestions and curated decisions; they serve only the agreement check below.
+
+```{r write_species_universe}
+# --- Species universe ---
+# One row per accepted species of the snapshot
+U <- data.frame(gbif_key = acc$key, species = gsub(" ", "_", acc$canonicalName),
+                canonical = acc$canonicalName, genus = acc$genus, authorship = acc$authorship,
+                stringsAsFactors = FALSE)
+
+# --- 2024 names matched to the snapshot ---
+# Automatic matching only: no suggestions and no curated decisions
+leg <- unique(legacy$species)
+legn <- normalise_name(leg)
+lm <- match_gbif_names(legn$normalised, acc, syn, dbt)
+cat("\n2024 species (", length(leg), ") vs GBIF snapshot:\n", sep = "")
+print(table(lm$match_type))
+drift <- data.frame(legacy_name = leg, lm[, -1], stringsAsFactors = FALSE)
+write_table(drift, file.path(dir_working, "names_2024_to_gbif.csv"))
+
+# --- Universe columns and output tables ---
+# Whether the 2024 compilation used each species, and its number of ledger rows
+U$in_legacy_aug24 <- U$gbif_key %in% na.omit(lm$accepted_key)
+U$n_ledger_rows <- as.integer(table(factor(
+  D$gbif_accepted_key[match(paste(L$species_as_published), D$name_as_published)],
+  levels = U$gbif_key)))
+write_table(U, file.path(dir_working, "species_universe_gbif.csv"))
+write_table(L, file.path(dir_working, "evidence_ledger_raw.csv"))
+cat("\nuniverse:", nrow(U), " in 2024 compilation:", sum(U$in_legacy_aug24),
+    " with >=1 ledger row:", sum(U$n_ledger_rows > 0), "\n")
+```
+
+```{r clear_build_names, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Duplicate species clusters
+
+The Backbone accepts some species under several genus combinations. Accepted keys sharing the epithet stem and the authority (author and year) are clustered; curated splits separate different species that one author described with the same epithet in one year, and curated merges join duplicates the rule cannot detect. Evidence is pooled on one representative key per cluster: a listed current combination, else the key with the most ledger rows, else the authored record with the smallest key.
+
+*Inputs:* gbif_backbone/accepted_species_20261002.csv; taxonomy/riodinid_genera.csv; working table species_universe_gbif.csv; trait_evidence/decisions/ cluster_splits.csv, cluster_merges.csv, cluster_merges_auto.csv, cluster_representatives.csv.  
+*Output:* working table species_clusters.csv (one row per accepted key).
+
+```{r read_cluster_inputs}
+# Accepted species of the snapshot, without the riodinid genera
+acc <- read_chr(file.path(dir_data_raw, "gbif_backbone", "accepted_species_20261002.csv"))
+acc <- acc[!acc$genus %in%
+             read_chr(file.path(dir_data_raw, "taxonomy", "riodinid_genera.csv"))$genus, ]
+
+# Number of ledger rows of each accepted key (species universe of the names section)
+U <- read_chr(file.path(dir_working, "species_universe_gbif.csv"))
+n_ledger_rows <- setNames(as.integer(U$n_ledger_rows), U$gbif_key)
+```
+
+## Automatic rule: same epithet stem and same authority
+
+Accepted keys cluster when they share the epithet stem (Latin gender endings removed) and the authority. The author surname(s) and the year define the authority, because one author often described several species with the same epithet in different genera.
+
+```{r cluster_by_authority}
+# --- Epithet stem ---
+# Epithet without the genus, and its stem with the Latin gender endings removed
+acc$epi <- sub("^[^ ]+ ", "", acc$canonicalName)
+acc$stem <- gsub("(ii|i|us|a|um|is|e|ae|ia|ius|oides|ensis|ense|iensis)$", "", acc$epi)
+
+# Placeholder epithets never cluster
+ph <- acc$epi %in% c("spec", "sp")
+acc$stem[ph] <- paste0("unnamed", acc$key[ph])
+
+# --- Authority ---
+# Author names and year without punctuation (au), the author part (au_name) and the
+# year (yr)
+au <- tolower(acc$authorship)
+au <- gsub("[(),&]| and |[.]", "", au)
+acc$au <- gsub("[^a-z0-9]", "", au)
+acc$au_name <- gsub("[0-9]+", "", acc$au)
+acc$yr <- sub("^.*?([0-9]{4}).*$", "\\1", acc$authorship)
+acc$yr[!grepl("[0-9]{4}", acc$authorship)] <- ""
+authored <- nzchar(acc$au_name)
+
+# --- Clusters with author and year ---
+acc$cluster <- NA_character_
+full_auth <- authored & nzchar(acc$yr)
+acc$cluster[full_auth] <- paste0("C:", acc$stem[full_auth], " ", acc$au_name[full_auth], " ",
+                                 acc$yr[full_auth])
+
+# --- Author without year ---
+# Attach if exactly one year-bearing cluster has this stem and author; otherwise the key
+# is a cluster of its own
+by_sa <- tapply(acc$cluster[full_auth],
+                paste(acc$stem[full_auth], acc$au_name[full_auth]),
+                function(z) unique(z))
+for (i in which(authored & !full_auth)) {
+  cs <- by_sa[[paste(acc$stem[i], acc$au_name[i])]]
+  acc$cluster[i] <- if (!is.null(cs) && length(cs) == 1L) cs else paste0("K:", acc$key[i])
+}
+
+# --- Unauthored ---
+# Attach if exactly one authored cluster has this stem; otherwise the key is a cluster of
+# its own
+auth_by_stem <- tapply(acc$cluster[!is.na(acc$cluster)], acc$stem[!is.na(acc$cluster)],
+                       function(z) unique(z))
+for (i in which(!authored)) {
+  cs <- auth_by_stem[[acc$stem[i]]]
+  acc$cluster[i] <- if (!is.null(cs) && length(cs) == 1L) cs else paste0("K:", acc$key[i])
+}
+
+# Cluster from the author/year rule alone (kept for audit)
+acc$cluster_rule <- acc$cluster
+```
+
+## Curated corrections
+
+One author sometimes described different species with the same epithet in one year in different genera (e.g. *Thestor* and *Deudorix penningtoni* van Son, 1949); the keys in `cluster_splits.csv` (evidence in the file) become single-key species. Duplicates that the rule cannot detect are joined by hand-reviewed merges and by rule-based merges of unauthored duplicates (Catalogue of Life agreement or co-occurring GBIF records; reasons in the files).
+
+```{r correct_clusters}
+# --- Curated splits ---
+# The keys of cluster_splits.csv become single-key clusters
+SP <- read_chr(decision_file("cluster_splits.csv"))
+hit <- acc$key %in% SP$gbif_key
+if (sum(hit) != nrow(SP))
+  warning("cluster split keys not found: ",
+          paste(setdiff(SP$gbif_key, acc$key), collapse = ", "))
+acc$cluster[hit] <- paste0("S:", acc$key[hit])
+
+# --- Curated and rule-based merges ---
+# The cluster of key_b joins the cluster of key_a
+MM <- read_chr(decision_file("cluster_merges.csv"))
+MM <- rbind(MM,
+            read_chr(decision_file("cluster_merges_auto.csv"))[c("key_a", "key_b", "reason")])
+for (i in seq_len(nrow(MM))) {
+  a <- which(acc$key == MM$key_a[i])
+  b <- which(acc$key == MM$key_b[i])
+  if (length(a) != 1L || length(b) != 1L) {
+    warning("cluster merge key not found: ", MM$key_a[i], " / ", MM$key_b[i])
+    next
+  }
+  acc$cluster[acc$cluster == acc$cluster[b]] <- acc$cluster[a]
+}
+
+# --- Cluster ids ---
+acc$cluster_id <- as.integer(factor(acc$cluster, levels = unique(acc$cluster)))
+```
+
+## Representative key
+
+The representative of a cluster is, in order of precedence, a key listed in `cluster_representatives.csv` (the current combination of the merged duplicates), the key with the most ledger rows, the authored record with the smallest key, or the smallest key.
+
+```{r choose_representatives}
+# --- Representative by rule ---
+# rep_of() returns the representative key of one cluster `z` (its rows of acc): the key
+# with the most ledger rows, else the authored record with the smallest key, else the
+# smallest key
+acc$n_ledger_rows <- unname(n_ledger_rows[acc$key])
+stopifnot(!anyNA(acc$n_ledger_rows))
+rep_of <- function(z) {
+  z <- z[z$n_ledger_rows == max(z$n_ledger_rows), ]
+  if (nrow(z) == 1L) return(z$key)
+  a <- z[nzchar(acc$au_name[match(z$key, acc$key)]), ]
+  if (nrow(a)) return(a$key[which.min(as.numeric(a$key))])
+  z$key[which.min(as.numeric(z$key))]
+}
+reps <- vapply(split(acc, acc$cluster_id), rep_of, "")
+
+# --- Curated representatives ---
+# The keys of cluster_representatives.csv override the rule
+CR <- read_chr(decision_file("cluster_representatives.csv"))
+for (k in CR$gbif_key) {
+  i <- which(acc$key == k)
+  if (length(i) != 1L) {
+    warning("cluster representative key not found: ", k)
+    next
+  }
+  reps[as.character(acc$cluster_id[i])] <- k
+}
+
+# --- Cluster columns and output ---
+acc$representative_key <- reps[as.character(acc$cluster_id)]
+size <- table(acc$cluster_id)
+acc$cluster_size <- as.integer(size[as.character(acc$cluster_id)])
+members <- tapply(acc$canonicalName, acc$cluster_id, function(z) paste(z, collapse = " | "))
+acc$cluster_members <- members[as.character(acc$cluster_id)]
+write_table(acc[, c("key", "canonicalName", "authorship", "cluster_id", "cluster_size",
+                    "representative_key", "n_ledger_rows", "cluster_members", "cluster_rule")],
+            file.path(dir_working, "species_clusters.csv"))
+cat("accepted keys:", nrow(acc), " clusters:", length(unique(acc$cluster_id)),
+    " multi-key clusters:", sum(size > 1), " keys in them:", sum(size[size > 1]), "\n")
+```
+
+```{r clear_cluster_species, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Species trait table
+
+Each source's verbatim category is translated into a class (n, f, o = obligate with subtype unspecified, m, p). A species takes the class recorded by the most independent sources; a tie goes to the class with the most direct record: an observation of the species, then a review or compilation, then the broad coding of Schär et al. (2018); between records of the same kind, the more recent source wins. Rules R1-R13, documented in the code below, handle supersession of earlier Fiedler scores, derivative, doubtful and regurgitation-only records, unreviewed name matches, unverified iNaturalist records, Schär's 'n', attendance records without a class and the subtype of obligate species; scores presumed from relatives are used only when a species has no direct evidence. Ant names are harmonised to accepted genera, and partner breadth counts distinct ant genera among field attendance or host records. Cited genus-level statements and the species decisions are then applied; rule-based genus-consensus classes (R11) are recorded in `interaction_type_rule_default` but not used. Carnivory comes from source records, with genus-consensus (R12) and brood-predator-genus (R12b) presumptions flagged in `carnivory_basis`.
+
+*Inputs:* synonym_database.csv; working tables evidence_ledger_raw.csv, species_universe_gbif.csv and species_clusters.csv; trait_evidence/api_caches/ant_genus_col_check.csv; trait_evidence/sources.csv; trait_evidence/decisions/ ant_name_overrides.csv, parasitic_genera.csv, species_decisions.csv, genus_presumptions.csv.  
+*Outputs:* evidence_ledger.csv (ledger with accepted keys, harmonised ants, classes, evidence ranks and record use); working table species_traits_core.csv (species table before the phylogenetic defaults and wingspan).
+
+```{r read_trait_inputs}
+# Ledger, synonym database and species universe written by the names section
+L <- read_chr(file.path(dir_working, "evidence_ledger_raw.csv"))
+D <- read_chr(file.path(dir_data_intermediate, "synonym_database.csv"))
+U <- read_chr(file.path(dir_working, "species_universe_gbif.csv"))
+
+# Catalogue of Life status of ant genera, ant name overrides and the source table
+colchk <- read_chr(file.path(dir_data_raw, "trait_evidence", "api_caches",
+                             "ant_genus_col_check.csv"))
+ovr <- read_chr(decision_file("ant_name_overrides.csv"))
+S <- read_chr(file.path(dir_data_raw, "trait_evidence", "sources.csv"))
+```
+
+## Accepted species keys
+
+Each ledger row receives the accepted key of its published name, re-pointed to the representative of the key's duplicate cluster. Names without an accepted GBIF species are kept as 'extra' taxa with a pseudo key.
+
+```{r attach_species_keys}
+# --- Accepted key of each ledger row ---
+m <- match(L$species_as_published, D$name_as_published)
+L$name_match_type <- D$gbif_match_type[m]
+L$name_confidence <- D$resolution_confidence[m]
+L$accepted_key <- D$gbif_accepted_key[m]
+L$accepted_name <- D$gbif_accepted_name[m]
+
+# --- Representative of the duplicate cluster ---
+# Evidence is attached to the representative key of its duplicate cluster. The other
+# member rows stay in the table, flagged as duplicates, without trait values.
+CL <- read_chr(file.path(dir_working, "species_clusters.csv"))
+L$accepted_key_original <- L$accepted_key
+rk <- setNames(CL$representative_key, CL$key)
+hit <- !is.na(L$accepted_key) & L$accepted_key %in% names(rk)
+L$accepted_key[hit] <- rk[L$accepted_key[hit]]
+L$accepted_name[hit] <- U$canonical[match(L$accepted_key[hit], U$gbif_key)]
+
+# Cluster columns of the species universe
+U$cluster_id <- CL$cluster_id[match(U$gbif_key, CL$key)]
+U$cluster_size <- as.integer(CL$cluster_size[match(U$gbif_key, CL$key)])
+U$representative_key <- CL$representative_key[match(U$gbif_key, CL$key)]
+U$cluster_members <- CL$cluster_members[match(U$gbif_key, CL$key)]
+cat("evidence rows re-pointed to a cluster representative:",
+    sum(hit & L$accepted_key != L$accepted_key_original), "\n")
+
+# --- 'Extra' taxa ---
+# Names without an accepted GBIF species (not in GBIF, doubtful in GBIF, GBIF
+# subspecies/lump, unresolved) are kept as 'extra' taxa with a pseudo key so no
+# evidence is lost; they are flagged in universe_status and never merged silently.
+L$normalised_name <- D$normalised_name[m]
+ex <- (is.na(L$accepted_key) & !is.na(L$normalised_name)) | grepl("^X:", L$accepted_key)
+nokey <- is.na(L$accepted_key) & !is.na(L$normalised_name)
+L$accepted_key[nokey] <- paste0("X:", gsub(" ", "_", L$normalised_name[nokey]))
+L$accepted_name[ex] <- gsub("_", " ", sub("^X:", "", L$accepted_key[ex]))
+L$extra_reason <- ifelse(ex,
+                         paste0(D$gbif_match_type[m],
+                                ifelse(is.na(D$match_note[m]), "",
+                                       paste0(": ", D$match_note[m]))),
+                         NA)
+extra_tab <- unique(data.frame(gbif_key = L$accepted_key[ex], canonical = L$accepted_name[ex],
+                               reason = L$extra_reason[ex], stringsAsFactors = FALSE))
+extra_tab <- extra_tab[!duplicated(extra_tab$gbif_key), ]
+
+# Add the extra taxa to the universe
+U <- rbind(cbind(U, universe_status = "gbif_accepted", extra_reason = NA_character_),
+           data.frame(gbif_key = extra_tab$gbif_key,
+                      species = gsub(" ", "_", extra_tab$canonical),
+                      canonical = extra_tab$canonical,
+                      genus = sub(" .*$", "", extra_tab$canonical),
+                      authorship = NA, in_legacy_aug24 = NA, n_ledger_rows = NA,
+                      universe_status = "extra_not_gbif_accepted",
+                      extra_reason = extra_tab$reason,
+                      cluster_id = NA, cluster_size = 1L,
+                      representative_key = extra_tab$gbif_key,
+                      cluster_members = NA, stringsAsFactors = FALSE))
+cat("extra (non-GBIF-accepted) taxa with evidence:", nrow(extra_tab), "\n")
+cat("ledger rows:", nrow(L), " with accepted key:", sum(!is.na(L$accepted_key)), "\n")
+```
+
+## Ant names
+
+Ant names are harmonised by the regular-expression overrides of `ant_name_overrides.csv` (accepted genus, count groups such as *Paratrechina*+*Nylanderia*, exclusions); otherwise a genus that the Catalogue of Life lists as a synonym takes its accepted name. Records count towards partner breadth if they are field attendance or host records.
+
+```{r harmonise_ant_names}
+# --- Ant records and result columns ---
+# Final genus and species, count group and exclusion flag of every ant record
+A <- L$claim_type == "ant_association"
+L$ant_genus_final <- NA_character_
+L$ant_species_final <- NA_character_
+L$ant_count_group <- NA_character_
+L$ant_excluded <- FALSE
+
+# Ant name (expanded where available) without '?' marks
+nm <- ifelse(is.na(L$ant_name_expanded), L$ant_name_verbatim, L$ant_name_expanded)
+nm <- gsub("^\\?|[?]", "", nm)
+nm <- trimws(nm)
+
+# --- Harmonise each ant record ---
+for (i in which(A)) {
+  # Genus as published, when it is one capitalised word
+  g <- L$ant_genus_verbatim[i]
+  out_g <- if (!is.na(g) && grepl("^[A-Z][a-z]+$", g)) g else NA_character_
+
+  # First override whose pattern matches the name
+  hit <- NA
+  for (k in seq_len(nrow(ovr))) if (grepl(ovr$pattern[k], nm[i])) {
+    hit <- k
+    break
+  }
+
+  if (!is.na(hit)) {
+    # Excluded records are skipped and keep no ant genus
+    if (identical(ovr$exclude[hit], "TRUE")) {
+      L$ant_excluded[i] <- TRUE
+      next
+    }
+    if (!is.na(ovr$accepted_genus[hit])) out_g <- ovr$accepted_genus[hit]
+    if (!is.na(ovr$count_group[hit])) L$ant_count_group[i] <- ovr$count_group[hit]
+    if (!is.na(ovr$accepted_name[hit])) L$ant_species_final[i] <- ovr$accepted_name[hit]
+  } else if (!is.na(out_g)) {
+    # No override: a genus that the Catalogue of Life lists as a synonym takes its
+    # accepted name
+    j <- match(out_g, colchk$genus_verbatim)
+    if (!is.na(j) && !is.na(colchk$col_status[j]) && colchk$col_status[j] == "synonym" &&
+        !is.na(colchk$col_accepted[j]))
+      out_g <- colchk$col_accepted[j]
+  }
+  L$ant_genus_final[i] <- out_g
+
+  # Species (without an override name): the genus plus the second word of the name
+  # (parenthesised text removed), unless that word is a placeholder such as sp or aff
+  if (is.na(L$ant_species_final[i]) && !is.na(out_g)) {
+    w <- strsplit(sub("\\s*[(][^)]*[)]", "", nm[i]), "\\s+")[[1]]
+    ep <- if (length(w) >= 2) w[2] else NA
+    if (!is.na(ep) && grepl("^[a-z-]{3,}$", ep) &&
+        !ep %in% c("sp", "spp", "nr", "aff", "group", "indet"))
+      L$ant_species_final[i] <- paste(out_g, ep)
+  }
+
+  # Count group: that of the override, else the genus
+  if (is.na(L$ant_count_group[i])) L$ant_count_group[i] <- out_g
+}
+
+# --- Partner breadth ---
+# Records without an ant genus are excluded
+L$ant_excluded[A & is.na(L$ant_genus_final)] <- TRUE
+
+# Records that count towards partner breadth: field attendance or host records
+qual_kinds <- c("attended-by-larvae", "host-of-obligate-myrmecophile",
+                "host-of-parasitic-larvae", "visitor-of-facultative-myrmecophile",
+                "trophobiont-tending")
+L$ant_qualifies <- A & L$association_kind %in% qual_kinds & !L$ant_excluded &
+  !is.na(L$ant_genus_final)
+cat("ant rows:", sum(A), " qualifying for breadth:", sum(L$ant_qualifies), "\n")
+print(table(L$association_kind[A], L$ant_qualifies[A]))
+```
+
+## Interaction class of each source record
+
+Each source's verbatim category is translated into a class. Each record also receives an evidence rank (an observation of the species, a review or compilation, or the coding of Schär et al. 2018) and the year of its source, which break ties between classes; records that only repeat another source are excluded.
+
+```{r classify_source_records}
+# classes: n none | f facultative | o obligate (mutualist/parasite unspecified) |
+#          m obligate mutualist | p obligate parasite | a ant-associated unspecified
+
+# --- Class of one record ---
+# val(): the first captured group of `pat` in `x`
+val <- function(x, pat) sub(pat, "\\1", x)
+
+# cls_of(): class of one record, from its source id `src` and its verbatim reported
+# value `v`; NA when the category does not translate to a class
+cls_of <- function(src, v) {
+  # gap-hunt sources (gh_*) carry the class directly as 'class = n|f|m|p|o'
+  if (grepl("^class = [nfmpo]$", v)) return(sub("^class = ", "", v))
+  switch(src,
+    # Degree of myrmecophily: 0 n | 1, 2, 3 f | 4 m | 5, 5* p | 4/5* o
+    eastwood1999 = {
+      g <- val(v, "^degree of myrmecophily = (.*)$")
+      if (g == "0") "n" else
+      if (g %in% c("1", "2", "3")) "f" else
+      if (g == "4") "m" else
+      if (g %in% c("5", "5*")) "p" else
+      if (g == "4/5*") "o" else NA_character_
+    },
+
+    # Degree of myrmecophily without any '(T)': 0 n | 1, 2, 3, 1/2, 2/3 f | 4 o
+    fiedler1991 = {
+      g <- sub("\\s*\\(T\\)", "", val(v, "^degree of myrmecophily = (.*)$"))
+      dig <- sub("^[(]?([0-9](/[0-9])?).*$", "\\1", g)
+      if (!grepl("^[0-9](/[0-9])?$", dig)) NA_character_ else
+      if (dig == "0") "n" else
+      if (dig %in% c("1", "2", "3", "1/2", "2/3")) "f" else
+      if (dig == "4") "o" else NA_character_
+    },
+
+    # Status of myrmecophily: 0 n | 1, 2, 3, 1/2, 2/3, 1/3 f | 4 o
+    fiedler1995 = {
+      g <- val(v, "^status of myrmecophily = (.*)$")
+      dig <- sub("^[\\[]?([0-9](/[0-9])?).*$", "\\1", g)
+      if (!grepl("^[0-9](/[0-9])?$", dig)) NA_character_ else
+      if (dig == "0") "n" else
+      if (dig %in% c("1", "2", "3", "1/2", "2/3", "1/3")) "f" else
+      if (dig == "4") "o" else NA_character_
+    },
+
+    # '= 1' in the value gives o, anything else f
+    fiedler2021 = if (grepl("= 1", v)) "o" else "f",
+
+    # Ant association N, F or O gives n, f or o
+    heath2003 = {
+      g <- sub("^ant-association = ([NFO?]).*$", "\\1", v)
+      c(N = "n", F = "f", O = "o")[g]
+    },
+
+    # Ant association OM o | FM f | MX n | DD no class
+    sujitha2024 = {
+      g <- sub("^ant association = (OM|FM|MX|DD).*$", "\\1", v)
+      c(OM = "o", FM = "f", MX = "n", DD = NA)[g]
+    },
+
+    # Interaction type p, m or f
+    fiedler2012 = sub("^interaction type = ([pmf]):.*$", "\\1", v),
+
+    # Parasite reviews: every record is class p
+    pierce1995 = "p",
+    boyle2015 = "p",
+
+    # Association type: facultative f | obligate parasite p | other obligate m
+    fiedler2006 = {
+      g <- sub("^association type = ", "", v)
+      if (grepl("^fac", g)) "f" else
+      if (grepl("^obl, par", g)) "p" else
+      if (grepl("^obl", g)) "m" else NA_character_
+    },
+
+    # Any other source has no class
+    NA_character_)
+}
+
+# --- Class of each record ---
+catrows <- which(L$claim_type == "interaction_category" & L$source_id != "schar2018")
+L$class <- NA_character_
+L$class[catrows] <- unname(mapply(cls_of, L$source_id[catrows],
+                                  L$reported_value_verbatim[catrows]))
+
+# Sujitha et al. (2024) MX records are stored as non_association rows
+mx <- L$source_id == "sujitha2024" & L$claim_type == "non_association"
+L$class[mx] <- "n"
+
+# --- Schaer et al. (2018) ---
+# Combine type m/p/n with ant specialisation per species
+sch <- L[L$source_id == "schar2018" & !is.na(L$accepted_key), ]
+type_v <- sch[sch$claim_type == "interaction_category",
+              c("evidence_id", "accepted_key", "species_as_published",
+                "reported_value_verbatim")]
+type_v$type <- sub("^type of ant association = ", "", type_v$reported_value_verbatim)
+spec_v <- sch[sch$claim_type == "ant_specialisation",
+              c("species_as_published", "reported_value_verbatim")]
+spec_v$spec <- sub("^ant specialisation = ", "", spec_v$reported_value_verbatim)
+type_v$spec <- spec_v$spec[match(type_v$species_as_published, spec_v$species_as_published)]
+
+# p and n are kept; m becomes m (specialisation 1), f (specialisation 0) or a (otherwise)
+type_v$class <- ifelse(
+  type_v$type == "p", "p",
+  ifelse(type_v$type == "n", "n",
+         ifelse(type_v$type == "m" & type_v$spec == "1", "m",
+                ifelse(type_v$type == "m" & type_v$spec == "0", "f",
+                       ifelse(type_v$type == "m", "a", NA)))))
+L$class[match(type_v$evidence_id, L$evidence_id)] <- type_v$class
+
+# --- Directness and independence ---
+# directness: parenthesised, bracketed or '*' scores are presumed from relatives
+presumed <- L$evidence_kind == "inferred-from-relatives"
+L$basis <- ifelse(is.na(L$class), NA, ifelse(presumed, "presumed", "direct"))
+
+# Sujitha rows that merely repeat Fiedler (2021) are not independent
+L$independent <- !(L$source_id == "sujitha2024" &
+                     grepl("Fiedler \\(2021\\)", L$primary_reference_cited))
+
+# --- Evidence rank and year (tie-break between classes) ---
+# 1 an observation of the species, 2 a review or compilation, 3 the broad coding of Schaer et
+# al. (2018); within a rank, the more recent source wins (year in the source id)
+L$evidence_rank <- ifelse(L$evidence_kind %in% "observation-this-species", 1L,
+                   ifelse(L$source_id == "schar2018", 3L, 2L))
+L$source_year <- ifelse(grepl("[12][0-9]{3}", L$source_id),
+                        as.integer(sub("^.*?([12][0-9]{3}).*$", "\\1", L$source_id)), NA_integer_)
+
+# --- Use of each record ---
+# full: decides; weak: decides only when a species has no full record (R2, R4, R8);
+# excluded: not used for the interaction type. Records that only repeat another source are
+# excluded; use notes start empty
+L$record_use <- ifelse(L$independent, "full", "excluded")
+L$use_note <- NA_character_
+```
+
+## Record rules
+
+Rules R1-R4, R7, R8 and R13 exclude particular records or mark them as weak. Weak records (doubtful scores, Schär's 'n' and regurgitation-only parasite records) decide a species only when it has no other usable record. The ledger with these marks is written as the evidence ledger.
+
+```{r apply_record_rules}
+# --- R1 same-author supersession ---
+# Fiedler (2021) re-scored obligate vs facultative with explicit criteria; where it covers
+# a species it replaces Fiedler 1991/1995/2006.
+has21 <- unique(L$accepted_key[L$source_id == "fiedler2021" & !is.na(L$class)])
+r1 <- L$source_id %in% c("fiedler1991", "fiedler1995", "fiedler2006") &
+  L$accepted_key %in% has21 & !is.na(L$class)
+L$record_use[r1] <- "excluded"
+L$use_note[r1] <- "R1 superseded by Fiedler 2021"
+
+# --- R7 derivative records ---
+# Fiedler (2021) rows whose only cited source is Eastwood & Fraser (1999) repeat
+# Eastwood's records WITHOUT Eastwood's own quality screen (aberrant X, erroneous [E] and
+# non-attendance N records included). For species that Eastwood scored, Eastwood's degree
+# decides; the derivative rows are excluded and count for breadth only if the same ant
+# genus is a qualifying Eastwood record.
+eastwood_sp <- unique(L$accepted_key[L$source_id == "eastwood1999" & !is.na(L$class)])
+only_east <- L$source_id == "fiedler2021" & !is.na(L$primary_reference_cited) &
+  vapply(strsplit(L$primary_reference_cited, ",\\s*"),
+         function(z) length(z) > 0 && all(grepl("Eastwood", z)), TRUE)
+r7 <- only_east & L$accepted_key %in% eastwood_sp
+L$use_note[r7] <- "R7 derivative of Eastwood & Fraser 1999 (Eastwood's screen decides)"
+L$record_use[r7 & !is.na(L$class)] <- "excluded"
+east_q <- paste(L$accepted_key, L$ant_genus_final)[L$source_id == "eastwood1999" &
+                                                     L$ant_qualifies]
+L$ant_qualifies[r7 & L$claim_type == "ant_association" &
+                  !(paste(L$accepted_key, L$ant_genus_final) %in% east_q)] <- FALSE
+cat("R7 rows:", sum(r7), "\n")
+
+# --- R8 regurgitation-only Pierce records ---
+# Pierce (1995) rows that rest on ant regurgitations (AR, trophallaxis) alone are weak
+# parasite evidence unless Fiedler (2012) also names the species as a parasite (Fiedler's
+# later, restrictive definition).
+f12_p <- unique(L$accepted_key[L$source_id == "fiedler2012" & L$class %in% "p"])
+r8 <- L$source_id == "pierce1995" & L$claim_type == "interaction_category" &
+  grepl("AR=x", L$reported_value_verbatim) & !grepl("AB=", L$reported_value_verbatim) &
+  !(L$accepted_key %in% f12_p)
+r8 <- r8 & L$record_use != "excluded"
+L$record_use[r8] <- "weak"
+L$use_note[r8] <- "R8 AR-only (trophallaxis) record, not listed by Fiedler 2012 (weak)"
+
+# --- R2 doubtful scores ---
+# Fiedler (1991, 1995) scores with '?' in the printed degree are weak
+r2 <- L$source_id %in% c("fiedler1991", "fiedler1995") & !is.na(L$class) &
+  L$record_use != "excluded" & grepl("[?]", L$reported_value_verbatim)
+L$record_use[r2] <- "weak"
+L$use_note[r2] <- "R2 doubtful score (weak)"
+
+# --- R3 unreviewed name matches ---
+# Low-confidence name matches (genus-transfer or spelling suggestions) do not feed the
+# table
+r3 <- !is.na(L$name_confidence) & grepl("^low", L$name_confidence)
+L$record_use[r3] <- "excluded"
+L$use_note[r3] <- "R3 name match unreviewed (low confidence)"
+L$ant_qualifies[r3] <- FALSE
+
+# --- R13 iNaturalist records ---
+# Records without research grade (identification pending) are leads only
+r13 <- L$source_id == "inat_ant_butterfly" & L$confidence %in% "low"
+L$record_use[r13] <- "excluded"
+L$use_note[r13] <- "R13 iNaturalist needs_id record (lead only)"
+L$ant_qualifies[r13] <- FALSE
+
+# --- R4 Schaer 'n' ---
+# 'n' (not ant associated) is contradicted by observation-based facultative records for
+# many species: weak (a hint, not a refutation)
+r4 <- L$source_id == "schar2018" & L$class %in% "n" & L$record_use != "excluded"
+L$record_use[r4] <- "weak"
+L$use_note[r4] <- "R4 Schaer 'n' (weak)"
+
+# --- Evidence ledger ---
+print(table(L$source_id, L$class, useNA = "a"))
+print(table(L$record_use[!is.na(L$class)]))
+write_table(L, file.path(dir_data_intermediate, "evidence_ledger.csv"))
+cat("wrote evidence_ledger.csv\n")
+```
+
+## Species-level traits
+
+The usable records of each species decide its interaction type (rules R6-R10 and the parasitic-genus rules), and its qualifying ant records give the associated ants and partner breadth. Carnivory comes from Schär et al. (2018), Heath & Claassens (2003), Eastwood & Fraser (1999) parasites and the parasite reviews of Pierce (1995) and Boyle et al. (2015).
+
+```{r aggregate_to_species}
+# --- Source citations and parasitic genera ---
+# Short citation of each source
+short <- setNames(S$short_citation, S$source_id)
+PG <- read_chr(decision_file("parasitic_genera.csv"))
+
+# Parasitic-genus rules use the genus of the representative name, except that a cluster
+# containing an Orachrysops name is not parasitic (Orachrysops larvae are not ant
+# parasites; Fiedler 2012, section 4.1.1). pg_genus() returns that genus for GBIF key `k`.
+pg_genus <- function(k) {
+  i <- match(k, U$gbif_key)
+  g <- sub(" .*$", "", U$canonical[i])
+  if (!is.na(U$cluster_members[i]) && grepl("Orachrysops", U$cluster_members[i]))
+    "Orachrysops" else g
+}
+
+# Curated species decisions, applied in the next section
+DEC <- read_chr(decision_file("species_decisions.csv"))
+
+# --- Species to summarise ---
+# Species with ledger evidence, and every cluster representative in a parasitic genus
+keys <- unique(c(na.omit(L$accepted_key),
+                 U$gbif_key[vapply(U$gbif_key, pg_genus, "") %in% PG$genus &
+                              U$gbif_key == U$representative_key]))
+rows <- vector("list", length(keys))
+
+# --- One row of traits per species ---
+for (ki in seq_along(keys)) {
+  k <- keys[ki]
+
+  # --- Class records ---
+  # Direct records decide; records presumed from relatives are used only when there is no
+  # direct record. Excluded records are ignored, and weak records are used only when no full
+  # record remains.
+  R <- L[!is.na(L$accepted_key) & L$accepted_key == k, ]
+  cat_ev <- R[!is.na(R$class) & R$record_use != "excluded", ]
+  dir <- cat_ev[cat_ev$basis == "direct", ]
+  pre <- cat_ev[cat_ev$basis == "presumed", ]
+  use_all <- if (nrow(dir)) dir else pre
+  basis <- if (nrow(dir)) "direct" else if (nrow(pre)) "presumed_relatives" else
+    NA_character_
+  use <- if (any(use_all$record_use == "full")) use_all[use_all$record_use == "full", ] else
+    use_all
+
+  # --- Sources of each class ---
+  # R6: documented field attendance by ants is positive evidence of association. Each
+  # source that records qualifying ants for the species but gave no class adds one
+  # 'associated' vote.
+  qa <- R[R$ant_qualifies, ]
+  cls_src <- unique(use_all$source_id)
+  a_src <- setdiff(unique(qa$source_id[qa$source_id %in% names(short)]), cls_src)
+  tie_cols <- c("source_id", "evidence_rank", "source_year")
+  att <- qa[qa$source_id %in% a_src, tie_cols]
+
+  # Records supporting n, f (the attendance votes count only without an obligate class) and
+  # obligate (o, m, p)
+  obl_cl <- c("o", "m", "p")
+  support <- function(x, cl) x[x$class %in% cl, tie_cols]
+  sup <- list(n = support(use, "n"),
+              f = rbind(support(use, "f"), if (!nrow(support(use, obl_cl))) att),
+              obl = support(use, obl_cl))
+
+  # Associated votes: class 'a' records plus the attendance votes
+  n_a <- length(unique(use$source_id[use$class %in% "a"])) + length(a_src)
+
+  # pick(): the class with the most independent sources; a tie goes to the class whose best
+  # record has the lower evidence rank and then the more recent source; NA if still tied
+  pick <- function(s) {
+    n <- vapply(s, function(z) length(unique(z$source_id)), integer(1))
+    top <- names(n)[n == max(n) & n > 0]
+    if (length(top) > 1L) {
+      best <- vapply(s[top], function(z) {
+        min(z$evidence_rank * 1e4 - ifelse(is.na(z$source_year), 0, z$source_year))
+      }, numeric(1))
+      top <- top[best == min(best)]
+    }
+    if (length(top) == 1L) top else NA_character_
+  }
+
+  # --- Interaction type ---
+  # Type and note start empty, status as 'missing' and the conflict flag FALSE
+  it <- NA_character_
+  status <- "missing"
+  conflict <- FALSE
+  detail <- NA_character_
+  if (sum(vapply(sup, nrow, integer(1))) > 0) {
+    grp <- pick(sup)
+
+    # Conflict: the usable records (weak ones included) name more than one of n, f and
+    # obligate
+    present <- unique(c(ifelse(use_all$class %in% obl_cl, "obl", use_all$class),
+                        if (nrow(att) && !any(use_all$class %in% obl_cl)) "f"))
+    present <- intersect(present, c("n", "f", "obl"))
+    if (is.na(grp)) {
+      status <- "conflict_unresolved"
+      conflict <- TRUE
+    } else {
+      conflict <- length(present) > 1L
+      if (grp == "n") it <- "n" else if (grp == "f") it <- "f" else {
+        # Subtype: the same rule between m and p; a parasite subtype needs a full parasite
+        # record (weak ones alone, e.g. a lone trophallaxis record, do not make a parasite)
+        sp <- support(use[use$record_use == "full", ], "p")
+        sm <- support(use, "m")
+
+        # Parasite and mutualist records among the usable ones (weak included) are a conflict
+        if (any(use_all$class %in% "p") && any(use_all$class %in% "m")) conflict <- TRUE
+        if (nrow(sp) && nrow(sm)) {
+          conflict <- TRUE
+          it <- unname(c(p = "p", m = "m")[pick(list(p = sp, m = sm))])
+        } else if (nrow(sp)) it <- "p" else if (nrow(sm)) it <- "m" else {
+          # obligate, mutualist/parasite not specified
+          gen <- pg_genus(k)
+          if (gen %in% PG$genus) {
+            it <- "p"
+            detail <- "obligate; parasite assumed from genus (parasitic_genera.csv)"
+          } else {
+            it <- "m"
+            detail <-
+              "obligate; mutualist assumed (no parasitism recorded for this species or genus)"
+          }
+          basis <- if (basis == "direct") "direct_class_inferred_subtype" else basis
+        }
+      }
+      status <- if (is.na(it)) "conflict_unresolved" else
+        if (conflict) "resolved_conflict" else
+          if (length(unique(use_all$source_id)) >= 2) "agreed" else
+            "single_source"
+    }
+  } else if (n_a > 0) {
+    it <- NA
+    status <- "associated_unspecified"
+    basis <- "direct"
+  }
+
+  # --- Types resting on attendance records only ---
+  # a type that rests only on field ant-attendance records (R6 'a' votes) is direct
+  # evidence
+  if (!is.na(it) && is.na(basis)) {
+    basis <- "direct"
+    detail <- paste(na.omit(c(detail, "type from field ant-attendance records only (R6)")),
+                    collapse = "; ")
+
+    # R6b: a bare attendance record shows association, not facultativeness. In a
+    # documented parasitic genus the species is presumed parasitic (never 'f' for e.g.
+    # Lepidochrysops, Thestor)
+    if (identical(it, "f") && pg_genus(k) %in% PG$genus) {
+      it <- "p"
+      basis <- "presumed_relatives"
+      status <- "presumed_genus_level"
+      detail <-
+        "R6b attendance-only record in a parasitic genus (parasitic_genera.csv): parasite presumed"
+    }
+
+    # R6d: otherwise the class stays empty (no rule-based default); ants and breadth are
+    # kept
+    if (identical(it, "f") && identical(basis, "direct")) {
+      it <- NA_character_
+      basis <- NA_character_
+      status <- "associated_unspecified"
+      detail <- "attendance records only (R6): ant-associated, class not established"
+    }
+  }
+
+  # --- Genus-level presumptions ---
+  # genus-level presumption for parasitic genera, only when the species has no category
+  # evidence of its own
+  gen_k <- pg_genus(k)
+  presump <- NA_character_
+  if (is.na(it) && status %in% c("missing", "associated_unspecified") &&
+      gen_k %in% PG$genus) {
+    it <- "p"
+    basis <- "presumed_relatives"
+    status <- "presumed_genus_level"
+    presump <- paste0(PG$confidence[match(gen_k, PG$genus)])
+    detail <- paste("genus-level presumption:", PG$evidence[match(gen_k, PG$genus)])
+  }
+
+  # R10: category evidence that is only presumed from relatives (parenthesised scores,
+  # Heath genus-level 'F(p)') does not outrank a documented genus-wide parasitic habit
+  if (identical(basis, "presumed_relatives") && it %in% c("f", "n") &&
+      gen_k %in% PG$genus) {
+    it <- "p"
+    presump <- PG$confidence[match(gen_k, PG$genus)]
+    status <- "presumed_genus_level"
+    detail <- paste("R10 only presumed (relative-based) scores for a parasitic genus:",
+                    PG$evidence[match(gen_k, PG$genus)])
+    conflict <- FALSE
+  }
+
+  # --- Ants and partner breadth ---
+  Q <- R[R$ant_qualifies, ]
+
+  # R9: non-attendance (Eastwood N, Heath N, Sujitha MX) is a regional observation,
+  # whereas a field attendance record with identified ants is a property of the species. A
+  # species with qualifying attendance records is therefore never typed 'n'; it becomes
+  # 'f' (facultative, weak) and the conflict is flagged.
+  if (identical(it, "n") && nrow(Q) > 0L) {
+    it <- "f"
+    conflict <- TRUE
+    status <- "resolved_conflict"
+    detail <-
+      "R9: attendance recorded by ants (field record) although some regional sources report non-association"
+  }
+
+  # Distinct count groups (partner breadth); ants are the species names, then the genera
+  # without a recorded species as 'Genus sp.'
+  grp <- unique(Q$ant_count_group)
+  sp_list <- unique(na.omit(Q$ant_species_final))
+  gen_only <- setdiff(unique(Q$ant_genus_final), sub(" .*$", "", sp_list))
+  ants <- c(sort(sp_list), if (length(gen_only)) paste(sort(gen_only), "sp."))
+
+  # --- Carnivory ---
+  # Schaer et al. (2018) values, and Heath & Claassens (2003) feeding categories
+  # containing E (1) or not (0)
+  cv <- R[R$claim_type == "carnivory" & R$source_id == "schar2018",
+          "reported_value_verbatim"]
+  cv <- as.integer(sub("^carnivory = ", "", cv))
+  hv <- R[R$claim_type == "carnivory" & R$source_id == "heath2003",
+          "reported_value_verbatim"]
+  hv <- ifelse(grepl("E", sub("^feeding category = ", "", hv)), 1L, 0L)
+  ev_c <- c(cv, hv)
+
+  # Direct parasite records of Eastwood & Fraser (1999) give a carnivory value of 1
+  eastwood_par <- any(R$source_id == "eastwood1999" & R$class %in% "p" & R$basis == "direct")
+  if (eastwood_par) ev_c <- c(ev_c, 1L)
+
+  # Parasite reviews (Pierce 1995, Boyle et al. 2015) give 1; pc_direct: a review record
+  # that cites a primary source
+  pc <- R[R$source_id %in% c("pierce1995", "boyle2015") & R$claim_type == "carnivory", ]
+  pc_direct <- any(pc$evidence_kind %in% "review-citing-primary")
+  if (nrow(pc)) ev_c <- c(ev_c, 1L)
+
+  # Carnivory is 1 when any value is 1 (NA without evidence), with its sources and basis;
+  # the basis is presumed_inferred when a review without a primary source is the only
+  # evidence
+  carn <- if (length(ev_c)) as.integer(any(ev_c == 1L)) else NA_integer_
+  carn_src <- unique(c(if (length(cv)) "schar2018", if (length(hv)) "heath2003",
+                       if (eastwood_par) "eastwood1999",
+                       if (nrow(pc)) unique(pc$source_id)))
+  carn_basis <- if (!length(ev_c)) NA_character_ else
+    if (nrow(pc) && !pc_direct && !length(cv) && !length(hv) && !eastwood_par)
+      "presumed_inferred" else "direct"
+
+  # --- Plant specialisation and wingspan ---
+  # (Schaer et al. 2018, Fiedler 1991)
+  pv <- R[R$claim_type == "plant_specialisation" & R$source_id == "schar2018",
+          "reported_value_verbatim"]
+  fv <- R[R$claim_type == "plant_specialisation" & R$source_id == "fiedler1991",
+          "reported_value_verbatim"]
+  wv <- R[R$claim_type == "wingspan", "reported_value_verbatim"]
+
+  # --- Row of the species ---
+  rows[[ki]] <- data.frame(
+    gbif_key = k,
+    species = U$species[match(k, U$gbif_key)],
+
+    # Interaction type, its basis, status and note, and the sources behind it
+    interaction_type = it,
+    interaction_type_basis = basis,
+    interaction_type_status = status,
+    interaction_type_note = detail,
+    interaction_type_presumption = presump,
+    cite_interaction_type = paste(unique(short[use$source_id]), collapse = "; "),
+    all_class_claims = paste(paste0(short[cat_ev$source_id], ":", cat_ev$class,
+                                    ifelse(cat_ev$basis == "presumed", "(p)", "")),
+                             collapse = " | "),
+
+    # Associated ants and partner breadth
+    n_ant_genera_raw = if (nrow(Q)) length(grp) else NA_integer_,
+    host_breadth = if (nrow(Q)) length(grp) else NA_integer_,
+    host_breadth_n_records = nrow(Q),
+    host_breadth_basis = if (nrow(Q)) "direct" else NA_character_,
+    associated_ants = paste(ants, collapse = "; "),
+    cite_ants = paste(unique(short[Q$source_id]), collapse = "; "),
+
+    # Carnivory, plant specialisation and wingspan
+    carnivory = carn,
+    carnivory_basis = carn_basis,
+    cite_carnivory = paste(unique(short[carn_src]), collapse = "; "),
+    plant_specialisation_schar = if (length(pv))
+      sub("^plant specialisation = ", "", pv[1]) else NA_character_,
+    fiedler1991_host_range = if (length(fv)) fv[1] else NA_character_,
+    wingspan_mm_schar = if (length(wv))
+      sub("^wingspan [(]mm[)] = ", "", wv[1]) else NA_character_,
+
+    # Evidence counts and conflict flag
+    n_ledger_rows = nrow(R),
+    n_sources = length(unique(R$source_id)),
+    conflict_flag = conflict,
+    stringsAsFactors = FALSE)
+}
+T0 <- do.call(rbind, rows)
+```
+
+## Curated species decisions
+
+The species decisions of `species_decisions.csv` override the values derived above.
+
+```{r apply_species_decisions}
+# --- Apply each decision ---
+# A decision replaces the derived value of one variable of one species
+for (i in seq_len(nrow(DEC))) {
+  j <- which(T0$species == DEC$species[i])
+  if (length(j) != 1L) {
+    warning("decision target not found: ", DEC$species[i])
+    next
+  }
+  v <- DEC$variable[i]
+
+  # host_breadth and carnivory are stored as integers
+  T0[[v]][j] <-
+    if (v %in% c("host_breadth", "carnivory")) as.integer(DEC$chosen_value[i]) else
+      DEC$chosen_value[i]
+
+  # An interaction-type decision also sets the status, basis and note
+  if (v == "interaction_type") {
+    T0$interaction_type_status[j] <- "decision_override"
+    T0$interaction_type_basis[j] <- DEC$basis[i]
+    T0$interaction_type_note[j] <- paste0("DECISION: ", DEC$rationale[i])
+  }
+}
+
+# --- Summary ---
+cat("species decisions applied:", nrow(DEC), "\n")
+cat("species with evidence:", nrow(T0), "\n")
+print(table(T0$interaction_type, useNA = "a"))
+print(table(T0$interaction_type_status))
+```
+
+## Full species universe and genus-level rules
+
+The species with evidence are merged into the universe of all accepted species. Cited genus-level statements then fill species without a class. The genus-consensus rule for the interaction type records its values without using them (R11); carnivory is presumed from genus consensus (R12) and for parasites of brood-predator genera (R12b), flagged in `carnivory_basis`.
+
+```{r apply_genus_rules}
+# --- Merge with the species universe ---
+# All universe species (accepted and 'extra' taxa), with the traits of those with evidence
+full <- merge(U[, c("gbif_key", "species", "canonical", "genus", "authorship",
+                    "in_legacy_aug24", "universe_status", "extra_reason", "cluster_id",
+                    "cluster_size", "representative_key", "cluster_members")],
+              T0[, setdiff(names(T0), "species")], by = "gbif_key", all.x = TRUE,
+              sort = FALSE)
+full$is_representative <- full$gbif_key == full$representative_key
+full$gbif_duplicate_of <- ifelse(full$is_representative, NA_character_,
+                                 full$representative_key)
+full$n_ledger_rows[is.na(full$n_ledger_rows)] <- 0
+
+# --- Cited genus-level statements ---
+# The statements of genus_presumptions.csv fill species without a class. In a genus
+# presumed obligate mutualist ('m') they also replace (R6c) an 'f' that rests only on bare
+# attendance records or on relative-based presumed scores.
+GP <- read_chr(decision_file("genus_presumptions.csv"))
+for (j in seq_len(nrow(GP))) {
+  ii <- which(full$is_representative & vapply(full$gbif_key, pg_genus, "") == GP$genus[j] &
+                (is.na(full$interaction_type) |
+                   (GP$class[j] == "m" & full$interaction_type %in% "f" &
+                      (grepl("R6", full$interaction_type_note) |
+                         full$interaction_type_basis %in% "presumed_relatives"))))
+  full$interaction_type[ii] <- GP$class[j]
+  full$interaction_type_basis[ii] <- "presumed_relatives"
+  full$interaction_type_status[ii] <- "presumed_genus_level"
+  full$interaction_type_presumption[ii] <- GP$confidence[j]
+  full$interaction_type_note[ii] <- paste("genus-level presumption:", GP$evidence[j])
+  full$cite_interaction_type[ii] <- short[GP$source_id[j]]
+  cat("genus presumption", GP$genus[j], "->", GP$class[j], ":", length(ii), "species\n")
+}
+
+# Cluster genus: Orachrysops-containing clusters are not Lepidochrysops
+full$genus_c <- vapply(full$gbif_key, pg_genus, "")
+
+# --- R11 genus consensus for the interaction type ---
+# The consensus (a species without any class whose >= 3 directly scored congeners agree
+# >= 80 % on f or m, or >= 5 agree >= 90 % on n) is NOT written to interaction_type; the
+# value it would give is kept for transparency in interaction_type_rule_default.
+full$interaction_type_rule_default <- NA_character_
+full$interaction_type_rule_default_note <- NA_character_
+
+# Per genus of the directly scored representatives: number of species (n), most common
+# class (top), its share and its count (k)
+dirq <- full$is_representative &
+  full$interaction_type_basis %in% c("direct", "direct_class_inferred_subtype") &
+  full$interaction_type %in% c("n", "f", "m", "p")
+cons <- lapply(split(full$interaction_type[dirq], full$genus_c[dirq]), function(z) {
+  tb <- sort(table(z), decreasing = TRUE)
+  c(n = length(z), top = names(tb)[1], share = unname(tb[1]) / length(z), k = unname(tb[1]))
+})
+
+# Species without a class in these genera that meet the consensus thresholds
+fill <- which(full$is_representative & is.na(full$interaction_type) &
+                full$genus_c %in% names(cons))
+nfill <- 0L
+for (i in fill) {
+  cz <- cons[[full$genus_c[i]]]
+  ok_fm <- as.integer(cz["n"]) >= 3L && as.numeric(cz["share"]) >= 0.8 &&
+    cz["top"] %in% c("f", "m")
+  ok_n <- as.integer(cz["n"]) >= 5L && as.numeric(cz["share"]) >= 0.9 && cz["top"] == "n"
+  if (ok_fm || ok_n) {
+    full$interaction_type_rule_default[i] <- cz["top"]
+    full$interaction_type_rule_default_note[i] <- paste0(
+      "R11 genus consensus ", cz["k"], "/", cz["n"], " congeners = ", cz["top"],
+      " (not used)")
+    nfill <- nfill + 1L
+  }
+}
+cat("R11 genus-consensus rule defaults recorded:", nfill, "\n")
+
+# --- R12 genus consensus for carnivory ---
+# Carnivory (0/1) of a genus with >= 3 congeners with direct evidence, >= 90 % agreeing,
+# is presumed for the congeners without a value
+dirc <- full$is_representative & full$carnivory_basis %in% "direct" &
+  full$carnivory %in% c(0, 1)
+consc <- lapply(split(full$carnivory[dirc], full$genus_c[dirc]), function(z) {
+  c(n = length(z), top = as.numeric(mean(z) >= 0.5), share = max(mean(z), 1 - mean(z)),
+    k = sum(z == as.numeric(mean(z) >= 0.5)))
+})
+fillc <- which(full$is_representative & is.na(full$carnivory) &
+                 full$genus_c %in% names(consc))
+ncf <- 0L
+for (i in fillc) {
+  cz <- consc[[full$genus_c[i]]]
+  if (cz["n"] >= 3 && cz["share"] >= 0.9) {
+    full$carnivory[i] <- as.integer(cz["top"])
+    full$carnivory_basis[i] <- "presumed_inferred"
+    full$cite_carnivory[i] <- paste0("genus consensus ", cz["k"], "/", cz["n"],
+                                     " congeners = ", cz["top"])
+    ncf <- ncf + 1L
+  }
+}
+cat("R12 genus-consensus carnivory presumptions added:", ncf, "\n")
+
+# --- R12b brood-predator genera ---
+# In the brood-predator genera (Fiedler 2012, sections 4.1-4.3: older larvae of
+# Lepidochrysops, Acrodipsas, Maculinea/Phengaris, Liphyra/Euliphyra and Thestor feed on
+# ant brood) a species typed 'p' without its own carnivory record is presumed carnivorous.
+bp <- c("Lepidochrysops", "Acrodipsas", "Maculinea", "Phengaris", "Liphyra", "Euliphyra",
+        "Thestor")
+fb <- which(full$is_representative & is.na(full$carnivory) &
+              full$interaction_type %in% "p" &
+              vapply(full$gbif_key, pg_genus, "") %in% bp)
+full$carnivory[fb] <- 1L
+full$carnivory_basis[fb] <- "presumed_inferred"
+full$cite_carnivory[fb] <-
+  "brood-predator genus (Fiedler 2012 sections 4.1-4.3; parasitic_genera.csv)"
+cat("R12b brood-predator carnivory presumptions added:", length(fb), "\n")
+
+# --- Output ---
+# genus_c is a helper column and is dropped before writing
+full$genus_c <- NULL
+write_table(full, file.path(dir_working, "species_traits_core.csv"))
+cat("universe rows:", nrow(full), "\n")
+```
+
+```{r clear_build_species_table, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Tree tips
+
+The tips of the Yumnam & Kodandaramaiah (2025) and Schär et al. (2018) trees are matched to species of the GBIF Backbone snapshot: the binomial parsed from a tip must be an accepted name or a synonym of one accepted species (no orthographic variants or fuzzy matches), and its key is mapped to the representative of its duplicate cluster. The matched tips are used by the phylogenetic rule below; `s04_fit_models` matches the tips in the same way.
+
+*Inputs:* gbif_backbone/ snapshot; taxonomy/riodinid_genera.csv; working table species_clusters.csv; the two trees.  
+*Output:* working table tree_tips.csv (one row per tip and tree).
+
+`match_tree_tips()` (`code/R/phylogeny.R`) matches the tips of one tree; it is applied to both trees.
+
+```{r match_tree_tips}
+# --- Inputs ---
+# GBIF Backbone snapshot (without the riodinid genera) and the representative key of each
+# accepted key
+snapshot <- read_backbone_snapshot(dir_data_raw)
+CL <- read_chr(file.path(dir_working, "species_clusters.csv"))
+representative_of <- setNames(CL$representative_key, CL$key)
+
+# --- Tips of both trees ---
+tips <- do.call(rbind, lapply(names(tree_files), function(study) {
+  match_tree_tips(read_published_tree(tree_files[[study]]), study, snapshot, representative_of)
+}))
+write_table(tips, file.path(dir_working, "tree_tips.csv"))
+
+# Tips matched to a species on each tree
+print(table(tips$study, tips$matched))
+```
+
+```{r clear_match_tree_tips, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Phylogenetic rule defaults
+
+For tree species without an interaction type, rule R14 records the class (f or m) shared by at least three of the four nearest directly scored tips when the fourth lies within the median leave-one-out distance, using only trees on which the rule's leave-one-out accuracy is at least 0.88. Like R11, these values fill `interaction_type_rule_default` only.
+
+*Inputs:* working tables tree_tips.csv and species_traits_core.csv; the two trees.  
+*Output:* working table species_traits_with_r14.csv.
+
+```{r add_phylogenetic_defaults}
+# --- Matched tips and species table ---
+# Tips matched to a species (one tip per species)
+cw <- read_chr(file.path(dir_working, "tree_tips.csv"))
+cw <- cw[cw$matched == "TRUE", ]
+tr <- read.csv(file.path(dir_working, "species_traits_core.csv"),
+               colClasses = "character", check.names = FALSE)
+
+# Class of each directly scored representative species
+direct <- tr$interaction_type_basis %in% c("direct", "direct_class_inferred_subtype") &
+  tr$interaction_type %in% c("n", "f", "m", "p") & tr$gbif_key == tr$representative_key
+cls <- setNames(tr$interaction_type[direct], tr$gbif_key[direct])
+pred_all <- list()
+loo_all <- list()
+
+# --- Nearest-tip rule on each tree ---
+for (s in names(tree_files)) {
+  tre <- read_published_tree(tree_files[[s]])
+
+  # One tip per representative species
+  z <- cw[cw$study == s & cw$tree_tip_original %in% tre$tip.label, ]
+  z$key <- z$representative_key
+  z <- z[!is.na(z$key) & !duplicated(z$tree_tip_original) & !duplicated(z$key), ]
+  tre <- ape::keep.tip(tre, z$tree_tip_original)
+
+  # Distances between tips, the representative key of each tip and the class of the
+  # directly scored tips
+  D <- ape::cophenetic.phylo(tre)
+  tip_key <- setNames(z$key, z$tree_tip_original)[rownames(D)]
+  has <- tip_key %in% names(cls)
+  tipcls <- ifelse(has, cls[tip_key], NA)
+
+  # nn(): the (up to) four directly scored tips nearest to tip i, with their indices,
+  # distances and classes
+  nn <- function(i) {
+    cand <- which(has)
+    cand <- cand[cand != i]
+    o <- cand[order(D[i, cand])][seq_len(min(4, length(cand)))]
+    list(idx = o, d = D[i, o], cl = tipcls[o])
+  }
+
+  # vote(): the majority class of those neighbours, the number agreeing, the distance of
+  # the farthest neighbour (d4) and the number of neighbours
+  vote <- function(r) {
+    tb <- table(r$cl)
+    top <- names(tb)[which.max(tb)]
+    list(cls = top, agree = max(tb), d4 = r$d[length(r$d)], n = length(r$cl))
+  }
+
+  # Leave-one-out on directly scored tips: the 4th-nearest tip must lie within the median
+  # leave-one-out distance, and a tree is used only if the rule's accuracy is >= 0.88.
+  L <- do.call(rbind, lapply(which(has), function(i) {
+    v <- vote(nn(i))
+    data.frame(truth = tipcls[i], pred = v$cls, agree = v$agree, d4 = v$d4, n = v$n)
+  }))
+  L <- L[L$n == 4, ]
+  cap <- quantile(L$d4, 0.5)
+  L$ok <- L$agree >= 3 & L$d4 <= cap & L$pred %in% c("f", "m")
+  acc <- mean(L$truth[L$ok] == L$pred[L$ok])
+  loo_all[[s]] <- data.frame(tree = s, n_loo = nrow(L), n_accepted = sum(L$ok),
+                             accuracy_accepted = acc, d4_cap = cap)
+  if (!is.finite(acc) || acc < 0.88) {
+    cat(s, "not used for predictions (leave-one-out accuracy below 0.88)\n")
+    next
+  }
+
+  # predictions for tips without any type
+  has_type <- tip_key %in%
+    tr$gbif_key[!is.na(tr$interaction_type) & tr$interaction_type != ""]
+  for (i in which(!has_type)) {
+    r <- nn(i)
+    if (length(r$cl) < 4) next
+    v <- vote(r)
+    if (v$agree >= 3 && v$d4 <= cap && v$cls %in% c("f", "m"))
+      pred_all[[length(pred_all) + 1]] <- data.frame(
+        gbif_key = tip_key[i], tree = s, pred = v$cls, agree = v$agree, d4 = v$d4,
+        stringsAsFactors = FALSE)
+  }
+}
+
+# --- Combine the trees ---
+print(do.call(rbind, loo_all), row.names = FALSE)
+P <- do.call(rbind, pred_all)
+stopifnot(!is.null(P))
+
+# species predicted from both trees are kept only if the trees agree
+agg <- do.call(rbind, lapply(split(P, P$gbif_key), function(g) {
+  if (length(unique(g$pred)) > 1) return(NULL)
+  data.frame(gbif_key = g$gbif_key[1], pred = g$pred[1],
+             support = paste0(g$agree, "/4 in ", g$tree, collapse = "; "))
+}))
+cat("phylogenetic rule defaults:", nrow(agg), "\n")
+
+# --- Record the defaults and write the table ---
+# Only species without an interaction type receive a value in interaction_type_rule_default
+j <- match(agg$gbif_key, tr$gbif_key)
+ok <- !is.na(j) & (is.na(tr$interaction_type[j]) | tr$interaction_type[j] == "")
+j <- j[ok]
+a <- agg[ok, ]
+tr$interaction_type_rule_default[j] <- a$pred
+tr$interaction_type_rule_default_note[j] <- paste("R14 phylogeny", a$support, "(not used)")
+write_table(tr, file.path(dir_working, "species_traits_with_r14.csv"))
+cat("R14 values written to interaction_type_rule_default:", length(j), "\n")
+```
+
+```{r clear_add_phylogenetic_defaults, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Wingspan
+
+Wingspan is taken from Schär et al. (2018), then LepTraits 1.0 (Shirey et al. 2022), Afrotropical Butterflies specimen captions, LepTraits forewing length × 2.1 and Wikipedia text, in this order; the representative of a duplicate cluster takes the first value among its members. Remaining species receive the median of their measured congeners, flagged in `wingspan_basis`. This section writes the final species table.
+
+*Inputs:* working table species_traits_with_r14.csv; trait_evidence/wingspan/ leptraits_wingspan.csv, atb_wingspan.csv, wiki_wingspan.csv.  
+*Output:* species_traits.csv (the final species trait table).
+
+```{r add_wingspan}
+# --- Inputs ---
+tr <- read.csv(file.path(dir_working, "species_traits_with_r14.csv"),
+               colClasses = "character", check.names = FALSE)
+read_wingspan <- function(file)
+  read_chr(file.path(dir_data_raw, "trait_evidence", "wingspan", file), na = "NA")
+lt <- read_wingspan("leptraits_wingspan.csv")
+atb <- read_wingspan("atb_wingspan.csv")
+wk <- read_wingspan("wiki_wingspan.csv")
+
+# --- Result vectors ---
+# Wingspan (v), minimum (lo) and maximum (hi) in mm, with their source (src) and basis
+# (bas)
+n <- nrow(tr)
+v <- rep(NA_real_, n)
+lo <- v
+hi <- v
+src <- rep(NA_character_, n)
+bas <- src
+
+# fill(): fills the species still without a value from one source. `keys` match
+# tr$gbif_key; mid, mn and mx are the wingspan, minimum and maximum of the source; s and b
+# are the source and basis labels.
+fill <- function(keys, mid, mn, mx, s, b) {
+  m <- match(tr$gbif_key, keys)
+  ok <- !is.na(m) & is.na(v) & !is.na(mid[m])
+  v[ok] <<- mid[m][ok]
+  lo[ok] <<- mn[m][ok]
+  hi[ok] <<- mx[m][ok]
+  src[ok] <<- s
+  bas[ok] <<- b
+}
+
+# --- Sources in order of precedence ---
+# 1. Schaer et al. (2018)
+sch <- suppressWarnings(as.numeric(tr$wingspan_mm_schar))
+ok <- !is.na(sch)
+v[ok] <- sch[ok]
+lo[ok] <- sch[ok]
+hi[ok] <- sch[ok]
+src[ok] <- "Schaer et al. 2018"
+bas[ok] <- "direct_measure"
+
+# 2. LepTraits 1.0 (Shirey et al. 2022)
+fill(lt$gbif_key,
+     as.numeric(lt$ws_mid_mm), as.numeric(lt$ws_min_mm), as.numeric(lt$ws_max_mm),
+     "LepTraits 1.0 (Shirey et al. 2022)", "direct_measure")
+
+# 3. Afrotropical Butterflies specimen captions
+fill(atb$gbif_key,
+     as.numeric(atb$mid_mm), as.numeric(atb$min_mm), as.numeric(atb$max_mm),
+     "Afrotropical Butterflies 2026 (specimen captions)", "direct_measure")
+
+# 4. LepTraits forewing length x 2.1
+fill(lt$gbif_key,
+     as.numeric(lt$fw_mid_mm) * 2.1, as.numeric(lt$fw_mid_mm) * 2.1,
+     as.numeric(lt$fw_mid_mm) * 2.1,
+     "LepTraits 1.0 forewing length x 2.1", "derived_from_forewing")
+
+# 5. Wikipedia text (forewing lengths are multiplied by 2.1)
+wk <- wk[!duplicated(wk$gbif_key), ]
+mn <- as.numeric(wk$min_mm)
+mx <- as.numeric(wk$max_mm)
+mid <- (mn + mx) / 2
+fw <- wk$kind == "forewing"
+mid[fw] <- mid[fw] * 2.1
+mn[fw] <- mn[fw] * 2.1
+mx[fw] <- mx[fw] * 2.1
+fill(wk$gbif_key, mid, mn, mx, "Wikipedia (text-mined)", "tertiary_text")
+
+# --- Duplicate clusters ---
+# The representative row takes the first available value among its members (in the
+# precedence order above); non-representative rows stay empty.
+isrep <- tr$is_representative != "FALSE"
+for (cl in unique(tr$cluster_id[tr$cluster_size != "1" & !is.na(tr$cluster_id)])) {
+  idx <- which(tr$cluster_id == cl)
+  r <- idx[isrep[idx]]
+  if (length(r) != 1) next
+  if (is.na(v[r])) {
+    j <- idx[!is.na(v[idx])]
+    if (length(j)) {
+      j <- j[1]
+      v[r] <- v[j]
+      lo[r] <- lo[j]
+      hi[r] <- hi[j]
+      src[r] <- src[j]
+      bas[r] <- bas[j]
+    }
+  }
+}
+v[!isrep] <- NA
+lo[!isrep] <- NA
+hi[!isrep] <- NA
+src[!isrep] <- NA
+bas[!isrep] <- NA
+
+# --- Genus median ---
+# Last resort: median of the measured congeners (min/max = their range). Wingspan is
+# strongly conserved within genera, but these values are not measurements.
+meas <- !is.na(v) & isrep
+for (g in unique(tr$genus[isrep & is.na(v)])) {
+  tg <- which(tr$genus == g & isrep)
+  mg <- tg[meas[tg]]
+  ng <- tg[!meas[tg]]
+  if (length(mg) >= 1) {
+    v[ng] <- median(v[mg])
+    lo[ng] <- min(v[mg])
+    hi[ng] <- max(v[mg])
+    src[ng] <- paste0("genus median of ", length(mg), " congeners")
+    bas[ng] <- "imputed_genus_median"
+  }
+}
+
+# --- Output columns ---
+# Values rounded to 0.1 mm and written as text; missing values are empty strings
+tr$wingspan_mm <- ifelse(is.na(v), "", format(round(v, 1), trim = TRUE))
+tr$wingspan_min_mm <- ifelse(is.na(lo), "", format(round(lo, 1), trim = TRUE))
+tr$wingspan_max_mm <- ifelse(is.na(hi), "", format(round(hi, 1), trim = TRUE))
+tr$wingspan_source <- ifelse(is.na(src), "", src)
+tr$wingspan_basis <- ifelse(is.na(bas), "", bas)
+write_table(tr, file.path(dir_data_intermediate, "species_traits.csv"))
+
+# Wingspan coverage of the accepted representatives
+rep <- tr[tr$universe_status == "gbif_accepted" & tr$is_representative != "FALSE", ]
+cat("wingspan coverage (accepted representatives):", sum(rep$wingspan_mm != ""), "of",
+    nrow(rep), "\n")
+print(table(rep$wingspan_source))
+```
+
+```{r clear_add_wingspan, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Comparison with the 2024 compilation
+
+Each species of the 2024 manual compilation is mapped to its current representative key and its interaction type and partner breadth are compared with the rebuilt values; the supplement reports the agreement.
+
+*Inputs:* species_traits.csv, synonym_database.csv, working tables names_2024_to_gbif.csv and species_clusters.csv; legacy_2024/Aug24_final_dataset.csv.  
+*Output:* legacy_comparison.csv (one row per 2024 species).
+
+```{r compare_legacy}
+# --- Inputs ---
+# Rebuilt species table, 2024 compilation and the 2024 names matched to the snapshot
+N <- read_chr(file.path(dir_data_intermediate, "species_traits.csv"), na = c("", "NA"))
+leg <- read_chr(file.path(dir_data_raw, "legacy_2024", "Aug24_final_dataset.csv"),
+                na = c("", "NA"))
+drift <- read_chr(file.path(dir_working, "names_2024_to_gbif.csv"),
+                  na = c("", "NA"))
+leg$accepted_key <- drift$accepted_key[match(leg$species, drift$legacy_name)]
+leg$legacy_match <- drift$match_type[match(leg$species, drift$legacy_name)]
+
+# --- Current key of each 2024 species ---
+# 2024 names without an accepted GBIF key map to the pseudo key of 'extra' taxa. The names
+# are looked up in the synonym database as written and with underscores as spaces.
+dm <- read_chr(file.path(dir_data_intermediate, "synonym_database.csv"))
+nn <- dm$normalised_name[match(gsub("_", " ", leg$species), dm$name_as_published)]
+nn[is.na(nn)] <- dm$normalised_name[match(leg$species[is.na(nn)], dm$name_as_published)]
+legkey_dm <- dm$gbif_accepted_key[match(leg$species, dm$name_as_published)]
+legkey_dm[is.na(legkey_dm)] <-
+  dm$gbif_accepted_key[match(gsub("_", " ", leg$species)[is.na(legkey_dm)],
+                             dm$name_as_published)]
+
+# Synonym-database key, else the snapshot match, else the pseudo key of an extra taxon
+leg$accepted_key <- ifelse(!is.na(legkey_dm), legkey_dm,
+                           ifelse(!is.na(leg$accepted_key), leg$accepted_key,
+                                  ifelse(!is.na(nn), paste0("X:", gsub(" ", "_", nn)), NA)))
+
+# The 2024 values, kept under legacy_ names
+for (m in c("interaction_type", "host_breadth")) leg[[paste0("legacy_", m)]] <- leg[[m]]
+
+# Representative key of the duplicate cluster of each key
+CL <- read_chr(file.path(dir_working, "species_clusters.csv"))
+rk <- setNames(CL$representative_key, CL$key)
+leg$accepted_key <- ifelse(leg$accepted_key %in% names(rk), rk[leg$accepted_key],
+                           leg$accepted_key)
+
+# --- Comparison table ---
+# 2024 species joined to the rebuilt values of their representative key
+cmp <- merge(leg[, c("species", "accepted_key", "legacy_match", "legacy_interaction_type",
+                     "legacy_host_breadth", "associated_ants", "citation")],
+             N[, c("gbif_key", "interaction_type", "interaction_type_basis",
+                   "interaction_type_status", "host_breadth", "host_breadth_basis",
+                   "associated_ants", "all_class_claims", "cite_interaction_type",
+                   "conflict_flag")],
+             by.x = "accepted_key", by.y = "gbif_key", all.x = TRUE,
+             suffixes = c("_legacy", "_new"))
+cmp$legacy_host_breadth <- suppressWarnings(as.integer(cmp$legacy_host_breadth))
+cmp$host_breadth <- suppressWarnings(as.integer(cmp$host_breadth))
+
+# Agreement of the two values: neither, new_only, legacy_only, agree or disagree
+cmp$type_status <- ifelse(
+  is.na(cmp$legacy_interaction_type) & is.na(cmp$interaction_type), "neither",
+  ifelse(is.na(cmp$legacy_interaction_type), "new_only",
+         ifelse(is.na(cmp$interaction_type), "legacy_only",
+                ifelse(cmp$legacy_interaction_type == cmp$interaction_type, "agree",
+                       "disagree"))))
+cmp$breadth_status <- ifelse(
+  is.na(cmp$legacy_host_breadth) & is.na(cmp$host_breadth), "neither",
+  ifelse(is.na(cmp$legacy_host_breadth), "new_only",
+         ifelse(is.na(cmp$host_breadth), "legacy_only",
+                ifelse(cmp$legacy_host_breadth == cmp$host_breadth, "agree",
+                       "disagree"))))
+write_table(cmp, file.path(dir_data_intermediate, "legacy_comparison.csv"))
+
+# --- Summary ---
+cat("Interaction type, 2024 vs rebuilt (2024 species only):\n")
+print(table(legacy = cmp$legacy_interaction_type, new = cmp$interaction_type,
+            useNA = "ifany"))
+cat("\nStatus of type comparison:\n")
+print(table(cmp$type_status))
+cat("\nHost breadth comparison:\n")
+print(table(cmp$breadth_status))
+both <- cmp[cmp$breadth_status %in% c("agree", "disagree"), ]
+cat("breadth equal:", sum(both$breadth_status == "agree"), "of", nrow(both),
+    " | new greater:", sum(both$host_breadth > both$legacy_host_breadth),
+    " | new smaller:", sum(both$host_breadth < both$legacy_host_breadth), "\n")
+```
+
+```{r clear_compare_legacy, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Consistency checks and release table
+
+The ledger and species table are checked for registered sources, locators, unique keys, partner breadth recounted independently from the ledger, ledger support of every class, and biological consistency of classes in parasitic and obligate genera. The public dataset keeps one row per representative species with an evidence-strength tier (strong: an observation of the species or agreement of at least two independent source groups), and the column dictionary documents the full species table.
+
+*Inputs:* evidence_ledger.csv, species_traits.csv; trait_evidence/sources.csv; trait_evidence/decisions/ parasitic_genera.csv, genus_presumptions.csv.  
+*Outputs:* release/species_interaction_dataset.csv, release/column_dictionary.csv.
+
+## Consistency checks
+
+The notebook stops if any check fails.
+
+```{r check_consistency}
+# --- Inputs ---
+L <- read_chr(file.path(dir_data_intermediate, "evidence_ledger.csv"))
+tr <- read_chr(file.path(dir_data_intermediate, "species_traits.csv"))
+S <- read_chr(file.path(dir_data_raw, "trait_evidence", "sources.csv"))
+
+# --- Partner breadth ---
+# host breadth recounted independently from the ledger
+Q <- L[L$ant_qualifies == "TRUE" & !is.na(L$accepted_key), ]
+rc <- tapply(Q$ant_count_group, Q$accepted_key, function(z) length(unique(z)))
+tt <- tr[!is.na(tr$host_breadth), ]
+same_breadth <- as.integer(tt$host_breadth) == as.integer(rc[tt$gbif_key])
+
+# --- Ledger support of every class ---
+# every class is supported by ledger rows, except genus-level presumptions and decisions
+has_val <- !is.na(tr$interaction_type) &
+  !(tr$interaction_type_status %in% c("presumed_genus_level", "presumed_genus_consensus",
+                                      "presumed_phylogeny", "decision_override"))
+
+# --- Classes in parasitic and obligate genera ---
+# An 'f' or 'n' may never rest only on a bare attendance record (R6) or on relative-based
+# presumed scores in a parasitic genus or in a genus presumed obligate mutualist.
+PGg <- read_chr(decision_file("parasitic_genera.csv"))$genus
+GPg <- read_chr(decision_file("genus_presumptions.csv"))
+GPm <- GPg$genus[GPg$class == "m"]
+Tg <- tr[tr$is_representative == "TRUE", ]
+Tg$g <- sub(" .*$", "", Tg$canonical)
+orach <- grepl("Orachrysops", Tg$cluster_members) & !is.na(Tg$cluster_members)
+weak <- Tg$interaction_type %in% c("f", "n") &
+  (grepl("R6", Tg$interaction_type_note) |
+     Tg$interaction_type_basis %in% "presumed_relatives")
+
+# --- Checks ---
+# The notebook stops if any of them fails
+stopifnot(
+  "every ledger source_id is registered in sources.csv" = all(L$source_id %in% S$source_id),
+  "every ledger row has a locator" = !anyNA(L$locator) && all(nzchar(L$locator)),
+  "every ledger row has a species name" = !anyNA(L$species_as_published),
+  "evidence_id unique" = !anyDuplicated(L$evidence_id),
+  "gbif_key unique in species table" = !anyDuplicated(tr$gbif_key),
+  "host_breadth equals independently recounted distinct ant groups" =
+    all(same_breadth, na.rm = TRUE),
+  "host_breadth only for species with qualifying ant records" =
+    all(!is.na(rc[tt$gbif_key])),
+  "interaction_type values have ledger support" =
+    all(as.integer(tr$n_ledger_rows[has_val]) > 0),
+  "no species typed n with qualifying ant records" =
+    sum(tr$interaction_type %in% "n" & !is.na(tr$host_breadth)) == 0,
+  "duplicate GBIF species rows carry no trait values" =
+    all(is.na(tr$interaction_type[!is.na(tr$gbif_duplicate_of)])),
+  "extra (non-GBIF) taxa have a stated reason" =
+    all(!is.na(tr$extra_reason[tr$universe_status != "gbif_accepted"])),
+  "no species of a parasitic genus typed f/n on bare attendance or presumed scores" =
+    !any(weak & Tg$g %in% PGg & !orach),
+  "no species of a genus presumed obligate mutualist typed f/n on bare attendance or presumed scores" =
+    !any(weak & Tg$g %in% GPm),
+  "no Lepidochrysops (outside Orachrysops clusters) typed f/n/m" =
+    !any(Tg$g %in% "Lepidochrysops" & !orach & Tg$interaction_type %in% c("f", "n", "m"),
+         na.rm = TRUE)
+)
+cat("all consistency checks passed\n")
+```
+
+## Release table with evidence strength
+
+The evidence strength of a species' type counts the independent source groups whose direct records agree with it; the public dataset keeps one row per representative species.
+
+```{r write_release_table}
+# --- Inputs ---
+# Species and ledger tables read as text; blank and "NA" are missing
+read_out <- function(f) read.csv(file.path(dir_data_intermediate, f),
+                                 colClasses = "character", check.names = FALSE,
+                                 na.strings = c("", "NA"))
+traits <- read_out("species_traits.csv")
+ledger <- read_out("evidence_ledger.csv")
+release_dir <- file.path(dir_data_intermediate, "release")
+
+# --- Direct class records ---
+# Interaction-category records with a class (n, f, o, m, p), direct basis, not excluded
+# and an accepted key
+C <- ledger[ledger$claim_type == "interaction_category" & !is.na(ledger$class) &
+              ledger$class %in% c("n", "f", "o", "m", "p") & ledger$basis %in% "direct" &
+              !is.na(ledger$accepted_key) & ledger$record_use != "excluded", ]
+
+# Independent source groups: the sources of one author or compilation count once
+s <- C$source_id
+C$grp <- ifelse(
+  grepl("^fiedler", s), "Fiedler",
+  ifelse(grepl("^heath|^gh_heath", s), "Heath",
+         ifelse(grepl("^eastwood|^gh_eastwood|^braby|^gh_braby", s), "Eastwood/Braby",
+                ifelse(grepl("^pierce|^boyle|^gh_pierce", s), "Pierce/Boyle",
+                       ifelse(grepl("^schar", s), "Schaer", s)))))
+
+# Records that observe the species itself
+C$obs <- C$evidence_kind %in% "observation-this-species"
+
+# --- Records that agree with the final class ---
+# Coarse classes: n, f and obligate (m, p, o)
+R <- traits[traits$is_representative == "TRUE", ]
+fin <- setNames(R$interaction_type, R$gbif_key)
+C$final <- fin[C$accepted_key]
+C <- C[!is.na(C$final), ]
+coarse <- c(n = "n", f = "f", m = "obl", p = "obl", o = "obl")
+A <- C[coarse[C$class] == coarse[C$final], ]
+
+# Per species: number of agreeing source groups, and whether any record is an observation
+ev <- do.call(rbind, lapply(split(A, A$accepted_key), function(z)
+  data.frame(gbif_key = z$accepted_key[1], n_groups = length(unique(z$grp)),
+             obs = any(z$obs))))
+R <- merge(R, ev, by = "gbif_key", all.x = TRUE, sort = FALSE)
+
+# --- Evidence strength ---
+# strong: an observation of the species or >= 2 independent source groups agree
+R$evidence_strength <- ifelse(
+  is.na(R$interaction_type), NA_character_,
+  ifelse(R$interaction_type_status %in% "decision_override", "curated_decision",
+         ifelse(grepl("presumed", R$interaction_type_basis),
+                "presumed_by_cited_author_or_genus",
+                ifelse(is.na(R$n_groups), "other_direct",
+                       ifelse(R$obs | R$n_groups >= 2, "strong",
+                              "single_compilation_claim")))))
+
+# --- Release table ---
+# One row per representative species, with the canonical name as species
+keep <- c("gbif_key", "canonical", "genus", "authorship", "cluster_id", "cluster_size",
+          "interaction_type", "interaction_type_basis", "interaction_type_status",
+          "evidence_strength", "cite_interaction_type", "associated_ants", "host_breadth",
+          "cite_ants", "carnivory", "cite_carnivory", "wingspan_mm", "conflict_flag")
+slim <- R[, keep]
+names(slim)[names(slim) == "canonical"] <- "species"
+slim <- slim[order(slim$genus, slim$species), ]
+write_table(slim, file.path(release_dir, "species_interaction_dataset.csv"))
+```
+
+## Dictionary of the full species table
+
+The dictionary describes every column of the species table and marks those kept in the release table; the notebook stops if a column is undocumented.
+
+```{r write_column_dictionary}
+# --- Column descriptions ---
+# One c(column, description) per column of the full species table
+dict <- rbind(
+  # Species and duplicate cluster
+  c("gbif_key", "GBIF Backbone accepted species key (one row per accepted key)"),
+  c("species", "Accepted name with underscore"),
+  c("canonical", "Accepted canonical name"),
+  c("genus", "GBIF genus of the accepted name"),
+  c("authorship", "Name authorship from GBIF"),
+  c("in_legacy_aug24", "TRUE if the species was in the 2024 (legacy) dataset"),
+  c("universe_status", "gbif_accepted or extra (non-GBIF taxon added by name decision)"),
+  c("extra_reason", "Why an extra taxon is in the universe"),
+  c("cluster_id",
+    "Duplicate-species cluster (several GBIF keys for one biological species share an id)"),
+  c("cluster_size", "Number of GBIF keys in the cluster"),
+  c("representative_key", "Key of the cluster's representative row"),
+  c("cluster_members", "All GBIF names in the cluster"),
+
+  # Interaction type
+  c("interaction_type",
+    "n = no/myrmecoxenous, f = facultative, m = obligate mutualist, p = parasite; empty = not typed (no rule-based defaults)"),
+  c("interaction_type_basis",
+    "direct | direct (presumed ...) | curated decision: how the class was reached"),
+  c("interaction_type_status",
+    "agreed | single_source | conflict_unresolved | decision_override"),
+  c("interaction_type_note", "Free-text note on the call"),
+  c("interaction_type_presumption",
+    "Confidence or justification of a presumed class (cited-author genus presumption or genus-consensus counts)"),
+  c("cite_interaction_type", "Sources behind the class"),
+  c("all_class_claims", "Every class claim in the ledger as source:class"),
+
+  # Ants and partner breadth
+  c("n_ant_genera_raw", "Ant genera recorded before qualifying-record filtering"),
+  c("host_breadth", "Number of ant genera with qualifying records"),
+  c("host_breadth_n_records", "Records behind host_breadth"),
+  c("host_breadth_basis", "Basis of host_breadth"),
+  c("associated_ants", "Qualifying ant taxa"),
+  c("cite_ants", "Sources of ant records"),
+
+  # Carnivory, plant specialisation and the wingspan of Schaer et al. 2018
+  c("carnivory",
+    "1 = larvae feed on animal matter (ant brood, hemipterans, ...), 0 = plant feeders; genus-consensus default (R12) where no direct record"),
+  c("carnivory_basis", "direct or rule default (R12/R12b)"),
+  c("cite_carnivory", "Sources of carnivory call"),
+  c("plant_specialisation_schar", "Binary plant specialisation from Schaer et al. 2018"),
+  c("fiedler1991_host_range", "Fiedler 1991 host-plant range"),
+  c("wingspan_mm_schar", "Wingspan from Schaer et al. 2018"),
+
+  # Evidence counts, conflicts and cluster flags
+  c("n_ledger_rows", "Evidence-ledger rows for the species"),
+  c("n_sources", "Distinct sources"),
+  c("conflict_flag", "TRUE if sources disagree"),
+  c("is_representative", "TRUE for the one row per cluster that carries the data"),
+  c("gbif_duplicate_of", "Representative key for non-representative cluster members"),
+
+  # Rule defaults (not part of the dataset)
+  c("interaction_type_rule_default",
+    "Class that the genus-consensus (R11) or phylogeny (R14) rules WOULD give; NOT part of the dataset"),
+  c("interaction_type_rule_default_note", "Which rule and evidence"),
+
+  # Wingspan
+  c("wingspan_mm", "Merged wingspan"),
+  c("wingspan_min_mm", "Minimum"),
+  c("wingspan_max_mm", "Maximum"),
+  c("wingspan_source", "Source of wingspan"),
+  c("wingspan_basis", "direct or imputed"))
+
+# --- Dictionary table ---
+# Marks the columns of the full species table and those kept in the release table
+# (canonical is the species column of the release table)
+dict <- data.frame(column = dict[, 1], description = dict[, 2], stringsAsFactors = FALSE)
+dict$in_full_table <- dict$column %in% names(traits)
+dict$in_release_table <- dict$column %in% names(slim) | (dict$column == "canonical")
+
+# The notebook stops if a column of the species table is undocumented
+missing <- setdiff(names(traits), dict$column)
+if (length(missing)) stop("undocumented columns: ", paste(missing, collapse = ", "))
+write_table(dict, file.path(release_dir, "column_dictionary.csv"))
+cat("release table:", nrow(slim), "species,", sum(!is.na(slim$interaction_type)),
+    "typed; dictionary:", nrow(dict), "columns\n")
+```
+
+```{r clear_write_release_table, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Recording R environment
+
+The R version and packages used to render this notebook are printed below, with the versions of the geospatial libraries (GDAL, PROJ, GEOS) used by `sf` and `terra` when the notebook loaded them.
+
+```{r save_r_environment}
+print(sessionInfo())
+
+# Geospatial libraries bundled with (Windows) or linked by (Linux, macOS) sf and terra
+if ("sf" %in% loadedNamespaces()) print(sf::sf_extSoftVersion())
+if ("terra" %in% loadedNamespaces()) print(terra::gdal(lib = "all"))
+```

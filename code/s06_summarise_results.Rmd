@@ -1,0 +1,2234 @@
+---
+title: "Butterfly-ant interactions 06 - report tables and figures"
+author: "Ondrej Pelanek"
+date: "`r Sys.Date()`"
+knit: resrepo::knit_to_results
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Show the code of every chunk; stop at the first error
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+```
+
+# Script introduction
+
+This is the last of six R Markdown notebooks. It turns the fitted models and checks into the summaries and figures of the report: the robustness table, residual autocorrelation, the counts quoted in the text, the Supporting Information tables, Figures 1-4 and Figures S1, S2 and S4-S8 (Figure S3 is drawn in `s05_check_robustness`).
+
+The inputs are the trait table and evidence ledger of `s01_prepare_traits`, the occurrence records, range metrics and validation tables of `s02_prepare_ranges`, the species tables and Daru range cells of `s03_build_species_tables`, the model tables of `s04_fit_models`, the rarefied-range models of `s05_check_robustness` and the Yumnam & Kodandaramaiah (2025) tree. All outputs are read by the report, which includes the figures from `results/s06_summarise_results/`. A full run takes about 10 min.
+
+# Setup
+
+## Packages
+
+`ggplot2` and `patchwork` draw the figures and `sf` the maps; `ape`, `lme4`, `ragg`, `reformulas`, `rnaturalearth` and `scales` are called with `::`.
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(resrepo)
+library(data.table)
+library(lmerTest)
+library(ggplot2)
+library(patchwork)
+library(sf)
+```
+
+## Variables
+
+The three range measures, the labels of the two species tables in the model tables, and the colours shared by the figures are fixed here.
+
+```{r setup_variables}
+# Range measures: short name -> column of the species table
+measures <- c(area = "range_area", lat = "latitudinal_extent", lon = "longitudinal_extent")
+
+# Labels of the two species tables in the `table` column of the s04 model tables
+main_table <- "MAIN_subtype"
+daru_table <- "MAIN_daru_subtype"
+
+# Colours of the interaction types
+type_colours <- c(n = "#4D4D4D", f = "#0072B2", m = "#E69F00", p = "#CC79A7")
+
+# Sequential palette of the maps (light = low, dark = high)
+magma_colours <- c("#FCFDBF", "#FC8961", "#B73779", "#51127C", "#000004")
+```
+
+## Folders
+
+Earlier results are read from the folders of `s01_prepare_traits` to `s05_check_robustness` and the tree from the versioned raw data; outputs are written to this notebook's folder in the versioned intermediate data. The input and output lists of the sections below give paths relative to these folders (`s01/` to `s05/` for the earlier notebooks).
+
+```{r setup_folders}
+# Raw data and the outputs of s01 to s05
+dir_data_raw <- path_resrepo("data/raw")
+dir_s01 <- path_resrepo("data/intermediate/s01_prepare_traits")
+dir_s02 <- path_resrepo("data/intermediate/s02_prepare_ranges")
+dir_s03 <- path_resrepo("data/intermediate/s03_build_species_tables")
+dir_s04 <- path_resrepo("data/intermediate/s04_fit_models")
+dir_s05 <- path_resrepo("data/intermediate/s05_check_robustness")
+
+# Outputs of this notebook
+dir_data_intermediate <- path_resrepo("data/intermediate/s06_summarise_results")
+dir.create(dir_data_intermediate, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Functions
+
+`write_table()` writes the output tables and `report_figures.R` copies the report figures to `results/`. `models.R` refits the taxonomic mixed models, `geography.R` the presence cells, regional background and spherical GAM, and `projections.R`, `range_metrics.R`, `thinning.R` and `phylogeny.R` provide the grids, range measures, thinning and tree reading of the figures.
+
+```{r load_functions}
+# Output tables and copying of the report figures to results/
+source(here::here("code", "R", "write_table.R"))
+source(here::here("code", "R", "report_figures.R"))
+
+# Refit of the taxonomic mixed models
+source(here::here("code", "R", "models.R"))
+
+# Presence cells, regional background and spherical GAM
+source(here::here("code", "R", "geography.R"))
+
+# Grids, range measures, thinning and tree reading of the figures
+source(here::here("code", "R", "projections.R"))
+source(here::here("code", "R", "range_metrics.R"))
+source(here::here("code", "R", "thinning.R"))
+source(here::here("code", "R", "phylogeny.R"))
+```
+
+The species tables are read in several sections, and every figure is saved in the same way.
+
+```{r define_helpers}
+# Read a species table of s03 as a data frame, with the given key columns read as text and the
+# interaction types as a factor
+read_species_table <- function(file = "species_table.csv", key_columns = "pool_key") {
+  d <- read.csv(file.path(dir_s03, file),
+                na.strings = c("", "NA"),
+                colClasses = setNames(rep("character", length(key_columns)), key_columns))
+  d$interaction_type <- factor(d$interaction_type, levels = c("n", "f", "m", "p"))
+  d
+}
+
+# Save a report figure as a PNG in this notebook's folder; ragg (AGG) renders text identically on
+# every machine, which the base png() device does not. `name` is the file name without the
+# extension; width and height are in inches.
+save_report_figure <- function(plot, name, width, height, dpi = 300) {
+  ggsave(file.path(dir_data_intermediate, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = dpi, bg = "white", device = ragg::agg_png)
+}
+```
+
+The maps of Figures 1, S4, S5 and S6 share three functions: Equal Earth cells become polygons (Figure S6 builds its cells from their ids), the polygons are clipped to land, and each panel is drawn in the same style.
+
+```{r define_map_functions}
+#' Convert equal-area Equal Earth cells to map polygons
+#'
+#' Cells of `cell_km` x `cell_km` in the Equal Earth projection all have the same area on
+#' the ground (unlike longitude-latitude cells, which shrink towards the poles). Cell indices
+#' are those of `equal_area_species_cells()`: the lower-left corner is `cell_x * cell_km` km
+#' east and `cell_y * cell_km` km north in the projection.
+#' @param cells Data frame with integer columns `cell_x` and `cell_y`; other columns are kept.
+#' @param cell_km Cell side in km (the value used to create the indices).
+#' @return sf polygons in the Equal Earth CRS of `global_equal_area_crs()`.
+equal_area_cell_polygons <- function(cells, cell_km = 250) {
+  stopifnot(all(c("cell_x", "cell_y") %in% names(cells)), is.finite(cell_km), cell_km > 0)
+  s <- cell_km * 1000
+
+  # One closed square (five corners, starting at the lower-left one) per cell
+  geometries <- lapply(seq_len(nrow(cells)), function(i) {
+    x0 <- cells$cell_x[i] * s
+    y0 <- cells$cell_y[i] * s
+    sf::st_polygon(list(rbind(c(x0, y0), c(x0 + s, y0), c(x0 + s, y0 + s),
+                              c(x0, y0 + s), c(x0, y0))))
+  })
+  sf::st_sf(cells, geometry = sf::st_sfc(geometries, crs = global_equal_area_crs()))
+}
+
+#' Prepare land and gridded data for publication maps
+#'
+#' The cells are transformed to Equal Earth and clipped to land, so that coastal
+#' cells do not colour the sea. Unoccupied land remains grey and the panel
+#' background supplies the light-blue ocean.
+#' @param cells sf polygons of the 500-km Equal Earth cells (e.g. from
+#'   `equal_area_cell_polygons()`).
+#' @return A list with projected `cells` and `land` layers.
+map_layers <- function(cells) {
+  # Land and cells in the Equal Earth projection
+  target <- global_equal_area_crs()
+  land <- rnaturalearth::ne_countries(scale = "small", returnclass = "sf")
+  land <- sf::st_make_valid(sf::st_transform(land[, "geometry"], target))
+  cells <- sf::st_make_valid(sf::st_transform(cells, target))
+
+  # Unioning first avoids duplicating coastal grid fragments at country borders.
+  clipped <- suppressWarnings(sf::st_intersection(cells, sf::st_union(land)))
+  list(cells = clipped, land = land)
+}
+
+#' Draw one publication map in Equal Earth
+#'
+#' @param layers Output from `map_layers()`.
+#' @param variable Column in `layers$cells` to map.
+#' @param title Legend title.
+#' @param palette Colours of the sequential scale, or low, mid and high colours of a
+#'   diverging scale.
+#' @param trans Scale transformation, usually `identity` or `log10`.
+#' @param midpoint Optional midpoint for a diverging scale.
+#' @param limits Optional limits of the colour scale; values outside them take the end colour.
+#' @param breaks Optional scale breaks; defaults to ggplot2's automatic choice.
+#' @param labels Optional labels for `breaks` (sequential scale only), e.g. to mark a truncated
+#'   end ("≤ 0.5") when values outside `limits` are squished onto it.
+#' @return A ggplot object.
+plot_grid_map <- function(layers, variable, title, palette,
+                          trans = "identity", midpoint = NULL, limits = NULL,
+                          breaks = ggplot2::waiver(), labels = ggplot2::waiver()) {
+  # Cells with a finite value (and a positive one on a log scale)
+  values <- layers$cells[[variable]]
+  keep <- is.finite(values) & (trans != "log10" | values > 0)
+  cells <- layers$cells[keep, , drop = FALSE]
+  cells$value <- cells[[variable]]
+
+  # Colour scale: sequential, or diverging when a midpoint is given
+  scale <- if (is.null(midpoint)) {
+    ggplot2::scale_fill_gradientn(
+      colours = palette,
+      trans = trans, limits = limits, breaks = breaks, labels = labels,
+      oob = scales::squish, name = title,
+      na.value = NA,
+      guide = ggplot2::guide_colourbar(title.position = "top", title.hjust = 0.5,
+                                       barwidth = grid::unit(35, "mm"),
+                                       barheight = grid::unit(3, "mm")))
+  } else {
+    ggplot2::scale_fill_gradient2(
+      low = palette[1], mid = palette[2], high = palette[3],
+      midpoint = midpoint, limits = limits, oob = scales::squish,
+      breaks = breaks, name = title, na.value = NA,
+      guide = ggplot2::guide_colourbar(title.position = "top", title.hjust = 0.5,
+                                       barwidth = grid::unit(35, "mm"),
+                                       barheight = grid::unit(3, "mm")))
+  }
+
+  # Grey land, the cells on top of it, then the country outlines
+  ggplot2::ggplot() +
+    ggplot2::geom_sf(data = layers$land, fill = "grey55", colour = "grey35",
+                     linewidth = 0.08) +
+    ggplot2::geom_sf(data = cells, ggplot2::aes(fill = value), colour = NA) +
+    ggplot2::geom_sf(data = layers$land, fill = NA, colour = "grey25", linewidth = 0.08) +
+
+    # Colour scale, projection and axis labels
+    scale +
+    ggplot2::coord_sf(crs = global_equal_area_crs(), expand = FALSE,
+                      label_axes = list(bottom = "E", left = "N")) +
+    ggplot2::labs(x = NULL, y = NULL) +
+
+    # Minimal theme with a light-blue ocean and a colour bar above the map
+    ggplot2::theme_minimal(base_size = 9) +
+    ggplot2::theme(
+      panel.background = ggplot2::element_rect(fill = "#ADD8E6", colour = NA),
+      panel.grid.major = ggplot2::element_line(colour = "white", linewidth = 0.2),
+      panel.grid.minor = ggplot2::element_blank(),
+
+      legend.position = "top",
+      legend.title = ggplot2::element_text(size = 8),
+      legend.text = ggplot2::element_text(size = 7),
+
+      axis.title = ggplot2::element_text(size = 8),
+      axis.text = ggplot2::element_blank(),
+      axis.ticks = ggplot2::element_blank(),
+
+      plot.margin = ggplot2::margin(2, 3, 2, 3)
+    )
+}
+```
+
+Each section below reads its inputs from disk and ends by removing its objects (in a hidden chunk), so only the objects defined in this setup carry over from one section to the next.
+
+```{r keep_setup_objects}
+# Objects of the setup, kept when each section clears its own objects
+setup_objects <- c(ls(), "setup_objects")
+```
+
+# Main-model summaries and Figure 2
+
+The main models are refitted (they must equal the saved fits) to build the robustness table: the main mixed model beside the spherical GAM, the all-butterfly background, the 80-95 % range-stability subsets, Daru modelled ranges, matched-tip, genus-grafted and genus-level PGLS, the joint phylogenetic spatial model and a wingspan covariate. The section also writes Moran's I of the range-area residuals between species centres within 500 and 1,000 km, the counts quoted in the text, and Figure 2 (species' ranges by interaction type with the model estimates).
+
+*Inputs:* s03/ species_table.csv, species_table_daru.csv, analysis_units.csv, daru_all_species.csv, daru_cells_500km.csv; s04/ main_models.rds, main_contrasts.csv, main_estimated_means.csv, main_metadata.csv, lmm_\*, gam_\*, background_\*, pgls_matched_\*, pgls_grafted_\*, genus_level_pgls.csv, phylo_geography_contrasts.csv, species_centres.csv, presence_500km.csv; s02/ range_metrics.csv, dataset_counts.csv, expert_validation_summary.csv; s01/species_traits.csv  
+*Outputs:* robustness.csv, pgls_metadata.csv, wingspan_coefficients.csv, residual_moran.csv, counts.csv, plot_range_by_interaction_type.png (Figure 2)
+
+```{r read_main_table}
+# Main species table of s03
+d <- read_species_table()
+```
+
+## Main models
+
+The main models are refitted because the robustness rows and residual checks need the fitted objects and their samples; they must equal the saved main models.
+
+```{r refit_main_models}
+# Refit the main models and compare their type contrasts with the saved ones of s04
+fit <- fit_log_range_models(d, measures = measures, breadth_scale = "raw")
+ref <- fread(file.path(dir_s04, "main_contrasts.csv"))
+chk <- merge(as.data.table(fit$contrasts)[, .(measure, predictors, contrast,
+                                              r1 = range_ratio)],
+             ref[, .(measure, predictors, contrast, r2 = range_ratio)],
+             by = c("measure", "predictors", "contrast"))
+stopifnot(nrow(chk) == nrow(ref), max(abs(chk$r1 / chk$r2 - 1)) < 1e-8)
+```
+
+## Robustness table
+
+```{r robustness_table}
+# --- Helpers that put a model table in the robustness-table layout ---
+# Type contrasts of a model table, as "a-b"; n-f is shown as f-n (its ratio and interval
+# inverted). Returns measure, contrast, ratio, lower, upper and p.
+flip <- function(x) {
+  x <- as.data.table(x)[, contrast := gsub(" ", "", contrast)]
+  i <- x$contrast == "n-f"
+  x[i, `:=`(contrast = "f-n",
+            range_ratio = 1 / range_ratio,
+            lo = 1 / ratio_upper,
+            hi = 1 / ratio_lower)]
+  x[!i, `:=`(lo = ratio_lower, hi = ratio_upper)]
+  x[, .(measure, contrast, ratio = range_ratio, lower = lo, upper = hi, p = p.value)]
+}
+
+# Partner-breadth slope of a coefficient table, in the same layout
+slope <- function(x)
+  as.data.table(x)[predictors == "breadth" & term == "partner_breadth_centered",
+                   .(measure, contrast = "breadth", ratio = range_ratio,
+                     lower = ratio_lower, upper = ratio_upper, p = p_value)]
+
+# Read a model table of s04
+read_s04 <- function(file) fread(file.path(dir_s04, file))
+
+# --- Model tables of s04 (c: contrasts, k: coefficients, m: metadata) ---
+# Taxonomic mixed models (the main model, its range-stability subsets and the Daru table)
+lmm_c <- read_s04("lmm_contrasts.csv")
+lmm_k <- read_s04("lmm_coefficients.csv")
+lmm_m <- read_s04("lmm_metadata.csv")
+
+# Spherical GAMs
+gam_c <- read_s04("gam_contrasts.csv")
+gam_k <- read_s04("gam_coefficients.csv")
+gam_m <- read_s04("gam_metadata.csv")
+
+# All-butterfly regional background models
+reg_c <- read_s04("background_contrasts.csv")
+reg_k <- read_s04("background_coefficients.csv")
+reg_m <- read_s04("background_metadata.csv")
+
+# Phylogenetic models: the two trees shown in the report, on matched tips (pg) and on
+# genus-grafted trees (gr)
+report_trees <- c("yumnam_2025", "schar_2018")
+pg_c <- read_s04("pgls_matched_contrasts.csv")
+pg_k <- read_s04("pgls_matched_coefficients.csv")
+pg_m <- read_s04("pgls_matched_metadata.csv")
+gr_c <- read_s04("pgls_grafted_contrasts.csv")
+gr_k <- read_s04("pgls_grafted_coefficients.csv")
+gr_m <- read_s04("pgls_grafted_metadata.csv")
+
+# --- Helpers that assemble the rows of one analysis ---
+# One analysis in the robustness-table layout: its type contrasts and breadth slope, with the
+# sample size and number of parasites. `ct`, `co` and `md` are the contrast, coefficient and
+# metadata tables of the analysis; `n_par` supplies the parasite numbers when the metadata do
+# not record them (a number, or a list with the entries `type` and `breadth`).
+one <- function(label, ct, co, md, n_par = NA_integer_) {
+  # Contrasts and breadth slope
+  r <- rbind(flip(ct[predictors == "type"]), slope(co))
+
+  # Sample size (and parasite number, where recorded) of each model
+  nn <- md[, .(n = n[1],
+               n_parasite_model = if ("n_parasite" %in% names(md)) n_parasite[1]
+                                  else NA_integer_),
+           by = .(measure, predictors)]
+  r[, n := ifelse(contrast == "breadth",
+                  nn$n[match(paste(measure, "breadth"), paste(nn$measure, nn$predictors))],
+                  nn$n[match(paste(measure, "type"), paste(nn$measure, nn$predictors))])]
+
+  # Parasite numbers differ between type and breadth samples; phylogenetic
+  # metadata already records both, while full LMM fits supply them explicitly.
+  pred_key <- ifelse(r$contrast == "breadth", "breadth", "type")
+  np <- nn$n_parasite_model[match(paste(r$measure, pred_key),
+                                  paste(nn$measure, nn$predictors))]
+  fallback <- if (is.list(n_par)) vapply(pred_key, function(k) n_par[[k]], 1L) else
+    rep(n_par, nrow(r))
+  np[is.na(np)] <- fallback[is.na(np)]
+  r[, `:=`(analysis = label, n_parasite = np)]
+  r
+}
+
+# Number of parasites in the range-area type and breadth samples of a fit_log_range_models() fit
+npar <- function(fitobj)
+  list(type = sum(fitobj$model_data$area_type$interaction_type == "p"),
+       breadth = sum(fitobj$model_data$area_breadth$interaction_type == "p"))
+
+# --- Robustness table ---
+# One block of rows per analysis
+robust <- rbind(
+  # Main taxonomic mixed model
+  one("lmm",
+      lmm_c[table == main_table & analysis == "main"],
+      lmm_k[table == main_table & analysis == "main"],
+      lmm_m[table == main_table & analysis == "main"],
+      npar(fit)),
+
+  # Spherical GAM
+  one("spherical_gam",
+      gam_c[table == main_table],
+      gam_k[table == main_table],
+      gam_m[table == main_table]),
+
+  # All-butterfly regional background
+  one("background_500km_butterflies",
+      reg_c[table == main_table & analysis == "regional_background_500_bfly"],
+      reg_k[table == main_table & analysis == "regional_background_500_bfly"],
+      reg_m[table == main_table & analysis == "regional_background_500_bfly"]),
+
+  # Range-stability subsets (80, 90 and 95 %)
+  one("stability_80",
+      lmm_c[table == main_table & analysis == "stability_80"],
+      lmm_k[table == main_table & analysis == "stability_80"],
+      lmm_m[table == main_table & analysis == "stability_80"]),
+  one("stability_90",
+      lmm_c[table == main_table & analysis == "stability_90"],
+      lmm_k[table == main_table & analysis == "stability_90"],
+      lmm_m[table == main_table & analysis == "stability_90"]),
+  one("stability_95",
+      lmm_c[table == main_table & analysis == "stability_95"],
+      lmm_k[table == main_table & analysis == "stability_95"],
+      lmm_m[table == main_table & analysis == "stability_95"]),
+
+  # Daru modelled ranges
+  one("modelled_ranges_daru",
+      lmm_c[table == daru_table & analysis == "main"],
+      lmm_k[table == daru_table & analysis == "main"],
+      lmm_m[table == daru_table & analysis == "main"]),
+
+  # Matched-tip PGLS, one block per tree
+  rbindlist(lapply(report_trees, function(s) {
+    m <- pg_m[table == main_table & study == s]
+    one(paste0("pgls_", s),
+        pg_c[table == main_table & study == s],
+        pg_k[table == main_table & study == s],
+        m,
+        m[measure == "area" & predictors == "type", n_parasite])
+  })),
+
+  # Genus-grafted trees: the main phylogenetic analysis
+  rbindlist(lapply(report_trees, function(s) {
+    m <- gr_m[study == s]
+    one(paste0("pgls_grafted_", s),
+        gr_c[study == s],
+        gr_k[study == s],
+        m,
+        m[measure == "area" & predictors == "type", n_parasite])
+  })),
+  fill = TRUE)
+
+# --- Wingspan covariate ---
+# Wingspan sensitivity: the main models plus log10 wingspan (measured values only; genus-median
+# imputations excluded) as a centred covariate. fit_log_range_models() takes one centred species
+# covariate through its regional-background argument, so log10 wingspan is passed in those
+# columns (same centring, estimated means at the mean, Tukey contrasts as every other row).
+wing_ok <- is.finite(d$wingspan_mm) & d$wingspan_mm > 0 &
+  !d$wingspan_basis %in% "imputed_genus_median"
+dw <- d[wing_ok, ]
+for (m in names(measures)) dw[[paste0("regional_background_", m)]] <- log10(dw$wingspan_mm)
+fit_w <- fit_log_range_models(dw, measures = measures, regional_background = TRUE,
+                              breadth_scale = "raw")
+
+# Coefficient of the covariate, written to its own table
+wing_coef <- as.data.table(fit_w$coefficients)[term == "regional_background_centered"]
+wing_coef[, term := "log10_wingspan_centered"]
+write_table(wing_coef, file.path(dir_data_intermediate, "wingspan_coefficients.csv"))
+
+# Rows of the model with the covariate
+robust <- rbind(robust,
+                one("wingspan_covariate",
+                    as.data.table(fit_w$contrasts),
+                    as.data.table(fit_w$coefficients),
+                    as.data.table(fit_w$metadata),
+                    npar(fit_w)),
+                fill = TRUE)
+
+# --- Genus-level PGLS ---
+# All genera: one unit per genus x interaction type, so n = genus units and n_parasite =
+# parasitic genus units; type contrasts only.
+glv <- read_s04("genus_level_pgls.csv")[dropped == "none" & tree %in% report_trees]
+robust <- rbind(robust,
+                glv[, .(analysis = paste0("pgls_genus_", tree), measure, contrast,
+                        n = n_units, n_parasite = n_p_units, ratio, lower, upper, p)],
+                fill = TRUE)
+
+# --- Joint phylogenetic spatial model ---
+# With all its contrasts
+joint <- read_s04("phylo_geography_contrasts.csv")[model == "phylo_spatial_gam"]
+joint[, contrast := gsub(" ", "", contrast)]
+joint[contrast == "n-f",
+      `:=`(contrast = "f-n", ratio = 1 / ratio, lower = 1 / upper, upper = 1 / lower)]
+robust <- rbind(robust,
+                joint[, .(analysis = paste0("phylo_spatial_", study), measure, contrast,
+                          n, n_parasite, ratio, lower, upper, p)],
+                fill = TRUE)
+
+# --- Parasites of the remaining analyses ---
+# Parasites in the type-model samples whose metadata do not record them: the same sample filter
+# as fit_log_range_models(), checked against the stored sample size. Returns the sample size
+# and the number of parasites of the species table `dd`; `threshold` keeps only species whose
+# range stability for the measure `label` exceeds it.
+sample_parasites <- function(dd, label, threshold = NULL) {
+  if (!is.null(threshold)) {
+    st <- dd[[paste0("asympt_prop_", label)]]
+    dd <- dd[is.finite(st) & st > threshold, , drop = FALSE]
+  }
+
+  # Species with a positive range, a type, a genus and a subfamily
+  r <- dd[[measures[[label]]]]
+  dd <- dd[is.finite(r) & r > 0 & !is.na(dd$interaction_type) & !is.na(dd$genus) &
+             !is.na(dd$subfamily), , drop = FALSE]
+  c(n = nrow(dd), p = sum(dd$interaction_type == "p"))
+}
+
+# Fill the missing parasite numbers of the type contrasts of one analysis in `robust` (by
+# reference), using the species table `dd` behind that analysis
+fill_parasites <- function(label, dd, threshold = NULL) {
+  for (m in names(measures)) {
+    i <- which(robust$analysis == label & robust$measure == m &
+                 robust$contrast != "breadth" & is.na(robust$n_parasite))
+    if (!length(i)) next
+    s <- sample_parasites(dd, m, threshold)
+    stopifnot(all(robust$n[i] == s[["n"]]))
+    set(robust, i, "n_parasite", as.integer(s[["p"]]))
+  }
+}
+
+# Spherical GAM, all-butterfly background, Daru ranges and the stability subsets
+fill_parasites("spherical_gam", d)
+fill_parasites("background_500km_butterflies", d)
+fill_parasites("modelled_ranges_daru", read_species_table("species_table_daru.csv"))
+for (s in c(80, 90, 95)) fill_parasites(paste0("stability_", s), d, s / 100)
+
+# --- Write the tables ---
+setcolorder(robust, c("analysis", "measure", "contrast", "n", "n_parasite"))
+write_table(robust, file.path(dir_data_intermediate, "robustness.csv"))
+
+# Metadata of the phylogenetic models (matched and genus-grafted trees)
+write_table(rbind(cbind(pg_m[table == main_table & study %in% report_trees],
+                        tree_set = "matched"),
+                  gr_m[study %in% report_trees],
+                  fill = TRUE),
+            file.path(dir_data_intermediate, "pgls_metadata.csv"))
+```
+
+## Residual spatial autocorrelation
+
+Moran's I of the range-area type-model residuals between species centres within 500 and 1,000 km is computed for the main model, the model with the all-butterfly background (rebuilt here for its residuals) and the spherical GAM.
+
+```{r residual_moran}
+# --- Species centres and 500-km presence cells ---
+ce <- fread(file.path(dir_s04, "species_centres.csv"),
+            colClasses = c(species = "character"))
+r26 <- read.csv(file.path(dir_s02, "range_metrics.csv"),
+                colClasses = c(pool_key = "character"))
+r26 <- r26[!duplicated(r26$pool_key) & is.finite(r26$range_area), ]
+p5 <- read.csv(file.path(dir_s04, "presence_500km.csv"),
+               colClasses = c(species = "character"))
+p5 <- p5[p5$species %in% r26$pool_key, ]
+
+# --- All-butterfly background, rebuilt for its residuals ---
+# The genus left out of a unit's background is its revised genus as an analysis unit, else its
+# GBIF genus.
+units <- read.csv(file.path(dir_s03, "analysis_units.csv"),
+                  colClasses = c(pool_key = "character"))
+unit_genus <- units$genus[match(r26$pool_key, units$pool_key)]
+bg5 <- butterfly_range_background(
+  p5,
+  setNames(ifelse(is.na(unit_genus), r26$genus, unit_genus), r26$pool_key),
+  fread(file.path(dir_s03, "daru_all_species.csv")),
+  fread(file.path(dir_s03, "daru_cells_500km.csv")),
+  measures = measures)
+
+# Range-area model with the background as a covariate
+db <- d
+for (cc in grep("^regional_background_", names(bg5), value = TRUE))
+  db[[cc]] <- ifelse(is.finite(db$range_area),
+                     bg5[[cc]][match(db$pool_key, bg5$species)],
+                     NA)
+fit_bg <- fit_log_range_models(db, measures = c(area = "range_area"),
+                               regional_background = TRUE, breadth_scale = "raw")
+
+# The f - p range-area ratio must equal that of the saved background model
+r_bg <- as.data.table(fit_bg$contrasts)[predictors == "type" & contrast == "f - p",
+                                        range_ratio]
+r_bg0 <- reg_c[table == main_table & analysis == "regional_background_500_bfly" &
+                 measure == "area" & predictors == "type" & contrast == "f - p",
+               range_ratio]
+stopifnot(abs(r_bg / r_bg0 - 1) < 1e-8)   # same background model as in s04_fit_models
+
+# --- Spherical GAM of range area ---
+dg <- merge(as.data.frame(d), ce, by.x = "pool_key", by.y = "species")
+gam <- fit_species_spatial_gam(dg, "range_area")
+
+# --- Moran's I of the residuals ---
+# Moran's I of the residuals `res` of a model fitted to the units `keys`, between species centres
+# within 500 and 1,000 km. The weights are 1 for pairs of centres at a distance above 0 and up to
+# the cut-off. Returns one row per cut-off.
+moran <- function(label, keys, res) {
+  k <- match(keys, ce$species)
+  ok <- !is.na(k)
+  D <- gc_km(ce$geo_latitude[k[ok]], ce$geo_longitude[k[ok]])
+  rbindlist(lapply(c(500, 1000), function(cut) {
+    m <- ape::Moran.I(res[ok], (D > 0 & D <= cut) * 1)
+    data.table(model = label, distance_km = cut, n = sum(ok), moran_i = m$observed,
+               expected = m$expected, p = m$p.value)
+  }))
+}
+
+# Main model, model with the all-butterfly background, and spherical GAM
+mor <- rbind(
+  moran("lmm", fit$model_data$area_type$pool_key, residuals(fit$models$area_type)),
+  moran("background_500km_butterflies", fit_bg$model_data$area_type$pool_key,
+        residuals(fit_bg$models$area_type)),
+  moran("spherical_gam", gam$data$pool_key, residuals(gam$model)))
+write_table(mor, file.path(dir_data_intermediate, "residual_moran.csv"))
+print(mor)
+```
+
+## Counts quoted in the text
+
+```{r text_counts}
+# --- Tables behind the counts ---
+# Species traits of s01, the main species table, and the samples of the area models
+tr <- fread(file.path(dir_s01, "species_traits.csv"), na.strings = c("", "NA"),
+            colClasses = "character")
+tab <- as.data.table(d)
+typed <- tab[!is.na(interaction_type)]
+md <- as.data.table(fit$model_data$area_type)
+mb <- as.data.table(fit$model_data$area_breadth)
+
+# Record counts, expert validation and range metrics of s02
+dc <- fread(file.path(dir_s02, "dataset_counts.csv"))
+ev <- fread(file.path(dir_s02, "expert_validation_summary.csv"))
+rm26 <- fread(file.path(dir_s02, "range_metrics.csv"), colClasses = c(pool_key = "character"))
+rm26 <- rm26[!duplicated(pool_key)]
+
+# --- Counts ---
+counts <- rbind(
+  # Species and traits of s01
+  data.table(name = "trait_species", value = nrow(tr)),
+  data.table(name = "trait_typed",
+             value = sum(tr$interaction_type %in% c("n", "f", "m", "p"))),
+  data.table(name = "trait_breadth", value = sum(is.finite(as.numeric(tr$host_breadth)))),
+
+  # Analysis units
+  data.table(name = "units", value = nrow(tab)),
+  data.table(name = "units_typed", value = nrow(typed)),
+  data.table(name = paste0("units_typed_", c("n", "f", "m", "p")),
+             value = as.numeric(table(typed$interaction_type)[c("n", "f", "m", "p")])),
+  data.table(name = "units_breadth", value = sum(is.finite(tab$host_breadth))),
+
+  # Occurrence records and units with a range
+  data.table(name = "records_with_coordinates",
+             value = dc[stage == "all_records_with_coordinates", records]),
+  data.table(name = "records_strict", value = dc[stage == "final_strict_plus", records]),
+  data.table(name = "records_introduced_removed",
+             value = dc[stage == "introduced_removed", records]),
+  data.table(name = "units_strict_range_5",
+             value = sum(is.finite(rm26$range_area_strict_plus))),
+  data.table(name = "units_strict_range_10", value = sum(is.finite(tab$range_area))),
+
+  # Samples of the models
+  data.table(name = "model_area_type_total", value = nrow(md)),
+  data.table(name = paste0("model_area_type_", c("n", "f", "m", "p")),
+             value = as.numeric(table(md$interaction_type)[c("n", "f", "m", "p")])),
+  data.table(name = "model_area_breadth_n", value = nrow(mb)),
+  data.table(name = paste0("model_basis_",
+                           c("direct", "direct_class_inferred_subtype",
+                             "presumed_relatives")),
+             value = as.numeric(
+               table(md$interaction_type_basis)[c("direct", "direct_class_inferred_subtype",
+                                                  "presumed_relatives")])),
+  data.table(name = "model_genera", value = uniqueN(md$genus)),
+  data.table(name = "model_wingspan_n", value = nrow(fit_w$model_data$area_type)),
+  data.table(name = "model_genus_revised", value = sum(md$genus != md$genus_gbif, na.rm = TRUE)),
+  data.table(name = "model_subfamilies", value = uniqueN(md$subfamily)),
+
+  # Expert validation and the all-butterfly set
+  data.table(name = "expert_species", value = ev$species),
+  data.table(name = "expert_pearson_strict", value = ev$pearson_log_area_strict_plus),
+  data.table(name = "daru_species",
+             value = nrow(fread(file.path(dir_s03, "daru_all_species.csv")))))
+
+# Missing values (e.g. a type with no species) are counted as zero
+counts[is.na(value), value := 0]
+write_table(counts, file.path(dir_data_intermediate, "counts.csv"))
+print(counts)
+```
+
+## Figure 2
+
+```{r plot_figure_2}
+# Species' observed ranges by interaction type (violins and boxes of the type-model samples) with
+# the model-estimated means and intervals offset beside them. Drawn from the saved main models
+# and their tables, as read by the report (the compact letters depend on the tables' row order
+# and formats).
+
+# --- Saved main models and tables ---
+main_models <- readRDS(file.path(dir_s04, "main_models.rds"))
+estimated_means <- read.csv(file.path(dir_s04, "main_estimated_means.csv"))
+main_contrasts <- read.csv(file.path(dir_s04, "main_contrasts.csv"))
+main_metadata <- read.csv(file.path(dir_s04, "main_metadata.csv"))
+
+# --- Compact letters ---
+# Compact letters of the Tukey-adjusted contrasts: types that share a letter do not differ at
+# p < 0.05, which does not establish that they are equivalent. Returns the letters of each type
+# as a named character vector; `contrasts` and `means` are the contrast and estimated-mean
+# tables of one measure.
+compact_letters <- function(contrasts, means) {
+  # Types from the largest to the smallest estimated mean
+  groups <- as.character(means$interaction_type[order(-means$emmean)])
+
+  # TRUE when the contrast between types a and b is not significant
+  non_significant <- function(a, b) {
+    p <- contrasts$p.value[
+      contrasts$contrast %in% c(paste(a, "-", b), paste(b, "-", a))
+    ]
+    stopifnot(length(p) == 1L, is.finite(p))
+    p >= 0.05
+  }
+
+  # Sets of types in which no pair differs, then the maximal ones, ordered by the rank of
+  # their first type
+  combinations <- unlist(lapply(seq_along(groups), function(k)
+    combn(groups, k, simplify = FALSE)), recursive = FALSE)
+  cliques <- Filter(function(s) length(s) == 1L ||
+    all(combn(s, 2L, function(pair) non_significant(pair[1], pair[2]))),
+    combinations)
+  maximal <- Filter(function(s) !any(vapply(cliques, function(t)
+    length(t) > length(s) && all(s %in% t), logical(1))), cliques)
+  maximal <- maximal[order(vapply(maximal, function(s)
+    min(match(s, groups)), numeric(1)))]
+
+  # One letter per maximal set, added to every type in the set
+  labels <- setNames(rep("", length(groups)), groups)
+  for (i in seq_along(maximal)) labels[maximal[[i]]] <-
+    paste0(labels[maximal[[i]]], letters[i])
+  labels
+}
+
+# --- Panels, one per range measure ---
+titles <- c(area = "Range area (km²)", lat = "Latitudinal extent (km)",
+            lon = "Longitudinal extent (km)")
+type_labels <- c(n = "Non-ant-associated", f = "Facultative", m = "Obligate mutualist",
+                 p = "Obligate parasite")
+panels <- lapply(names(titles), function(measure) {
+  # Observations of the type model, checked against the stored sample size
+  frame <- stats::model.frame(main_models[[paste0(measure, "_type")]])
+  expected_n <- main_metadata$n[main_metadata$measure == measure &
+                                  main_metadata$predictors == "type"]
+  stopifnot(length(expected_n) == 1L, nrow(frame) == expected_n,
+            all(is.finite(frame$log10_range)))
+  raw <- data.frame(type = as.character(frame$interaction_type),
+                    value = 10^frame$log10_range)
+  raw$position <- match(raw$type, names(type_labels))
+
+  # Estimated means and contrasts of the measure; the estimates sit beside each violin
+  em <- estimated_means[estimated_means$measure == measure &
+                          estimated_means$predictors == "type", , drop = FALSE]
+  ct <- main_contrasts[main_contrasts$measure == measure &
+                         main_contrasts$predictors == "type", , drop = FALSE]
+  stopifnot(nrow(em) == 4L, all(em$geometric_lower <= em$geometric_estimate),
+            all(em$geometric_estimate <= em$geometric_upper))
+  type_letters <- compact_letters(ct, em)
+  em$position <- match(em$interaction_type, names(type_labels)) + 0.23
+  em$letter <- unname(type_letters[em$interaction_type])
+  em$letter_y <- em$geometric_upper * 1.55
+
+  # Sample size above each violin
+  n_labels <- do.call(rbind, lapply(names(type_labels), function(type) {
+    values <- raw$value[raw$type == type]
+    data.frame(position = match(type, names(type_labels)),
+               y = max(values) * 1.40, label = paste0("n = ", length(values)))
+  }))
+
+  # scale_y_log10() transforms the observations before the density and box summaries,
+  # so the violin shape and the 1.5-IQR whiskers are calculated on log10 values.
+  ggplot(raw, aes(position, value, group = type, fill = type)) +
+    # Observed ranges: violins with boxes
+    geom_violin(scale = "width", trim = TRUE, width = 0.86, alpha = 0.35, colour = NA) +
+    geom_boxplot(width = 0.15, fill = "white", colour = "grey30",
+                 linewidth = 0.4, outlier.size = 0.55, outlier.alpha = 0.65) +
+
+    # Model estimates with intervals, compact letters and sample sizes
+    geom_errorbar(data = em, aes(x = position, ymin = geometric_lower, ymax = geometric_upper),
+                  inherit.aes = FALSE, width = 0.11, linewidth = 0.55, colour = "black") +
+    geom_point(data = em,
+               aes(x = position, y = geometric_estimate, shape = "Model estimate (95% CI)"),
+               inherit.aes = FALSE, size = 2.1, colour = "black") +
+    geom_text(data = em, aes(x = position, y = letter_y, label = letter),
+              inherit.aes = FALSE, size = 3.6, vjust = 0, colour = "black") +
+    geom_text(data = n_labels, aes(x = position, y = y, label = label),
+              inherit.aes = FALSE, size = 3.0, vjust = 0) +
+
+    # Scales, labels and theme
+    scale_x_continuous(breaks = seq_along(type_labels), labels = unname(type_labels),
+                       limits = c(0.5, 4.55), expand = expansion(mult = 0)) +
+    scale_y_log10(labels = scales::label_number(big.mark = ",",
+                                                scale_cut = scales::cut_short_scale()),
+                  expand = expansion(mult = c(0.035, 0.07))) +
+    scale_fill_manual(values = type_colours, guide = "none") +
+    scale_shape_manual(values = c("Model estimate (95% CI)" = 18), name = NULL) +
+    labs(x = NULL, y = NULL, title = titles[[measure]]) +
+    theme_minimal(base_size = 12.5) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major.x = element_blank(),
+          axis.text.x = element_text(size = 10.5, angle = 30, hjust = 1),
+          axis.text.y = element_text(size = 10.5),
+          plot.title = element_text(size = 12.5, hjust = 0.5),
+          legend.position = "bottom", legend.text = element_text(size = 11),
+          plot.margin = margin(8, 7, 4, 20))
+})
+
+# --- Figure 2 ---
+fig <- wrap_plots(panels, nrow = 1, guides = "collect") +
+  plot_annotation(tag_levels = "A") &
+  theme(plot.tag = element_text(face = "bold", size = 14), legend.position = "bottom")
+save_report_figure(fig, "plot_range_by_interaction_type", 10.6, 4.3)
+```
+
+```{r clear_summarise_main_models, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Interaction-trait maps (Figure 1)
+
+The strict-cleaning records of the analysed units are summarised in 500-km Equal Earth cells: type proportions (cells with at least 10 classified species), mean recorded partner breadth (at least 5 breadth-known associated species) and median range area (at least 10 species with a range). Figure 1 is drawn from the written cell table.
+
+*Inputs:* s03/species_table.csv; s02/records_final.rds  
+*Outputs:* interaction_cells_500km.csv (per cell: classified species, type proportions, mean recorded partner breadth, median range area); plot_interaction_maps.png (Figure 1)
+
+```{r interaction_cells}
+# --- Records of the analysed units ---
+d <- read_species_table()
+tab <- as.data.table(d)
+map_cell_km <- 500
+
+# Unique strict-cleaning coordinates of each analysed unit
+x <- readRDS(file.path(dir_s02, "records_final.rds"))
+x <- unique(x[in_strict_plus == TRUE & !is.na(pool_key) & pool_key %in% tab$pool_key,
+              .(pool_key, decimalLongitude, decimalLatitude)])
+invisible(gc())
+
+# --- Occupied 500-km cells of each unit, with its type and partner breadth ---
+occ <- split(as.data.frame(x[, .(decimalLongitude, decimalLatitude)]), x$pool_key)
+rm(x)
+invisible(gc())
+pres <- equal_area_species_cells(occ, cell_km = map_cell_km)
+pres$interaction_type <- as.character(tab$interaction_type)[match(pres$species, tab$pool_key)]
+pres$host_breadth <- tab$host_breadth[match(pres$species, tab$pool_key)]
+
+# --- Summary of each cell ---
+# Type proportions need at least 10 classified species in a cell (the denominator), and the mean
+# partner breadth at least five associated species with a recorded breadth.
+one_per_cell <- pres[!duplicated(pres[c("species", "cell_id")]), ]
+cells <- do.call(rbind, lapply(split(one_per_cell, one_per_cell$cell_id), function(x) {
+  classified <- !is.na(x$interaction_type) & x$interaction_type %in% c("n", "f", "m", "p")
+  n_classified <- sum(classified)
+  denominator <- if (n_classified >= 10L) n_classified else NA_real_
+  breadth <- x$host_breadth[!is.na(x$interaction_type) & x$interaction_type != "n" &
+                              is.finite(x$host_breadth)]
+  data.frame(
+    # Cell id and mean coordinates of its rows
+    cell_id = x$cell_id[1],
+    decimalLongitude = mean(x$decimalLongitude),
+    decimalLatitude = mean(x$decimalLatitude),
+
+    # Species counts and classification coverage
+    n_total = length(unique(x$species)),
+    n_classified = n_classified,
+    n_breadth_known = length(breadth),
+    coverage = n_classified / length(unique(x$species)),
+
+    # Type proportions among the classified species
+    prop_non_associated = sum(x$interaction_type[classified] == "n") / denominator,
+    prop_facultative = sum(x$interaction_type[classified] == "f") / denominator,
+    prop_mutualist = sum(x$interaction_type[classified] == "m") / denominator,
+    prop_parasitic = sum(x$interaction_type[classified] == "p") / denominator,
+
+    # Mean recorded partner breadth of the associated species
+    mean_partner_breadth = if (length(breadth) >= 5L) mean(breadth) else NA_real_,
+    stringsAsFactors = FALSE)
+}))
+cells <- merge(cells,
+               unique(pres[, c("cell_id", "cell_x", "cell_y",
+                               "cell_longitude", "cell_latitude")]),
+               by = "cell_id")
+
+# --- Median range area ---
+# Median range area of the species with a range estimate (>= 10 unique localities), in cells
+# with >= 10 of them.
+pres$range_area <- tab$range_area[match(pres$species, tab$pool_key)]
+med <- as.data.table(pres)[is.finite(range_area) & range_area > 0,
+                           .(n_range = .N, median_range_area = median(range_area)),
+                           by = cell_id]
+med[n_range < 10, median_range_area := NA]
+cells <- merge(cells, med, by = "cell_id", all.x = TRUE)
+
+# --- Write the cell table ---
+cells_file <- file.path(dir_data_intermediate,
+                        paste0("interaction_cells_", map_cell_km, "km.csv"))
+write_table(cells, cells_file)
+```
+
+## Figure 1
+
+```{r plot_figure_1}
+# Drawn from the written cell table, so the figure shows exactly the published values. Panels
+# A-D show the proportions of the four types on square-root colour scales whose limits span the
+# 1st to 99th percentile of each panel's cells (a common 0-1 scale would leave most cells of the
+# obligate panels in the lightest colours); more extreme cells take the end colour, which the
+# legend marks with "≤" or "≥". Panel E shows the median range area and F the mean recorded
+# ant-genus breadth per associated species.
+cells <- read.csv(cells_file)
+layers <- map_layers(equal_area_cell_polygons(cells, cell_km = 500))
+
+# --- Colour scales of the proportion panels ---
+# Limits: the 1st and 99th percentiles of the cells' proportions, rounded outwards to 0.1
+proportion_limits <- function(x) {
+  x <- x[is.finite(x)]
+  stopifnot(length(x) > 0L, all(x >= 0 & x <= 1))
+  q <- stats::quantile(x, c(0.01, 0.99), names = FALSE)
+
+  # round() guards against floating-point noise before rounding outwards to 0.1
+  c(max(0, floor(round(q[1] * 10, 6)) / 10), min(1, ceiling(round(q[2] * 10, 6)) / 10))
+}
+
+# Breaks and labels for the limits; the end label carries "≤" or "≥" when cells beyond the
+# limit take the end colour. Returns a list with `breaks` and `labels`.
+proportion_breaks <- function(limits, x) {
+  # Intermediate breaks, chosen by the limits
+  inner <- if (limits[1] > 0) c(0.5, 0.7) else
+    if (limits[2] <= 0.2) c(0.025, 0.05, 0.1) else
+    if (limits[2] <= 0.4) c(0.05, 0.1, 0.2) else
+    c(0.1, 0.2, 0.4)
+  breaks <- sort(unique(c(limits[1],
+                          inner[inner > limits[1] & inner < limits[2]],
+                          limits[2])))
+
+  # Labels, marked where cells beyond a limit take the end colour
+  labels <- format(breaks, trim = TRUE, drop0trailing = TRUE)
+  if (min(x, na.rm = TRUE) < limits[1]) labels[1] <- paste("≤", labels[1])
+  if (max(x, na.rm = TRUE) > limits[2])
+    labels[length(labels)] <- paste("≥", labels[length(labels)])
+  list(breaks = breaks, labels = labels)
+}
+
+# --- Panels ---
+# A-D: type proportions; E: median range area; F: mean recorded partner breadth
+variables <- c("prop_non_associated", "prop_facultative", "prop_mutualist",
+               "prop_parasitic", "median_range_area", "mean_partner_breadth")
+titles <- c("Non-ant-associated", "Facultative", "Obligate mutualist",
+            "Obligate parasite", "Median range area (km²)", "Mean recorded ant-genus breadth")
+panels <- lapply(seq_along(variables), function(i) {
+  v <- layers$cells[[variables[i]]]
+  if (i <= 4L) {
+    # Proportions: square-root scale between the 1st and 99th percentiles
+    limits <- proportion_limits(v)
+    scale <- proportion_breaks(limits, v)
+    panel <- plot_grid_map(layers, variables[i], NULL, palette = magma_colours,
+                           trans = "sqrt", limits = limits,
+                           breaks = scale$breaks, labels = scale$labels)
+  } else if (i == 5L) {
+    # Median range area: logarithmic scale
+    breaks <- c(3e5, 1e6, 3e6, 1e7, 3e7)
+    panel <- plot_grid_map(layers, variables[i], NULL,
+                           palette = magma_colours, trans = "log10", breaks = breaks,
+                           labels = scales::label_number(
+                             scale_cut = scales::cut_short_scale())(breaks))
+  } else {
+    # Mean partner breadth: linear scale
+    panel <- plot_grid_map(layers, variables[i], NULL, palette = magma_colours,
+                           breaks = seq(2, 8, by = 2))
+  }
+
+  # Panel title and letter, with a vertical colour bar at the right of each map
+  panel + labs(title = titles[i], tag = LETTERS[i]) +
+    guides(fill = guide_colourbar(barwidth = grid::unit(2.4, "mm"),
+                                  barheight = grid::unit(24, "mm"))) +
+    theme(plot.title = element_text(size = 9.5, hjust = 0.5, margin = margin(b = 2)),
+          plot.tag = element_text(face = "bold", size = 11),
+          legend.position = "right", legend.text = element_text(size = 7.5),
+          legend.margin = margin(0, 0, 0, 0), legend.box.spacing = grid::unit(2, "pt"),
+          plot.margin = margin(2, 3, 2, 3))
+})
+
+# --- Figure 1 ---
+save_report_figure(wrap_plots(panels, ncol = 2), "plot_interaction_maps", 6.9, 5.3)
+cat("cells:", nrow(cells), "\n")
+```
+
+```{r clear_map_interaction_traits, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Breadth and robustness figures (Figures 3, 4 and S8)
+
+Figure 3 draws range against recorded ant genera from the saved breadth models. Figures 4 and S8 show the range-area contrasts of the robustness table plus the rarefied ranges of `s05_check_robustness`.
+
+*Inputs:* s04/main_models.rds, s04/main_metadata.csv; robustness.csv; s05/rarefied_models.csv  
+*Outputs:* plot_range_by_partner_breadth.png, plot_robustness_core_analyses.png, plot_robustness_mutualist_contrasts.png
+
+## Figure 3
+
+```{r plot_figure_3}
+# Points are species, jittered horizontally (fixed seed) so that the many species with one or two
+# recorded genera are visible, with parasites drawn last. Lines and 95% confidence bands are
+# fixed-effect predictions of the additive taxonomic breadth models (common slope, type-specific
+# intercepts). Each type's line is solid where at least five species of that type have that
+# breadth or more, and dashed beyond.
+
+# --- Saved breadth models ---
+models <- readRDS(file.path(dir_s04, "main_models.rds"))
+metadata <- read.csv(file.path(dir_s04, "main_metadata.csv"))
+titles <- c(area = "Range area (km²)", lat = "Latitudinal extent (km)",
+            lon = "Longitudinal extent (km)")
+type_labels <- c(f = "Facultative", m = "Obligate mutualist", p = "Obligate parasite")
+
+# --- Panels, one per range measure ---
+panels <- lapply(names(titles), function(m) {
+  model <- models[[paste0(m, "_breadth")]]
+  mf <- model.frame(model)
+
+  # Recorded ant genera of each species: the centred breadth plus the sample mean (whole numbers)
+  bm <- metadata$partner_breadth_mean[metadata$measure == m &
+                                        metadata$predictors == "breadth"]
+  stopifnot(length(bm) == 1L)
+  breadth <- mf$partner_breadth_centered + bm
+  stopifnot(all(abs(breadth - round(breadth)) < 1e-6))
+
+  # Observations with horizontal jitter; parasites come last, so they are drawn on top
+  dd <- data.frame(host_breadth = round(breadth),
+                   log10_range = mf$log10_range,
+                   interaction_type = factor(as.character(mf$interaction_type),
+                                             levels = c("f", "m", "p")))
+  set.seed(20261012)
+  dd$x <- dd$host_breadth + stats::runif(nrow(dd), -0.18, 0.18)
+  dd <- dd[order(match(dd$interaction_type, c("f", "m", "p"))), ]
+
+  # Fixed-effect predictions of each type over its observed breadths, with 95% bands. The line
+  # is solid up to the largest breadth that at least five species of the type reach or exceed.
+  pr <- do.call(rbind, lapply(levels(dd$interaction_type), function(ty) {
+    obs <- dd$host_breadth[dd$interaction_type == ty]
+    values <- sort(unique(obs))
+    supported <- max(values[vapply(values, function(v) sum(obs >= v) >= 5, TRUE)])
+    grid <- if (diff(range(obs)) == 0) unique(obs) else
+      seq(min(obs), max(obs), length.out = 120)
+    nd <- data.frame(interaction_type = factor(ty, levels = levels(mf$interaction_type)),
+                     partner_breadth_centered = grid - bm)
+    X <- model.matrix(
+      stats::delete.response(stats::terms(reformulas::nobars(stats::formula(model)))), nd)
+    b <- lme4::fixef(model)
+    X <- X[, names(b), drop = FALSE]
+    f <- as.numeric(X %*% b)
+    se <- sqrt(diag(X %*% as.matrix(stats::vcov(model)) %*% t(X)))
+    data.frame(host_breadth = grid, interaction_type = ty, est = 10^f,
+               lo = 10^(f - 1.96 * se), hi = 10^(f + 1.96 * se),
+               part = ifelse(grid <= supported + 1e-9, "solid", "dashed"))
+  }))
+  pr$interaction_type <- factor(pr$interaction_type, levels = c("f", "m", "p"))
+
+  # The dashed part starts where the solid part ends: the last solid point is repeated as dashed
+  joins <- do.call(rbind, lapply(split(pr, pr$interaction_type), function(x) {
+    if (!any(x$part == "dashed")) return(NULL)
+    y <- x[x$part == "solid", ][sum(x$part == "solid"), ]
+    y$part <- "dashed"
+    y
+  }))
+  pr <- rbind(pr, joins)
+
+  # Points, confidence bands and fitted lines
+  ggplot(dd, aes(x, 10^log10_range, colour = interaction_type)) +
+    geom_point(alpha = 0.45, size = 0.8, shape = 16) +
+    geom_ribbon(data = pr[pr$part == "solid", ],
+                aes(host_breadth, ymin = lo, ymax = hi, fill = interaction_type),
+                inherit.aes = FALSE, alpha = 0.12) +
+    geom_line(data = pr, aes(host_breadth, est, colour = interaction_type, linetype = part),
+              inherit.aes = FALSE, linewidth = 0.7) +
+
+    # Scales, labels and theme
+    scale_linetype_manual(values = c(solid = "solid", dashed = "22"), guide = "none") +
+    scale_x_continuous(breaks = c(1, 2, 5, 10, 15)) +
+    scale_y_log10(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+    scale_colour_manual(values = type_colours[c("f", "m", "p")], labels = type_labels,
+                        name = "Interaction type") +
+    scale_fill_manual(values = type_colours[c("f", "m", "p")], guide = "none") +
+    labs(x = "Recorded ant genera", y = titles[[m]]) +
+    theme_minimal(base_size = 13) +
+    theme(panel.grid.minor = element_blank(), axis.text = element_text(size = 12))
+})
+
+# --- Figure 3 ---
+fig <- wrap_plots(panels, nrow = 1, guides = "collect") +
+  plot_annotation(tag_levels = "A") &
+  theme(plot.tag = element_text(face = "bold", size = 14), legend.position = "bottom")
+save_report_figure(fig, "plot_range_by_partner_breadth", 10, 3.8)
+```
+
+## Figures 4 and S8
+
+The rows are the robustness table plus the rarefied ranges (ten random localities per species, 200 draws, taxonomic model). `robustness_forest_plot()` draws the range-area effects of the core analyses; it draws Figure 4 (parasite contrasts and breadth) and Figure S8 (the other contrasts).
+
+```{r define_robustness_forest_plot}
+#' Draw the publication comparison of range-area effects across the core analyses
+#'
+#' One row per analysis, grouped by the alternative explanation it addresses (group labels at
+#' the left). The three phylogenetic analyses are shown on both trees, Yumnam (main) and Schär
+#' (alternative topology), in adjacent rows, and the row labels give the number of species (or
+#' genus-by-type units) and of parasites in the type model. Rows marked * have residuals
+#' without positive spatial autocorrelation (spatial and joint models; Table S6). Interaction
+#' contrasts are range-area ratios on logarithmic axes. The recorded-ant-genus slope is the
+#' percentage change in range area, its estimate and interval transformed together as
+#' 100 * (ratio - 1). Main Figure 4 shows the two parasite contrasts and breadth; Figure S8 the
+#' contrasts involving obligate mutualists and facultative / non-associated, with the same
+#' rows.
+#' @param robustness Data frame with analysis, measure, contrast, n, n_parasite, ratio, lower,
+#'   upper and p columns: the publication robustness table plus the rarefied-range rows
+#'   (analysis "rarefied_k10").
+#' @param contrasts Named panel titles, in panel order; names are contrast keys ("f-p", ...) or
+#'   "breadth".
+#' @param base_size Base text size, in points.
+#' @param shared_axis Use one logarithmic axis for all ratio panels.
+#' @return A patchwork plot. No analyses are fitted and the input is unchanged.
+robustness_forest_plot <- function(
+    robustness,
+    contrasts = c(`f-p` = "Facultative / parasite", `n-p` = "Non-associated / parasite",
+                  breadth = "Per recorded ant genus"),
+    base_size = 11, shared_axis = FALSE) {
+  # --- Rows of the figure ---
+  # Analysis, label and group of each row, in plotting order
+  rows <- data.frame(
+    analysis = c("lmm", "spherical_gam", "pgls_grafted_yumnam_2025", "pgls_grafted_schar_2018",
+                 "phylo_spatial_yumnam_2025", "phylo_spatial_schar_2018",
+                 "pgls_genus_yumnam_2025", "pgls_genus_schar_2018", "rarefied_k10",
+                 "modelled_ranges_daru"),
+    label = c("Taxonomic LMM (main)", "Spatial GAM*", "Species PGLS, Yumnam",
+              "Species PGLS, Schär", "Joint GAM, Yumnam*", "Joint GAM, Schär*",
+              "Genus PGLS, Yumnam", "Genus PGLS, Schär", "Rarefied ranges",
+              "Modelled ranges"),
+    group = c("Reference", "Space", "Phylogeny", "Phylogeny", "Phylogeny\n+ space",
+              "Phylogeny\n+ space", "Genus\nweighting", "Genus\nweighting",
+              "Range\nestimate", "Range\nestimate"))
+
+  # --- Range-area estimates of the plotted analyses ---
+  required <- c("analysis", "measure", "contrast", "n", "n_parasite", "ratio", "lower",
+                "upper", "p")
+  if (!all(required %in% names(robustness)))
+    stop("Robustness table is missing required columns")
+  dat <- as.data.frame(robustness)
+  dat <- dat[dat$measure == "area" & dat$analysis %in% rows$analysis &
+               dat$contrast %in% names(contrasts), , drop = FALSE]
+  if (anyDuplicated(dat[c("analysis", "contrast")]))
+    stop("More than one range-area estimate per analysis and contrast")
+  if (!nrow(dat) || any(!is.finite(as.matrix(dat[c("ratio", "lower", "upper")]))))
+    stop("Range-area effects must have finite estimates and intervals")
+  if (any(dat$lower <= 0 | dat$lower > dat$ratio | dat$ratio > dat$upper))
+    stop("Range-area ratios must be positive with ordered intervals")
+
+  # Row labels carry the type-model sample: species (or genus-by-type units) / parasites.
+  size_rows <- as.data.frame(robustness)
+  size_rows <- size_rows[size_rows$measure == "area" & size_rows$contrast == "f-p", ]
+  sizes <- size_rows[match(rows$analysis, size_rows$analysis), c("n", "n_parasite")]
+  if (any(!is.finite(as.matrix(sizes))))
+    stop("Every row needs its type-model sample size and number of parasites")
+  rows$label <- sprintf("%s  %d/%d", rows$label, as.integer(sizes$n), as.integer(sizes$n_parasite))
+  rows$label <- factor(rows$label, levels = rev(rows$label))
+  rows$group <- factor(rows$group, levels = unique(rows$group))
+
+  # Estimates joined to the rows; filled points are significant at p < 0.05
+  dat <- merge(dat, rows, by = "analysis")
+  dat$significance <- factor(ifelse(dat$p < 0.05, "p < 0.05", "p ≥ 0.05"),
+                             levels = c("p < 0.05", "p ≥ 0.05"))
+
+  # Common range of the ratio axes (used when `shared_axis` is TRUE)
+  ratio_keys <- setdiff(names(contrasts), "breadth")
+  common <- range(c(1, unlist(dat[dat$contrast %in% ratio_keys, c("lower", "upper")])))
+
+  # --- One panel per contrast ---
+  panels <- lapply(seq_along(contrasts), function(i) {
+    # Estimates of this contrast
+    key <- names(contrasts)[i]
+    d <- dat[dat$contrast == key, , drop = FALSE]
+    if (!nrow(d)) stop("No range-area results for contrast ", key)
+
+    # Keep every row (and its group strip) in every panel, also where a contrast is not
+    # estimated
+    missing_rows <- rows[!rows$analysis %in% d$analysis, ]
+    is_breadth <- key == "breadth"
+
+    # Axis: percentage change for breadth, logarithmic ratio axis for the contrasts
+    if (is_breadth) {
+      d[c("estimate", "interval_low", "interval_high")] <-
+        100 * (d[c("ratio", "lower", "upper")] - 1)
+
+      # Limits in steps of 10 percentage points, including 0
+      limits <- c(floor(min(0, d$interval_low) / 10) * 10,
+                  ceiling(max(0, d$interval_high) / 10) * 10)
+      if (diff(limits) == 0) limits[2] <- limits[1] + 10
+      x_scale <- ggplot2::scale_x_continuous(
+        limits = limits, breaks = seq(limits[1], limits[2], by = 10),
+        labels = function(x) paste0(format(x, trim = TRUE), "%"),
+        expand = ggplot2::expansion(mult = 0.04))
+      reference <- 0
+    } else {
+      d$estimate <- d$ratio
+      d$interval_low <- d$lower
+      d$interval_high <- d$upper
+
+      # Limits from this panel or shared by all ratio panels; ticks within them
+      limits <- if (shared_axis) common else range(c(1, d$lower, d$upper))
+      ticks <- c(0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100)
+      ticks <- ticks[ticks >= limits[1] & ticks <= limits[2]]
+      x_scale <- ggplot2::scale_x_log10(limits = limits, breaks = ticks,
+                                        labels = scales::label_number(),
+                                        expand = ggplot2::expansion(mult = 0.06))
+      reference <- 1
+    }
+
+    # Estimates with intervals and a reference line
+    p <- ggplot2::ggplot(d, ggplot2::aes(estimate, label)) +
+      ggplot2::geom_blank(data = missing_rows, ggplot2::aes(y = label),
+                          inherit.aes = FALSE) +
+      ggplot2::geom_vline(xintercept = reference, colour = "grey55", linewidth = 0.3) +
+      ggplot2::geom_errorbar(ggplot2::aes(xmin = interval_low, xmax = interval_high),
+                             width = 0.32, linewidth = 0.35, orientation = "y") +
+      ggplot2::geom_point(ggplot2::aes(fill = significance), shape = 21, size = 2,
+                          stroke = 0.5, show.legend = TRUE) +
+
+      # Fill by significance, axes, and one strip per group of rows
+      ggplot2::scale_fill_manual(values = c(`p < 0.05` = "black", `p ≥ 0.05` = "white"),
+                                 name = NULL, drop = FALSE) +
+      ggplot2::scale_y_discrete() + x_scale +
+      ggplot2::facet_grid(group ~ ., scales = "free_y", space = "free_y", switch = "y") +
+
+      # Labels and theme
+      ggplot2::labs(title = unname(contrasts[i]), tag = LETTERS[i], y = NULL,
+                    x = if (is_breadth) "Increase in range area (95% CI)" else
+                      "Range-area ratio (95% CI)") +
+      ggplot2::theme_minimal(base_size = base_size) +
+      ggplot2::theme(panel.grid.minor = ggplot2::element_blank(),
+                     panel.grid.major.y = ggplot2::element_line(colour = "grey92",
+                                                                linewidth = 0.3),
+                     panel.spacing.y = grid::unit(5, "pt"),
+
+                     strip.placement = "outside",
+                     strip.text.y.left = ggplot2::element_text(angle = 0, hjust = 1,
+                                                               face = "bold",
+                                                               size = base_size * 0.82,
+                                                               colour = "grey30"),
+
+                     plot.title = ggplot2::element_text(size = base_size, hjust = 0.5),
+                     plot.tag = ggplot2::element_text(face = "bold", size = 14),
+                     legend.position = "bottom")
+
+    # Only the first panel keeps the row labels and group strips
+    if (i > 1L) p <- p + ggplot2::theme(axis.text.y = ggplot2::element_blank(),
+                                        strip.text.y.left = ggplot2::element_blank())
+    p
+  })
+  patchwork::wrap_plots(panels, nrow = 1, guides = "collect") &
+    ggplot2::theme(legend.position = "bottom")
+}
+```
+
+```{r plot_figures_4_and_s8}
+# --- Robustness table plus the rarefied ranges ---
+robustness <- read.csv(file.path(dir_data_intermediate, "robustness.csv"))
+rare <- read.csv(file.path(dir_s05, "rarefied_models.csv"))
+rare <- rare[rare$model == "lmm" & rare$sampling == "k10" & rare$ranges == "rarefied", ]
+
+# n-f is shown as facultative / non-associated (f-n): ratio and interval inverted
+flip <- rare$contrast == "n-f"
+rare[flip, c("ratio", "lower", "upper")] <- 1 / rare[flip, c("ratio", "upper", "lower")]
+rare$contrast[flip] <- "f-n"
+rare$analysis <- "rarefied_k10"
+stopifnot(!anyDuplicated(rare[c("measure", "contrast")]),
+          all(c("f-p", "n-p", "breadth") %in% rare$contrast))
+
+# Append the rarefied rows to the robustness table (columns not in both are dropped or NA)
+rare <- rare[intersect(names(robustness), names(rare))]
+for (column in setdiff(names(robustness), names(rare))) rare[[column]] <- NA
+robustness <- rbind(robustness, rare[names(robustness)])
+
+# --- Figure 4: parasite contrasts and breadth ---
+save_report_figure(robustness_forest_plot(robustness), "plot_robustness_core_analyses",
+                   10, 5.8)
+
+# --- Figure S8: the other contrasts, on one shared axis ---
+forest_s8 <- robustness_forest_plot(
+  robustness,
+  contrasts = c(`m-p` = "Mutualist / parasite",
+                `f-m` = "Facultative / mutualist",
+                `n-m` = "Non-associated / mutualist",
+                `f-n` = "Facultative / non-associated"),
+  shared_axis = TRUE)
+save_report_figure(forest_s8, "plot_robustness_mutualist_contrasts", 11, 5.8)
+```
+
+```{r clear_plot_effect_figures, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Supporting Information tables
+
+Evidence basis and attrition by interaction type; type contrasts under four alternative coding decisions; the scale of the evidence ledger and Cohen's kappa against the earlier manual compilation; classification coverage within and outside southern Africa; and the share of obligate species among co-occurring lycaenids.
+
+*Inputs:* s03/ species_table.csv, species_table_daru.csv, species_table_assumed_subtype.csv; s01/ species_traits.csv, evidence_ledger.csv, legacy_comparison.csv; s04/ species_centres.csv, presence_200km.csv  
+*Outputs:* si_evidence_basis.csv, si_attrition.csv, si_alternative_decisions.csv, si_alternative_counts.csv, si_ledger_summary.csv, si_legacy_agreement.csv, si_classification_coverage.csv, si_background_contamination.csv
+
+```{r supplement_inputs}
+# Main species table, with the trait status of each species
+keys <- c("pool_key", "gbif_key")
+d <- read_species_table(key_columns = keys)
+tr <- fread(file.path(dir_s01, "species_traits.csv"), na.strings = c("", "NA"),
+            colClasses = "character")
+d$status <- tr$interaction_type_status[match(d$gbif_key, tr$gbif_key)]
+
+# Sample of the main models: classified species with a positive range, a genus and a subfamily
+md <- d[!is.na(d$interaction_type) & is.finite(d$range_area) & d$range_area > 0 &
+          !is.na(d$genus) & !is.na(d$subfamily), ]
+```
+
+## Evidence basis of the analysed interaction types
+
+```{r si_evidence_basis}
+# Evidence basis of each analysed species: species-specific evidence, a genus-wide presumption
+# stated in a source, or a statement for the species without direct observation
+md$evidence <- ifelse(
+  md$interaction_type_basis %in% c("direct", "direct_class_inferred_subtype"),
+  "Species-specific source evidence",
+  ifelse(md$status %in% "presumed_genus_level",
+         "Genus-wide presumption stated in a source",
+         "Stated for the species in a source (no direct observation)"))
+
+# Species by evidence basis and interaction type, with row totals
+ev <- dcast(as.data.table(md)[, .N, by = .(evidence, interaction_type)],
+            evidence ~ interaction_type, value.var = "N", fill = 0)
+ev[, total := rowSums(.SD), .SDcols = intersect(c("n", "f", "m", "p"), names(ev))]
+write_table(ev, file.path(dir_data_intermediate, "si_evidence_basis.csv"))
+```
+
+## Attrition by interaction type
+
+```{r si_attrition}
+# Species by interaction type at each filtering step: classified, with a range (at least 10
+# localities), in the main model, in the breadth model and with a modelled range
+dd <- read_species_table("species_table_daru.csv", keys)
+att <- rbindlist(lapply(c("n", "f", "m", "p"), function(t) data.table(
+  interaction_type = t,
+  classified = sum(d$interaction_type %in% t),
+  range_10_localities = sum(d$interaction_type %in% t & is.finite(d$range_area)),
+  main_model = sum(md$interaction_type == t),
+  breadth_model = sum(md$interaction_type == t & md$interaction_type != "n" &
+                        is.finite(md$host_breadth)),
+  modelled_range = sum(dd$interaction_type %in% t & is.finite(dd$range_area) &
+                         dd$range_area > 0))))
+write_table(att, file.path(dir_data_intermediate, "si_attrition.csv"))
+```
+
+## Alternative data decisions (main models; area and latitude)
+
+The main models are refitted under four alternative coding decisions.
+
+```{r si_alternative_decisions}
+# --- Refit under an alternative coding ---
+# Refits the area and latitude models on the species table `x` and returns their type contrasts
+# (n-f shown as f-n) and breadth slope with the sample size, labelled by `label`.
+alt_fit <- function(x, label) {
+  x$interaction_type <- factor(x$interaction_type, levels = c("n", "f", "m", "p"))
+  f <- fit_log_range_models(x,
+                            measures = c(area = "range_area", lat = "latitudinal_extent"),
+                            breadth_scale = "raw")
+
+  # Type contrasts, with n-f shown as f-n
+  ct <- as.data.table(f$contrasts)[
+    predictors == "type",
+    .(measure, contrast = gsub(" ", "", contrast), ratio = range_ratio,
+      lower = ratio_lower, upper = ratio_upper, p = p.value)]
+  ct[contrast == "n-f",
+     `:=`(contrast = "f-n", ratio = 1 / ratio, lower = 1 / upper, upper = 1 / lower)]
+
+  # Breadth slope
+  co <- as.data.table(f$coefficients)[
+    predictors == "breadth" & term == "partner_breadth_centered",
+    .(measure, contrast = "breadth", ratio = range_ratio, lower = ratio_lower,
+      upper = ratio_upper, p = p_value)]
+
+  # Sample size of the type model
+  n <- as.data.table(f$metadata)[predictors == "type", .(measure, n)]
+  r <- merge(rbind(ct, co), n, by = "measure")
+  r[, decision := label]
+  r
+}
+
+# --- Alternative species tables ---
+# (1) obligate species whose subtype was assumed rather than documented keep their coded type (the
+#     species table built with the alternative subtype rule)
+assumed <- read_species_table("species_table_assumed_subtype.csv", keys)
+
+# (2) three ant-fed aphnaeines coded as mutualists
+recip <- d
+recip$interaction_type <- as.character(recip$interaction_type)
+recip$interaction_type[recip$species %in% c("Axiocerses_harpax", "Crudaria_capensis",
+                                            "Crudaria_wykehami")] <- "m"
+
+# (3) species-level subtype evidence only: obligate species whose mutualist or parasite subtype
+#     rests on a genus statement or on the source's inference from relatives are left
+#     unclassified
+ledger <- fread(file.path(dir_s01, "evidence_ledger.csv"), colClasses = "character",
+                na.strings = c("", "NA"))
+species_level <- d
+species_level$interaction_type <- as.character(species_level$interaction_type)
+species_level$interaction_type[species_level$interaction_type %in% c("m", "p") &
+                                 !species_level$interaction_type_basis %in% "direct"] <- NA
+
+# (4) Fiedler (2012) definition: classified species that Fiedler lists as ant parasites (any
+#     recorded trophallaxis counts) are coded as parasites
+fiedler_keys <- unique(ledger[source_id == "fiedler2012" &
+                                claim_type == "interaction_category" & class == "p",
+                              accepted_key])
+fiedler <- d
+fiedler$interaction_type <- as.character(fiedler$interaction_type)
+recode <- !is.na(fiedler$interaction_type) &
+  (fiedler$gbif_key %in% fiedler_keys | fiedler$pool_key %in% fiedler_keys)
+fiedler$interaction_type[recode] <- "p"
+cat("species recoded as parasites under Fiedler (2012):", sum(recode & d$interaction_type != "p"),
+    "\n")
+
+# --- Refits under the main and the four alternative codings ---
+alt <- rbind(alt_fit(d, "main"),
+             alt_fit(assumed, "assumed_subtype_as_m"),
+             alt_fit(recip, "ant_fed_aphnaeines_as_m"),
+             alt_fit(species_level, "species_level_subtype_only"),
+             alt_fit(fiedler, "fiedler2012_parasites"))
+write_table(alt, file.path(dir_data_intermediate, "si_alternative_decisions.csv"))
+
+# Parasites and mutualists per decision (type model, area).
+alt_counts <- rbindlist(lapply(
+  list(main = d,
+       assumed_subtype_as_m = assumed,
+       ant_fed_aphnaeines_as_m = recip,
+       species_level_subtype_only = species_level,
+       fiedler2012_parasites = fiedler),
+  function(x) {
+    ok <- !is.na(x$interaction_type) & is.finite(x$range_area) & x$range_area > 0 &
+      !is.na(x$genus) & !is.na(x$subfamily)
+    data.table(n = sum(ok),
+               n_m = sum(ok & x$interaction_type %in% "m"),
+               n_p = sum(ok & x$interaction_type %in% "p"))
+  }),
+  idcol = "decision")
+write_table(alt_counts, file.path(dir_data_intermediate, "si_alternative_counts.csv"))
+```
+
+## Evidence ledger and agreement with the earlier manual compilation
+
+Cohen's kappa compares the interaction types of the species shared with the 2024 compilation.
+
+```{r si_ledger_agreement}
+# Size of the evidence ledger: claims, sources and species
+write_table(data.table(claims = nrow(ledger),
+                       sources = uniqueN(ledger$source_id),
+                       species = uniqueN(ledger$accepted_key[!is.na(ledger$accepted_key)])),
+            file.path(dir_data_intermediate, "si_ledger_summary.csv"))
+
+# Types of the species shared with the 2024 compilation, as a confusion table
+lc <- fread(file.path(dir_s01, "legacy_comparison.csv"), colClasses = "character",
+            na.strings = c("", "NA"))
+lc <- lc[legacy_interaction_type %in% c("n", "f", "m", "p") &
+           interaction_type %in% c("n", "f", "m", "p")]
+agree_tab <- table(factor(lc$legacy_interaction_type, levels = c("n", "f", "m", "p")),
+                   factor(lc$interaction_type, levels = c("n", "f", "m", "p")))
+
+# Cohen's kappa from the observed (po) and the chance (pe) agreement
+po <- sum(diag(agree_tab)) / sum(agree_tab)
+pe <- sum(rowSums(agree_tab) * colSums(agree_tab)) / sum(agree_tab)^2
+write_table(data.table(shared = sum(agree_tab), agree = sum(diag(agree_tab)), share = po,
+                       kappa = (po - pe) / (1 - pe)),
+            file.path(dir_data_intermediate, "si_legacy_agreement.csv"))
+```
+
+## Classification coverage by range size, within and outside southern Africa
+
+Southern Africa follows the region rule of the regional robustness check (centre south of 15 S, between 10 and 55 E).
+
+```{r si_classification_coverage}
+# Centres of the species with a range, and their region (southern Africa: centre south of
+# 15 S and between 10 and 55 E)
+centres <- fread(file.path(dir_s04, "species_centres.csv"),
+                 colClasses = c(species = "character"))
+cov <- d[is.finite(d$range_area) & d$range_area > 0, ]
+la <- centres$geo_latitude[match(cov$pool_key, centres$species)]
+lo <- centres$geo_longitude[match(cov$pool_key, centres$species)]
+cov$region <- ifelse(is.finite(la) & la < -15 & lo > 10 & lo < 55, "southern_Africa", "elsewhere")
+
+# Geometric mean
+gm <- function(x) 10^mean(log10(x))
+
+# By region: species with a range, share classified, geometric-mean range area of the
+# classified and unclassified species, and parasites
+write_table(as.data.table(cov)[,
+              .(n = .N,
+                classified = sum(!is.na(interaction_type)),
+                share_classified = mean(!is.na(interaction_type)),
+                gm_area_classified = gm(range_area[!is.na(interaction_type)]),
+                gm_area_unclassified = gm(range_area[is.na(interaction_type)]),
+                parasites = sum(interaction_type %in% "p")),
+              by = region],
+            file.path(dir_data_intermediate, "si_classification_coverage.csv"))
+```
+
+## Obligate species among co-occurring lycaenids
+
+For each analysed species, the share of the other lycaenid range units in its occupied 200-km cells that are obligate mutualists or parasites (mean over its cells) is summarised by interaction type; a lycaenid background would partly contain the trait under test.
+
+```{r si_background_contamination}
+# Species with a range in their occupied 200-km cells, with their interaction type
+pres <- fread(file.path(dir_s04, "presence_200km.csv"),
+              colClasses = c(species = "character"))[, .(species, cell_id)]
+pres <- pres[species %in% d$pool_key[is.finite(d$range_area)]]
+pres[, type := as.character(d$interaction_type)[match(species, d$pool_key)]]
+
+# Species, obligate species (m or p) and parasites in each cell
+cc <- pres[, .(n_all = .N,
+               n_mp = sum(type %in% c("m", "p")),
+               n_p = sum(type %in% "p")),
+           by = cell_id]
+
+# For each classified species in each of its cells: the other species there (o) and how many of
+# them are obligate (o_mp) or parasites (o_p)
+fc <- merge(pres[type %in% c("n", "f", "m", "p")], cc, by = "cell_id")
+fc[, `:=`(o = n_all - 1,
+          o_mp = n_mp - (type %in% c("m", "p")),
+          o_p = n_p - (type == "p"))]
+
+# Mean share over the cells of each species, then the mean over the species of each type
+cont <- fc[o > 0,
+           .(share_mp = mean(o_mp / o), share_p = mean(o_p / o)),
+           by = .(species, type)][
+  , .(species = .N, share_m_or_p = mean(share_mp), share_p = mean(share_p)), by = type][
+  order(match(type, c("n", "f", "m", "p")))]
+write_table(cont, file.path(dir_data_intermediate, "si_background_contamination.csv"))
+print(alt_counts)
+print(cont)
+```
+
+```{r clear_summarise_supplement_tables, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Expert validation (Figure S1)
+
+Strict occurrence-derived range areas against the expert range polygons of Hausharter et al. (2023).
+
+*Inputs:* s02/expert_validation_species.csv  
+*Outputs:* plot_expert_validation.png; si_expert_validation.csv (n, Pearson r of log10 areas, geometric mean ratio occurrence / expert area)
+
+```{r plot_expert_validation}
+# --- Species with an occurrence-based and an expert range area ---
+ex <- fread(file.path(dir_s02, "expert_validation_species.csv"))
+ex <- ex[is.finite(expert_area) & expert_area > 0 &
+           is.finite(range_area_strict_plus) & range_area_strict_plus > 0]
+r_ex <- cor(log10(ex$expert_area), log10(ex$range_area_strict_plus))
+
+# --- Figure S1 ---
+fig <- ggplot(ex, aes(expert_area, range_area_strict_plus)) +
+  # Line of equality, linear fit with its confidence band, and the species
+  geom_abline(slope = 1, intercept = 0, colour = "grey60", linewidth = 0.3) +
+  geom_smooth(method = "lm", formula = y ~ x, colour = "#0072B2", fill = "#0072B2",
+              alpha = 0.12, linewidth = 0.5) +
+  geom_point(size = 1, alpha = 0.7) +
+
+  # Logarithmic axes
+  scale_x_log10(labels = scales::label_number(big.mark = ",")) +
+  scale_y_log10(labels = scales::label_number(big.mark = ",")) +
+
+  # Sample size and correlation in the top-left corner
+  annotate("text", x = min(ex$expert_area), y = max(ex$range_area_strict_plus),
+           hjust = 0, vjust = 1, size = 3,
+           label = sprintf("n = %d; Pearson r = %.2f (log10)", nrow(ex), r_ex)) +
+
+  # Axis titles and theme
+  labs(x = "Expert range-polygon area (km²)", y = "Occurrence MCP area (km²)") +
+  theme_minimal(base_size = 9) +
+  theme(panel.grid.minor = element_blank())
+save_report_figure(fig, "plot_expert_validation", 4.6, 4.2)
+
+# --- Summary table ---
+# n, Pearson r of the log10 areas, and the geometric mean ratio of occurrence to expert area
+summary_table <- data.table(n = nrow(ex), pearson_log10 = r_ex,
+                            geometric_ratio = 10^mean(log10(ex$range_area_strict_plus) -
+                                                        log10(ex$expert_area)))
+write_table(summary_table, file.path(dir_data_intermediate, "si_expert_validation.csv"))
+print(summary_table)
+```
+
+```{r clear_plot_expert_validation, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Range accumulation example (Figure S2)
+
+Accumulation of latitudinal extent, longitudinal extent and MCP area with the number of thinned localities of *Celastrina argiolus*, using the thinning of `s02_prepare_ranges`. The curves are recomputed on every run.
+
+*Inputs:* s02/records_final.rds, s02/parameters.csv  
+*Outputs:* accumulation_example.csv (the plotted curves); plot_accumulation_example.png
+
+```{r plot_accumulation_example}
+# --- Thinning parameters of s02 ---
+# The thinning of s02_prepare_ranges (same grid, distance and per-species seed), applied to the
+# strict records.
+s02_parameters <- read.csv(file.path(dir_s02, "parameters.csv"), colClasses = "character")
+
+# Numeric value of one parameter of s02
+parameter <- function(name) {
+  v <- s02_parameters$value[s02_parameters$parameter == name]
+  stopifnot(length(v) == 1L)
+  as.numeric(v)
+}
+
+# --- Thinned localities of Celastrina argiolus ---
+# GBIF key of Celastrina argiolus
+key_ca <- "1925918"
+x <- readRDS(file.path(dir_s02, "records_final.rds"))
+x <- as.data.frame(unique(x[in_strict_plus == TRUE & x$pool_key == key_ca,
+                            .(decimalLongitude, decimalLatitude)]))
+invisible(gc())
+cell_km <- parameter("thin_cell_km")
+th <- thin_species(x, global_thinning_grid(cell_km), cell_km = cell_km,
+                   distance_km = parameter("thin_distance_km"),
+                   seed = parameter("thin_seed") + as.numeric(key_ca))
+cat("thinned localities:", nrow(th), "\n")
+
+# --- Accumulation curves ---
+# Each of 1,000 replicates is one random order of the thinned localities, measured on growing
+# prefixes of that order, so the samples are nested as in an accumulation curve. Every sample
+# uses the species' full-range cylindrical equal-area projection and converts longitude at the
+# full range's mid-latitude.
+sizes <- sort(unique(as.integer(c(seq(10, nrow(th), by = 50), nrow(th)))))
+reference_latitude <- mean(range(th$decimalLatitude))
+projection <- species_cea_crs(th$decimalLongitude)
+projected <- project_species_cea(th, projection)
+
+# The random orders (fixed seed)
+set.seed(20240401L)
+orders <- replicate(1000L, sample.int(nrow(projected)), simplify = FALSE)
+
+# Latitudinal extent, longitudinal extent and MCP area (the first three values returned) of every
+# prefix; an array of measures x sample sizes x replicates
+draws <- simplify2array(lapply(orders, function(order) vapply(sizes, function(n) {
+  projected_mcp_extent_area(projected[order[seq_len(n)], , drop = FALSE],
+                            longitude_reference_latitude = reference_latitude,
+                            projection = projection, include_s2_audit = FALSE)[1:3]
+}, numeric(3L))))
+
+# Mean, standard deviation and 95% interval (2.5th and 97.5th percentiles) of each measure at
+# each sample size
+curve <- do.call(rbind, lapply(seq_along(sizes), function(i) {
+  # Measures x replicates
+  values <- draws[, i, ]
+  data.frame(n_records = sizes[i],
+             measure = c("latitudinal_extent", "longitudinal_extent", "range_area"),
+             mean = rowMeans(values),
+             sd = apply(values, 1, stats::sd),
+             lower = apply(values, 1, stats::quantile, probs = 0.025),
+             upper = apply(values, 1, stats::quantile, probs = 0.975),
+             row.names = NULL)
+}))
+curve_file <- file.path(dir_data_intermediate, "accumulation_example.csv")
+write_table(curve, curve_file)
+
+# --- Figure S2 ---
+# The figure is drawn from the written curves.
+curve <- read.csv(curve_file)
+curve$measure <- factor(curve$measure,
+                        levels = c("latitudinal_extent", "longitudinal_extent", "range_area"),
+                        labels = c("Latitudinal extent (km)", "Longitudinal extent (km)",
+                                   "Range area (km²)"))
+panels <- lapply(levels(curve$measure), function(measure) {
+  ggplot(curve[curve$measure == measure, ], aes(n_records, mean)) +
+    geom_ribbon(aes(ymin = pmax(0, mean - sd), ymax = mean + sd), fill = "grey75",
+                alpha = 0.65) +
+    geom_line(linewidth = 0.45) +
+    scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+    labs(x = "Number of thinned localities", y = measure) +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid.minor = element_blank())
+})
+fig <- wrap_plots(panels, nrow = 1) + plot_annotation(tag_levels = "A") &
+  theme(plot.tag = element_text(face = "bold", size = 11))
+save_report_figure(fig, "plot_accumulation_example", 9.3, 3.4)
+```
+
+```{r clear_plot_accumulation_example, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Coverage maps and spatial effect (Figures S4 and S5)
+
+Recorded species, classification coverage and range-estimate coverage in the 500-km cells, and the partial spatial effect of the main spherical GAM at the cell centres.
+
+*Inputs:* s03/species_table.csv; s02/records_final.rds; s04/species_centres.csv; interaction_cells_500km.csv  
+*Outputs:* plot_richness_range_maps.png (Figure S4), plot_gam_spatial_effect.png (Figure S5)
+
+```{r coverage_inputs}
+# Main species table and the sample of the main models (classified species with a positive
+# range, a genus and a subfamily)
+d <- read_species_table(key_columns = c("pool_key", "gbif_key"))
+md <- d[!is.na(d$interaction_type) & is.finite(d$range_area) & d$range_area > 0 &
+          !is.na(d$genus) & !is.na(d$subfamily), ]
+```
+
+## Figure S4
+
+```{r plot_figure_s4}
+# --- Occupied 500-km cells of the species with a range ---
+map_cell_km <- 500
+x <- readRDS(file.path(dir_s02, "records_final.rds"))
+units <- d$pool_key[is.finite(d$range_area)]
+x <- unique(x[in_strict_plus == TRUE & pool_key %in% units,
+              .(pool_key, decimalLongitude, decimalLatitude)])
+invisible(gc())
+occ <- split(as.data.frame(x[, .(decimalLongitude, decimalLatitude)]), x$pool_key)
+rm(x)
+invisible(gc())
+pres <- equal_area_species_cells(occ, cell_km = map_cell_km)
+pres$area <- d$range_area[match(pres$species, d$pool_key)]
+
+# Richness and median range area of each cell (median only where there are 10 or more species)
+cells <- as.data.table(pres)[, .(richness = .N,
+                                 median_area = median(area),
+                                 cell_x = cell_x[1],
+                                 cell_y = cell_y[1],
+                                 longitude = cell_longitude[1],
+                                 latitude = cell_latitude[1]),
+                             by = cell_id]
+cells[richness < 10, median_area := NA]
+cells[, log10_median_area := log10(median_area)]
+
+# --- Cells of the maps ---
+# Recorded species per cell and the share with an interaction classification come from the cells
+# of Figure 1; both describe sampling and data coverage.
+ic <- read.csv(file.path(dir_data_intermediate,
+                         paste0("interaction_cells_", map_cell_km, "km.csv")))
+cells_all <- merge(as.data.frame(cells)[, c("cell_id", "cell_x", "cell_y", "richness",
+                                            "log10_median_area")],
+                   ic[, c("cell_id", "cell_x", "cell_y", "n_total", "coverage",
+                          "mean_partner_breadth")],
+                   by = c("cell_id", "cell_x", "cell_y"), all = TRUE)
+
+# Share of the recorded species with a range estimate
+cells_all$prop_range <- cells_all$richness / cells_all$n_total
+layers <- map_layers(equal_area_cell_polygons(cells_all, map_cell_km))
+
+# --- Panels ---
+# One sequential palette for all panels (magma, light = low, dark = high; colour-blind safe, not
+# red-green).
+s4_tag <- function(p, tag)
+  p + labs(tag = tag) + theme(plot.tag = element_text(face = "bold", size = 11))
+s4a <- s4_tag(plot_grid_map(layers, "n_total", "Recorded species", magma_colours,
+                            trans = "log10"),
+              "A")
+
+# B and C on linear scales: both shares are concentrated near 1, where a square-root scale
+# would compress the differences. C is truncated at 0.5 (lower cells take the lightest colour)
+# so that cells with incomplete range coverage stand out.
+s4b <- s4_tag(plot_grid_map(layers, "coverage",
+                            "Recorded species with an interaction classification",
+                            magma_colours,
+                            limits = c(0, 1), breaks = c(0, 0.25, 0.5, 0.75, 1)),
+              "B")
+s4c <- s4_tag(plot_grid_map(layers, "prop_range",
+                            "Recorded species with a range estimate (≥ 10 localities)",
+                            magma_colours,
+                            limits = c(0.5, 1), breaks = c(0.5, 0.6, 0.7, 0.8, 0.9, 1),
+                            labels = c("≤ 0.5", "0.6", "0.7", "0.8", "0.9", "1")),
+              "C")
+
+# --- Figure S4 ---
+# A and B side by side; C below, centred
+fig_s4 <- wrap_plots((s4a | s4b),
+                     (plot_spacer() + s4c + plot_spacer() +
+                        plot_layout(widths = c(1, 2, 1))),
+                     ncol = 1)
+save_report_figure(fig_s4, "plot_richness_range_maps", 9.2, 5.8)
+```
+
+## Figure S5
+
+The spatial term of the main-sample spherical GAM is mapped at the cell centres, in cells with at least three species with a range.
+
+```{r plot_figure_s5}
+# --- Spherical GAM of range area (main sample) ---
+ce <- fread(file.path(dir_s04, "species_centres.csv"), colClasses = c(species = "character"))
+dg <- merge(as.data.frame(md), ce, by.x = "pool_key", by.y = "species")
+gam <- fit_species_spatial_gam(dg, "range_area")
+
+# --- Partial spatial effect at the cell centres ---
+# The prediction data place a facultative species, with the subfamily and genus of the first
+# modelled species, at each cell centre; only the spatial term is used.
+nd <- data.frame(geo_latitude = cells$latitude, geo_longitude = cells$longitude,
+                 interaction_type = factor("f", levels = levels(gam$data$interaction_type)),
+                 subfamily = gam$data$subfamily[1], genus = gam$data$genus[1])
+tt <- predict(gam$model, newdata = nd, type = "terms")
+sp_term <- grep("geo_latitude", colnames(tt), value = TRUE)
+cells$spatial_effect <- ifelse(cells$richness >= 3, tt[, sp_term], NA)
+
+# --- Figure S5 ---
+# Diverging scale, symmetric around zero
+layers_g <- map_layers(equal_area_cell_polygons(as.data.frame(cells), map_cell_km))
+lim <- max(abs(cells$spatial_effect), na.rm = TRUE)
+fig_s5 <- plot_grid_map(layers_g, "spatial_effect", "Partial spatial effect (log10 range area)",
+                        palette = c("#B2182B", "#F7F7F7", "#2166AC"), midpoint = 0,
+                        limits = c(-lim, lim))
+save_report_figure(fig_s5, "plot_gam_spatial_effect", 8.4, 4.6)
+```
+
+```{r clear_map_richness_and_gam_effect, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Regional background map (Figure S6)
+
+Mean log10 modelled range of all butterflies (Daru 2025) and butterfly species counts in the 500-km cells used by the regional background.
+
+*Inputs:* s03/daru_all_species.csv, s03/daru_cells_500km.csv  
+*Outputs:* plot_regional_background.png
+
+```{r map_regional_background}
+# --- Mean log10 modelled range and species count per 500-km cell ---
+# Cells with at least five butterfly species.
+km <- 500
+dsp <- fread(file.path(dir_s03, "daru_all_species.csv"))
+dce <- fread(file.path(dir_s03, paste0("daru_cells_", km, "km.csv")))
+x <- merge(dce, dsp[range_area > 0, .(daru_name, lv = log10(range_area))], by = "daru_name")
+cells <- x[, .(mean_log10 = mean(lv), n_bfly = .N), by = cell_id][n_bfly >= 5]
+
+# --- Cell polygons ---
+# Cell ids are the x:y indices of the 500-km grid, so index * km * 1000 is the lower-left
+# corner in metres.
+xy <- do.call(rbind, lapply(strsplit(cells$cell_id, ":"), as.numeric)) * km * 1000
+crs_ee <- global_equal_area_crs()
+
+# Square polygon of one cell, from its lower-left corner (x0, y0)
+sq <- function(x0, y0) {
+  s <- km * 1000
+  st_polygon(list(rbind(c(x0, y0), c(x0 + s, y0), c(x0 + s, y0 + s),
+                        c(x0, y0 + s), c(x0, y0))))
+}
+g <- st_sf(cells,
+           geometry = st_sfc(mapply(sq, xy[, 1], xy[, 2], SIMPLIFY = FALSE), crs = crs_ee))
+
+# Display only: cells centred south of 60 S are dropped (a few modelled ranges spill onto
+# Antarctica; no lycaenid occurs there, so these cells never enter a background).
+cen_lat <- st_coordinates(st_transform(st_centroid(st_geometry(g)), 4326))[, 2]
+g <- g[cen_lat > -60, ]
+
+# --- Figure S6 ---
+# Cells are clipped to land, as in the other report maps, so land without a value stays grey.
+layers <- map_layers(g)
+p1 <- plot_grid_map(layers, "mean_log10",
+                    "Log10 geometric-mean range of all butterflies (km²)", magma_colours)
+p2 <- plot_grid_map(layers, "n_bfly", "Butterfly species per cell (Daru 2025)", magma_colours,
+                    trans = "log10")
+fig <- (p1 / p2) + plot_annotation(tag_levels = "A") &
+  theme(plot.tag = element_text(face = "bold", size = 11))
+save_report_figure(fig, "plot_regional_background", 8.4, 7.6)
+cat("cells:", nrow(g), "; median butterflies per cell:", median(g$n_bfly), "\n")
+```
+
+```{r clear_map_regional_background, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Phylogeny with traits (Figure S7)
+
+The Yumnam & Kodandaramaiah (2025) tree with the interaction types and range areas of the matched species, and the counts quoted in the caption.
+
+*Inputs:* phylogenies/yumnam_2025 tree; s04/crosswalk_yumnam_2025.csv; s03/species_table.csv  
+*Outputs:* plot_phylogeny_traits.png; si_phylogeny_overlay_counts.csv
+
+The fan layout of `ape` gives the tip and branch coordinates, which are drawn with `ggplot2`; both panels use the same tree drawing.
+
+```{r define_phylogeny_plots}
+#' Obtain plotting coordinates from ape without drawing a base-R figure
+#'
+#' `ape::plot.phylo()` supplies a stable fan layout; its coordinates are then
+#' converted to a data frame for publication styling with ggplot2.
+#' @param tree A `phylo` object.
+#' @return List containing branch segments, arcs and tip coordinates.
+phylogeny_plot_data <- function(tree) {
+  # Ladderised tree (right = FALSE: at each node the smaller clade comes first round the fan)
+  tree <- ape::ladderize(tree, right = FALSE)
+
+  # ape computes the fan layout on a temporary PDF device, closed and deleted on exit
+  temporary <- tempfile(fileext = ".pdf")
+  grDevices::pdf(temporary, width = 5, height = 5)
+  on.exit({
+    grDevices::dev.off()
+    unlink(temporary)
+  }, add = TRUE)
+  ape::plot.phylo(
+    tree, type = "fan", use.edge.length = TRUE, show.tip.label = FALSE,
+    no.margin = TRUE, plot = FALSE
+  )
+
+  # Node coordinates stored by ape, with their radius and angle
+  plot_environment <- get(".PlotPhyloEnv", envir = asNamespace("ape"))
+  coordinates <- get("last_plot.phylo", envir = plot_environment)
+  edges <- tree$edge
+  node_x <- coordinates$xx
+  node_y <- coordinates$yy
+  radius <- sqrt(node_x^2 + node_y^2)
+  angle <- atan2(node_y, node_x)
+
+  # A circular phylogram consists of a radial, branch-length-bearing segment
+  # plus an arc at the parent's depth. Drawing a single parent-child chord
+  # would distort branch length when their angles differ.
+  segments <- data.frame(
+    x = radius[edges[, 1]] * cos(angle[edges[, 2]]),
+    y = radius[edges[, 1]] * sin(angle[edges[, 2]]),
+    xend = radius[edges[, 2]] * cos(angle[edges[, 2]]),
+    yend = radius[edges[, 2]] * sin(angle[edges[, 2]])
+  )
+
+  # Arc of each edge: eight points at the parent's radius, from the parent's angle to the
+  # child's by the shorter way round
+  arcs <- do.call(rbind, lapply(seq_len(nrow(edges)), function(i) {
+    from <- angle[edges[i, 1]]
+    to <- angle[edges[i, 2]]
+    difference <- (to - from + pi) %% (2 * pi) - pi
+    theta <- seq(from, from + difference, length.out = 8L)
+    data.frame(
+      edge = i,
+      x = radius[edges[i, 1]] * cos(theta),
+      y = radius[edges[i, 1]] * sin(theta)
+    )
+  }))
+
+  # Tip coordinates
+  tips <- data.frame(
+    tip_label = tree$tip.label,
+    x = coordinates$xx[seq_len(ape::Ntip(tree))],
+    y = coordinates$yy[seq_len(ape::Ntip(tree))],
+    stringsAsFactors = FALSE
+  )
+  list(segments = segments, arcs = arcs, tips = tips)
+}
+
+#' Draw a clean circular overview of a large phylogeny
+#'
+#' @param tree A `phylo` object.
+#' @param title,subtitle Figure text.
+#' @param matches Optional crosswalk table (`matched`, `tree_tip_original`,
+#'   `interaction_type`) for tips coloured by interaction type.
+#' @param range_overlay Optional table with `tree_tip_original` and positive
+#'   `range_area` (km2) for tips coloured by log10 range area.
+#' The caller adds the colour scale of the overlay.
+#' @param branch_colour Colour used for the published branches.
+#' @param scale_unit Label for the published branch-length units. Set to `NULL`
+#'   to omit the scale bar.
+#' @return A ggplot object.
+plot_phylogeny_overview <- function(
+    tree, title, subtitle, matches = NULL, range_overlay = NULL,
+    branch_colour = "#263238",
+    scale_unit = "published branch-length units") {
+  # --- Branches ---
+  # Arcs and radial segments of the fan layout
+  plot_data <- phylogeny_plot_data(tree)
+  plot <- ggplot2::ggplot() +
+    ggplot2::geom_path(
+      data = plot_data$arcs, ggplot2::aes(x, y, group = edge),
+      linewidth = 0.13, colour = branch_colour, lineend = "round"
+    ) +
+    ggplot2::geom_segment(
+      data = plot_data$segments,
+      ggplot2::aes(x, y, xend = xend, yend = yend),
+      linewidth = 0.16, colour = branch_colour, lineend = "round"
+    ) +
+
+    # Equal aspect, titles and a theme without axes
+    ggplot2::coord_equal(clip = "off") +
+    ggplot2::labs(title = title, subtitle = subtitle) +
+    ggplot2::theme_void(base_size = 10) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold", size = 11),
+      plot.subtitle = ggplot2::element_text(size = 8.5, colour = "grey30"),
+
+      plot.margin = ggplot2::margin(6, 6, 6, 6)
+    )
+
+  # --- Scale bar ---
+  # A round length (the first non-zero break of pretty() from 0 to a quarter of the tree
+  # radius), at the bottom left
+  if (!is.null(scale_unit) && !is.null(tree$edge.length)) {
+    radius <- max(sqrt(plot_data$tips$x^2 + plot_data$tips$y^2))
+    scale_length <- pretty(c(0, radius / 4), n = 2)[2]
+    scale_y <- -1.08 * radius
+    scale_x <- -0.92 * radius
+    plot <- plot +
+      ggplot2::annotate(
+        "segment", x = scale_x, xend = scale_x + scale_length,
+        y = scale_y, yend = scale_y, linewidth = 0.45, colour = "grey20"
+      ) +
+      ggplot2::annotate(
+        "text", x = scale_x + scale_length / 2, y = scale_y,
+        label = paste(format(scale_length, trim = TRUE), scale_unit),
+        vjust = -0.7, size = 3.2, colour = "grey20"
+      )
+  }
+
+  # --- Tips coloured by interaction type ---
+  if (!is.null(matches)) {
+    # Matched tips with their type
+    overlay_matches <- matches[matches$matched, c("tree_tip_original", "interaction_type")]
+    names(overlay_matches)[1] <- "matched_tip_label"
+    overlay <- merge(
+      plot_data$tips,
+      overlay_matches,
+      by.x = "tip_label", by.y = "matched_tip_label", all = FALSE
+    )
+
+    if (nrow(overlay)) {
+      overlay$interaction_type <- factor(
+        overlay$interaction_type, levels = c("n", "f", "m", "p")
+      )
+      plot <- plot +
+        ggplot2::geom_point(
+          data = overlay, ggplot2::aes(x, y, colour = interaction_type),
+          size = 0.8, alpha = 0.85
+        ) +
+        ggplot2::theme(
+          legend.position = "bottom",
+          legend.key.width = grid::unit(3, "mm"),
+          legend.text = ggplot2::element_text(size = 7),
+          legend.title = ggplot2::element_text(size = 7.5)
+        )
+    }
+  }
+
+  # --- Tips coloured by log10 range area ---
+  if (!is.null(range_overlay)) {
+    stopifnot(all(c("tree_tip_original", "range_area") %in%
+                    names(range_overlay)))
+
+    # Tips with a positive range area, at most one row per tip
+    overlay_matches <- range_overlay[
+      is.finite(range_overlay$range_area) & range_overlay$range_area > 0,
+      c("tree_tip_original", "range_area"), drop = FALSE
+    ]
+    if (anyDuplicated(overlay_matches$tree_tip_original)) {
+      stop("The range overlay must contain at most one row per curated tip.")
+    }
+
+    # Tip coordinates joined to their range areas
+    overlay <- merge(plot_data$tips, overlay_matches,
+                     by.x = "tip_label", by.y = "tree_tip_original")
+
+    if (nrow(overlay)) {
+      overlay$log10_range_area <- log10(overlay$range_area)
+      plot <- plot +
+        ggplot2::geom_point(
+          data = overlay, ggplot2::aes(x, y, colour = log10_range_area),
+          size = 0.8, alpha = 0.85
+        ) +
+        ggplot2::theme(
+          legend.position = "bottom",
+          legend.text = ggplot2::element_text(size = 7),
+          legend.title = ggplot2::element_text(size = 7.5)
+        )
+    }
+  }
+  plot
+}
+```
+
+```{r plot_phylogeny_traits}
+# --- Tree and matched species ---
+d <- read_species_table(key_columns = c("pool_key", "gbif_key"))
+tree <- read_published_tree(
+  file.path(dir_data_raw, "phylogenies", "yumnam_2025",
+            "21Jan2025_30June23_SubfamAdded_RelTime_DivergenceTime_928sp.nwk"))
+
+# Crosswalk of the analysed species to the tree tips, with their interaction types
+cw <- read.csv(file.path(dir_s04, "crosswalk_yumnam_2025.csv"))
+cw$interaction_type <- as.character(d$interaction_type)[match(cw$analysis_species, d$species)]
+
+# Matched tips with a type, and matched tips with a range area
+cw_type <- cw[cw$matched & !is.na(cw$interaction_type), ]
+cw_range <- data.frame(tree_tip_original = cw$tree_tip_original[cw$matched],
+                       range_area = d$range_area[match(cw$analysis_species[cw$matched],
+                                                       d$species)])
+cw_range <- cw_range[is.finite(cw_range$range_area) & cw_range$range_area > 0, ]
+
+# --- Panels A and B ---
+# Branch lengths are RelTime divergence times in Myr (root depth 76.2).
+f6 <- plot_phylogeny_overview(
+  tree, "A  Interaction type",
+  sprintf("%d classified species matched to the tree", nrow(cw_type)),
+  matches = cw_type, scale_unit = "Myr")
+f7 <- plot_phylogeny_overview(
+  tree, "B  Range area",
+  sprintf("%d species with a range estimate matched to the tree", nrow(cw_range)),
+  range_overlay = cw_range, scale_unit = NULL)
+
+# Same colour rule as the maps: dark = larger range; the legend labels are in km2.
+rg <- log10(cw_range$range_area)
+ticks7 <- seq(ceiling(min(rg)), floor(max(rg)), by = 2)
+f7 <- f7 + scale_colour_viridis_c(
+  option = "A", direction = -1, begin = 0.15, end = 0.95, breaks = ticks7,
+  labels = scales::label_number(big.mark = ",",
+                                scale_cut = scales::cut_short_scale())(10^ticks7),
+  name = expression("Range area (km"^2*")"),
+  guide = guide_colourbar(barwidth = grid::unit(4, "mm"), barheight = grid::unit(30, "mm"),
+                          title.position = "top"))
+
+# The trees are stacked, each with its legend in an empty corner, so that they print larger: the
+# 7 x 14 inch source is shown about 4.4 inches wide, and text sizes are set for that reduction.
+tree_report_theme <- theme(plot.title = element_text(size = 13, face = "bold"),
+                           plot.subtitle = element_text(size = 10.5),
+                           legend.text = element_text(size = 10),
+                           legend.title = element_text(size = 10.5),
+                           legend.position = "inside",
+                           legend.position.inside = c(1, 0),
+                           legend.justification = c(1, 0))
+
+# Colours of the interaction types, as in the other report figures.
+f6 <- f6 + scale_colour_manual(values = type_colours, breaks = c("n", "f", "m", "p"),
+                               labels = c("Non-associated", "Facultative", "Mutualist",
+                                          "Parasite"),
+                               name = "Interaction type", drop = FALSE) +
+  guides(colour = guide_legend(ncol = 1, title.position = "top",
+                               override.aes = list(size = 2.5))) +
+  tree_report_theme
+f7 <- f7 + tree_report_theme
+
+# --- Labels of the parasitic genera ---
+# The text discusses the parasitic genera by name: one label per genus (which may also contain
+# non-parasitic species) at the circular mean angle of its matched parasite tips in the fan
+# layout.
+tip_xy <- phylogeny_plot_data(tree)$tips
+parasite_tips <- cw_type[cw_type$interaction_type == "p",
+                         c("tree_tip_original", "analysis_species")]
+parasite_tips$genus <- d$genus[match(parasite_tips$analysis_species, d$species)]
+parasite_tips <- merge(tip_xy, parasite_tips, by.x = "tip_label", by.y = "tree_tip_original")
+stopifnot(nrow(parasite_tips) == sum(cw_type$interaction_type == "p"),
+          !anyNA(parasite_tips$genus))
+tip_radius <- max(sqrt(tip_xy$x^2 + tip_xy$y^2))
+genus_labels <- do.call(rbind, lapply(split(parasite_tips, parasite_tips$genus), function(g) {
+  a <- atan2(g$y, g$x)
+  data.frame(genus = g$genus[1], label = g$genus[1], n = nrow(g),
+             angle = atan2(mean(sin(a)), mean(cos(a))))
+}))
+
+# Neighbouring labels are pushed apart along the circle and joined to their tips by short leader
+# lines.
+genus_labels <- genus_labels[order(genus_labels$angle), ]
+genus_labels$label_angle <- genus_labels$angle
+min_gap <- 0.075
+for (iteration in 1:200) for (i in seq_len(nrow(genus_labels))[-1]) {
+  gap <- genus_labels$label_angle[i] - genus_labels$label_angle[i - 1]
+  if (gap < min_gap) {
+    genus_labels$label_angle[i - 1] <- genus_labels$label_angle[i - 1] - (min_gap - gap) / 2
+    genus_labels$label_angle[i] <- genus_labels$label_angle[i] + (min_gap - gap) / 2
+  }
+}
+
+# Polar position (radius as a multiple of the tip radius, and angle) as x and y; the leaders run
+# from the tips to the pushed-apart label positions
+polar <- function(r, a)
+  data.frame(x = r * tip_radius * cos(a), y = r * tip_radius * sin(a))
+leaders <- cbind(polar(1.012, genus_labels$angle),
+                 setNames(polar(1.05, genus_labels$label_angle), c("xend", "yend")))
+genus_labels[c("x", "y")] <- polar(1.06, genus_labels$label_angle)
+
+# Text angle in degrees; labels on the left half are turned by 180 degrees and right-aligned
+right_side <- cos(genus_labels$label_angle) >= 0
+genus_labels$text_angle <- genus_labels$label_angle * 180 / pi + ifelse(right_side, 0, 180)
+genus_labels$hjust <- ifelse(right_side, 0, 1)
+
+# Leaders and labels on panel A. Both panels have identical fixed coordinates (equal tree size),
+# with room for the radial labels.
+tree_limits <- list(x = c(-1.36, 1.36) * tip_radius, y = c(-1.4, 1.36) * tip_radius)
+f6 <- f6 + geom_segment(data = leaders, aes(x, y, xend = xend, yend = yend),
+                        inherit.aes = FALSE, linewidth = 0.3, colour = "#8E3F72") +
+  geom_text(data = genus_labels,
+            aes(x, y, label = label, angle = text_angle, hjust = hjust),
+            inherit.aes = FALSE, size = 3.1, fontface = "italic", colour = "#8E3F72") +
+  coord_equal(xlim = tree_limits$x, ylim = tree_limits$y, expand = FALSE, clip = "off")
+f7 <- f7 + coord_equal(xlim = tree_limits$x, ylim = tree_limits$y, expand = FALSE,
+                       clip = "off")
+
+# --- Figure S7 ---
+# Each panel is wrapped whole so that patchwork lays them out independently (aligning two
+# fixed-aspect panels would stretch panel B).
+fig <- wrap_elements(full = f6) / wrap_elements(full = f7)
+
+# The figure is drawn in a new R process with the same packages: drawing Figure 3 earlier in this
+# session changes how the graphics device sizes the many small tip symbols, so the figure would
+# otherwise depend on the order of the sections.
+fig_file <- tempfile(fileext = ".rds")
+saveRDS(fig, fig_file)
+render_file <- tempfile(fileext = ".R")
+
+# The script of the new process: load the packages and save the figure
+writeLines(c("library(ggplot2); library(patchwork)",
+             sprintf("ggsave(%s, readRDS(%s), width = 7, height = 14, dpi = 400, bg = 'white', device = ragg::agg_png)",
+                     deparse(file.path(dir_data_intermediate, "plot_phylogeny_traits.png")),
+                     deparse(fig_file))),
+           render_file)
+
+# Run it with the project library, then restore the previous R_LIBS
+r_libs <- Sys.getenv("R_LIBS")
+Sys.setenv(R_LIBS = paste(.libPaths(), collapse = .Platform$path.sep))
+status <- system2(file.path(R.home("bin"), "Rscript"), c("--vanilla", shQuote(render_file)))
+Sys.setenv(R_LIBS = r_libs)
+stopifnot(status == 0)
+
+# --- Counts quoted in the caption ---
+counts <- data.table(classified_on_tree = nrow(cw_type), range_on_tree = nrow(cw_range),
+                     tips = length(tree$tip.label))
+write_table(counts, file.path(dir_data_intermediate, "si_phylogeny_overlay_counts.csv"))
+print(counts)
+```
+
+```{r clear_plot_phylogeny_traits, include=FALSE}
+rm(list = setdiff(ls(), setup_objects))
+invisible(gc())
+```
+
+# Export report figures
+
+The report figures drawn here are copied to `results/s06_summarise_results/`, from where the manuscript includes them; the originals stay in this notebook's intermediate folder.
+
+```{r export_report_figures}
+# Copy the report figures to results/s06_summarise_results/
+copy_report_figures("s06_summarise_results")
+```
+
+# Recording R environment
+
+The R version and packages used to render this notebook are printed below, with the versions of the geospatial libraries (GDAL, PROJ, GEOS) used by `sf` and `terra` when the notebook loaded them.
+
+```{r save_r_environment}
+print(sessionInfo())
+
+# Geospatial libraries bundled with (Windows) or linked by (Linux, macOS) sf and terra
+if ("sf" %in% loadedNamespaces()) print(sf::sf_extSoftVersion())
+if ("terra" %in% loadedNamespaces()) print(terra::gdal(lib = "all"))
+```
