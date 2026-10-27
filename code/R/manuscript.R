@@ -1,5 +1,5 @@
 # Tables, numbers and figures of the manuscript
-# (writing/lycaenidae_methods_results.Rmd).
+# (writing/lycaenidae_manuscript.Rmd).
 
 #' Read a required manuscript results table
 #' @param path Path to an existing CSV output.

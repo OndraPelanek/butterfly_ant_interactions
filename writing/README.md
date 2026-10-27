@@ -1,6 +1,6 @@
 # Manuscript files
 
-This directory contains the manuscript source (`lycaenidae_methods_results.Rmd`), with the main text and the Supporting Information, and its rendered Word and HTML documents.
+This directory contains the manuscript source (`lycaenidae_manuscript.Rmd`), with the main text and the Supporting Information, and its rendered Word and HTML documents.
 
 Every number in the text is computed from the notebook outputs in `data/intermediate/` (mainly `s04_fit_models/` to `s06_summarise_results/`), and `stopifnot()` checks in the setup chunks stop rendering if a worded claim no longer matches the results. Figures are read from `results/s05_check_robustness/` and `results/s06_summarise_results/` through the inventory in [`code/R/report_figures.R`](../code/R/report_figures.R); the graphical abstract is read from `data/raw/illustrations/`.
 

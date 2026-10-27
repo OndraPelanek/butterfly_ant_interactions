@@ -92,7 +92,7 @@ local({
   top <- head(cells[order(-cells$prop_parasitic), ], 3)
   stopifnot(nrow(top) == 3L, all(top$cell_latitude < -15 & top$cell_longitude > 10 & top$cell_longitude < 55))
 })
-# Appendix S5, "Sample and regional concentration": each claim of the paragraph, range area
+# Appendix S5, "Matched species, lineages and regions": each claim of the paragraph, range area
 local({
   rp_ <- function(subset, model, tree, contrast, dropped = "none") {
     x <- regional_results[regional_results$subset == subset & regional_results$dropped == dropped &
@@ -313,7 +313,7 @@ span_supported <- function(contrast) {
   r <- core_ratio(contrast)[core_p(contrast) < 0.05]
   sprintf("%.1f–%.1f", min(r), max(r))
 }
-# Abstract: breadth "supported in every core analysis that estimated it" (genus-level PGLS has no breadth)
+# Abstract: breadth "supported in every core analysis estimating it" (genus-level PGLS has no breadth)
 local({
   b <- robust[robust$measure == "area" & robust$contrast == "breadth" & robust$analysis %in% core_analyses, ]
   stopifnot(nrow(b) >= 7L, all(b$p < 0.05), !any(grepl("pgls_genus", b$analysis)))
@@ -322,6 +322,8 @@ local({
 core_k <- function(contrast) num_word(sum(core_p(contrast) < 0.05))
 # Discussion 5.2: "Parasites had smaller estimated ranges than mutualists in every core analysis"
 stopifnot(all(core_ratio("m-p") > 1))
+# Conclusions: obligate parasites "consistently had the smallest ranges" (every core point estimate below the other types)
+stopifnot(all(core_ratio("f-p") > 1), all(core_ratio("n-p") > 1))
 # Discussion 5.3: the breadth association "held in every analysis, including spatial, phylogenetic,
 # rarefied-range and modelled-range models" (positive and p < 0.05 in every range-area analysis estimating it)
 local({
@@ -393,10 +395,17 @@ breadth_med <- local({
 # including the Australasian ones (Results 4.4)
 stopifnot(reg_row("Old_World_only")$n_parasite == counts$value[counts$name == "model_area_type_p"])
 # Abstract: the most conservative facultative-parasite estimate (smallest core ratio) is the Yumnam joint
-# model, and it is the only core analysis without support for the non-associated-parasite contrast ("all except that
-# most conservative analysis")
+# model, and it is the only core analysis without support for the non-associated-parasite contrast ("the most
+# conservative, a joint spatial–phylogenetic model" and "the other nine")
 stopifnot(names(which.min(core_ratio("f-p"))) == "phylo_spatial_yumnam_2025",
           identical(unname(core_analyses[core_p("n-p") >= 0.05]), "phylo_spatial_yumnam_2025"))
+# evidence-database scale (s06_summarise_results, Supporting Information tables): Abstract and Appendix S1
+si_ledger <- read_report_table(file.path(dir_s06, "si_ledger_summary.csv"))
+ledger_n <- function(k) {
+  v <- si_ledger[[k]]
+  stopifnot(length(v) == 1L)
+  v
+}
 ```
 
 
@@ -474,10 +483,9 @@ contrasts involving mutualists were less consistent across analyses.
 *Lower panel:* ranges were larger in species with more recorded
 ant genera, represented by a single *M. sabuleti* worker (left) and workers of
 *Camponotus japonicus*, *Crematogaster scutellaris*, *M. sabuleti* and
-*Oecophylla smaragdina* (right), not by the partners of any one species. The
-patterns concern interaction types, not the illustrated species; arrows are
-conceptual; and apart from the four workers on the
-right, illustrations are not to a common scale. Illustrations were generated
+*Oecophylla smaragdina* (right). The species shown are examples, not data
+points; arrows show direction only; and only the four workers on the right
+share a common scale. Illustrations were generated
 with ChatGPT and carefully revised against photographic and taxonomic references.
 
 ```{=openxml}
@@ -501,8 +509,8 @@ Contents
 # Abstract
 
 **Aim.** Biotic interactions can limit or extend species distributions, but how
-interaction strategies spanning mutualism and parasitism relate to total range
-size remains poorly understood. We tested whether ant-interaction strategy and
+interaction strategies spanning mutualism and parasitism relate to range size
+remains poorly understood. We tested whether ant-interaction strategy and
 recorded ant-partner breadth are associated with range size across Lycaenidae.
 
 **Location.** Global.
@@ -512,38 +520,40 @@ recorded ant-partner breadth are associated with range size across Lycaenidae.
 **Major taxa studied.** Lycaenidae butterflies and associated ants
 (Formicidae).
 
-**Methods.** We compiled source-traceable interaction records, classified
-species into four interaction strategies and estimated range area and
+**Methods.** We compiled a family-wide dataset of lycaenid–ant interactions
+(`r report_number(ledger_n("claims"))` published records for
+`r report_number(ledger_n("species"))` species, each linked to its source),
+classified species into four interaction strategies and estimated range area and
 latitudinal and longitudinal extents from cleaned occurrences. Taxonomic mixed
 models related range size to interaction strategy and the number of recorded ant
-genera. Ten core analyses assessed robustness to spatial and phylogenetic
-non-independence, the concentration of parasites in a few genera, occurrence
-sampling and range estimation.
+genera. We tested robustness with `r num_word(length(core_analyses))` core
+analyses addressing spatial and phylogenetic non-independence, parasite
+concentration in a few genera, occurrence sampling and range estimation.
 
 **Results.** Across `r cnt("model_area_type_total")` species, estimated range
 area was smallest in obligate parasites, intermediate in obligate mutualists and
-largest in facultative associates and non-associated species
-(`r ratio("lmm", "f-p")` and `r ratio("lmm", "n-p")` times that of parasites),
-which did not differ clearly from each other. The facultative–parasite contrast
-was supported in `r core_support("f-p")` core analyses. Joint spatial and
-phylogenetic adjustment gave the most conservative estimate
-(`r effi_short("phylo_spatial_yumnam_2025", "f-p")`). The
-non-associated–parasite contrast was supported in `r core_k("n-p")`, all except
-that most conservative analysis. Contrasts involving mutualists depended on the
-model. Each additional recorded ant genus was associated with
-`r report_number(100 * (rb("lmm", "breadth")$ratio - 1), 0)`% greater range
-area, an association supported in every core analysis that estimated it.
-Interaction type alone explained
+largest in facultative associates (`r ratio("lmm", "f-p")` times that of
+parasites) and non-associated species (`r ratio("lmm", "n-p")` times), which did
+not differ clearly from each other. The facultative–parasite contrast was
+supported in `r core_support("f-p")` core analyses, including the most
+conservative, a joint spatial–phylogenetic model
+(`r effi_short("phylo_spatial_yumnam_2025", "f-p")`), and the
+non-associated–parasite contrast in the other `r core_k("n-p")`. Mutualist
+contrasts were model-dependent. Each additional recorded ant genus was
+associated with `r report_number(100 * (rb("lmm", "breadth")$ratio - 1), 0)`%
+greater range area (supported in every core analysis estimating it).
+Interaction type explained
 `r report_number(100 * main_metadata$marginal_r2[main_metadata$measure == "area" & main_metadata$predictors == "type"], 1)`%
-of range-area variation (marginal R²).
+of range-area variation, and type with breadth
+`r report_number(100 * main_metadata$marginal_r2[main_metadata$measure == "area" & main_metadata$predictors == "breadth"], 1)`%
+among species with recorded partners (marginal R²).
 
 **Main conclusions.** Range size varied with how, rather than whether, species
-interact with ants, with small ranges linked to obligate parasitism. Species
-with more recorded partner genera also had larger ranges, consistent with the
-niche-breadth hypothesis, although documentation effort and geographic
-opportunity offer alternative explanations. The type of biotic interaction, not
-just its presence, merits inclusion alongside environmental and resource niches
-in comparative range-size studies.
+interact with ants, with small ranges linked to obligate parasitism. The breadth
+association is consistent with the niche-breadth hypothesis, although
+documentation effort and geographic opportunity offer alternative explanations.
+Range-size studies should consider the type of biotic interaction alongside
+environmental and resource niches.
 
 **Keywords.** Biotic interactions; biotic niche; Formicidae; geographic range
 size; Lycaenidae; macroecology; mutualism; myrmecophily; niche breadth;
@@ -553,17 +563,17 @@ parasitism.
 
 Geographic range size varies by several orders of magnitude among species, and
 understanding its determinants is a central goal in ecology and biogeography
-[@brown1996; @gaston2009]. Range size reflects ecological tolerances, the
+[@brown1996; @gaston2009], not least because range size is closely linked to
+extinction risk [@chichorro2019]. Range size reflects ecological tolerances, the
 geographic availability of suitable conditions and resources, dispersal,
-evolutionary history and biotic interactions, and is closely linked to
-extinction risk [@chichorro2019; @sheth2020]. Niche breadth is among its most
-consistently supported correlates. Species with broader environmental tolerances
-or habitat and resource use generally occupy larger ranges [@brown1984;
-@slatyer2013]. Dispersal and historical opportunity further determine how much
-of the potential distribution is reached [@alzate2022]. Biotic interactions,
-however, remain much less integrated into comparative explanations of range size
-than climate, habitat and resource use [@paquette2021; @thuiller2023;
-@galiana2026].
+evolutionary history and biotic interactions [@sheth2020]. Among its most
+consistently supported correlates is niche breadth: species with broader
+environmental tolerances or habitat and resource use generally occupy larger
+ranges [@brown1984; @slatyer2013]. Dispersal and historical opportunity further
+affect how much of the potential distribution a species reaches [@alzate2022].
+Biotic interactions, however, remain much less integrated into comparative
+explanations of range size than climate, habitat and resource use
+[@paquette2021; @thuiller2023; @galiana2026].
 
 Biotic interactions—the Eltonian dimension of species' niches—can limit and
 extend distributions. Competition, predation and parasitism can prevent
@@ -603,11 +613,11 @@ because wide-ranging species may encounter more potential partners simply by
 occurring in more places [@hurtado2024]. Causality therefore remains hard to
 establish.
 
-Lycaenids are particularly suitable for testing these ideas. Their
-interaction strategies span a spectrum from no ant association through
-facultative and obligate mutualism to obligate parasitism, within a single
-family, so strategies can be compared among related species with broadly similar
-life cycles.
+Lycaenid butterflies (Lycaenidae) are particularly well suited to testing these
+ideas. Within this single family, interaction strategies span a spectrum from no
+ant association through facultative and obligate mutualism to obligate
+parasitism, so strategies can be compared among related species with broadly
+similar life cycles.
 More than 70% of almost 5,400 species worldwide appear to be ant-associated when
 known life histories are extrapolated across close relatives [@pierce2002;
 @piercedankowicz2022a]. Mutualistically associated larvae commonly provide
@@ -625,8 +635,10 @@ of range size, whereas relationships with habitat and diet breadth differed
 substantially among lineages [@hausharter2023]. In Lycaenidae, range size
 increased with climatic and habitat breadth but mostly decreased with larval
 plant-diet breadth, which the authors suggested might reflect ant associations
-as an additional niche dimension. Within the family, ant interactions are associated
-with ecological specialisation and stronger genetic structure [@schar2018]. The ant-associated niche may therefore capture range-size
+as an additional niche dimension. Within the family, ecological specialisation is
+associated with stronger genetic structure, and ant associations add a further
+dimension to that specialisation [@schar2018]. The ant-associated niche may
+therefore capture range-size
 variation that climate, habitat and larval host plants do not. To our knowledge,
 however, whether ant-interaction strategy and recorded partner breadth are
 associated with range size remains untested across the family.
@@ -646,8 +658,8 @@ regions, notably Australia and southern Africa, largely because lineages rich in
 obligate associates occur there [@pierce2002]. Because interaction
 strategies and range sizes are geographically and phylogenetically structured,
 we evaluated whether these associations were robust to spatial and phylogenetic
-non-independence, the concentration of parasites in a few genera, occurrence
-sampling and range estimation.
+non-independence, as well as to the concentration of parasites in a few genera,
+occurrence sampling and range estimation.
 
 ```{r setup-supplement, include=FALSE}
 # Supporting Information inputs (s04_fit_models, Joint phylogenetic and spatial models; s06_summarise_results, Supporting Information tables)
@@ -667,21 +679,25 @@ halved_fp_span <- sprintf("%.1f–%.1f", min(halved_fp), max(halved_fp))
 # Discussion opening: facultative associates are "the majority of ant-associated species"
 stopifnot(counts$value[counts$name == "model_area_type_f"] >
   counts$value[counts$name == "model_area_type_m"] + counts$value[counts$name == "model_area_type_p"])
-# Results 4.4: f-p "supported under every alternative range estimate" and "(all supported)" in the
+# Results 4.4: facultative associates "had clearly larger ranges than parasites under every alternative range estimate" and "(all supported)" in the
 # 80%, 90% and 95% stability subsets
 stopifnot(all(vapply(c("rarefied_k10", "modelled_ranges_daru", "stability_80", "stability_90", "stability_95"),
                      function(a) rb(a, "f-p")$p < 0.05 && rb(a, "f-p")$ratio > 1, TRUE)))
+# Discussion: within southern Africa both parasite contrasts have "larger ratios than in the full sample" in all
+# three models, and "both parasite contrasts also held with rarefied, modelled and differently cleaned ranges"
+for (m in list(c("lmm", NA, "lmm"), c("pgls", "yumnam_2025", "pgls_grafted_yumnam_2025"),
+               c("pgls", "schar_2018", "pgls_grafted_schar_2018")))
+  for (k in c("f-p", "n-p"))
+    stopifnot(reg_row("southern_Africa_only", m[1], m[2], k)$ratio > rb(m[3], k)$ratio)
+stopifnot(all(vapply(c("rarefied_k10", "modelled_ranges_daru"),
+                     function(a) rb(a, "n-p")$p < 0.05 && rb(a, "n-p")$ratio > 1, TRUE)),
+          with(cleaning_results[cleaning_results$measure == "area" & cleaning_results$predictors == "type" &
+                                  cleaning_results$contrast %in% c("f-p", "n-p"), ], all(p < 0.05 & ratio > 1)))
 si_contamination <- si("background_contamination")
 si_expert <- si("expert_validation")
 si_overlay <- si("phylogeny_overlay_counts")
-# dataset summaries (s06_summarise_results, Supporting Information tables): ledger scale, agreement with the earlier manual
+# dataset summaries (s06_summarise_results, Supporting Information tables): agreement with the earlier manual
 # compilation, classification coverage by region, sample composition of the alternative codings
-si_ledger <- si("ledger_summary")
-ledger_n <- function(k) {
-  v <- si_ledger[[k]]
-  stopifnot(length(v) == 1L)
-  v
-}
 legacy <- si("legacy_agreement")
 stopifnot(nrow(legacy) == 1L)
 coverage <- si("classification_coverage")
@@ -870,15 +886,17 @@ from regional and global syntheses [@eastwood1999; @heath2003; @fiedler2006;
 further natural-history literature. Each of the
 `r report_number(ledger_n("claims"))` claims from
 `r report_number(ledger_n("sources"))` sources was recorded in an evidence
-database with its source location and coding decision (Appendix S1). The first author compiled the data manually and then directed AI tools
-that assisted literature discovery, extraction, cross-checking and some coding
-decisions. The resulting interaction types agreed with the original manual
+database with its source location and coding decision (Appendix S1). The first
+author compiled the original data manually and then directed ChatGPT (OpenAI)
+and Claude (Anthropic), which assisted literature discovery, extraction,
+cross-checking and some classification decisions. As a consistency check, the resulting interaction
+types agreed with the original manual
 compilation for `r report_number(100 * legacy$share, 0)`% of shared species
-(Cohen's kappa `r report_number(legacy$kappa, 2)`; Appendix S1). We reconciled
-butterfly names with the GBIF Backbone Taxonomy and merged
-duplicate taxonomic entries into species units, which exceed the number of
-described species. Analysed genera follow current checklists and phylogenies
-(Appendix S1).
+(Cohen's kappa `r report_number(legacy$kappa, 2)`; Appendix S1). We matched
+butterfly names to the GBIF Backbone Taxonomy and merged entries for the same
+species into species units. Because the Backbone retains some outdated or
+duplicate names, these units outnumber described species. Analysed genera
+follow current checklists and phylogenies (Appendix S1).
 
 We classified species into four interaction types: non-ant-associated (n),
 facultatively associated (f), obligately mutualistic (m) and obligately
@@ -910,23 +928,24 @@ rules, without removing individual points by eye (Appendix S2). First, we
 applied metadata and *CoordinateCleaner* filters [@zizka2019]. Second, we
 removed documented introductions and records far from each species' native
 region, defined by country checklists [@pinkert2022] or biogeographic realms
-[@dinerstein2017]. Third, we removed small outlying groups separated from the
-remaining localities by over 200 km and a quarter of their maximum extent.
+[@dinerstein2017]. Third, because a single misidentified or mislocated record can greatly
+enlarge an MCP, we removed small outlying groups separated from the remaining localities
+by more than both 200 km and a quarter of their maximum extent. We chose these
+thresholds after an exploratory comparison with expert range polygons (Appendix S2).
 
 We measured range area and the latitudinal and longitudinal extents of each
-range, the north–south and east–west distances spanned by its records (Appendix
-S2). Range area, the primary response, was the MCP area in a species-specific
-equal-area projection. The extents complement area but are not independent
-tests. All three describe the extent of occurrence, which includes unoccupied
-ground within the range [@gaston2009]. We analysed species with at least ten unique cleaned localities,
-below which the cleaning protocol flagged range estimates as data-poor.
-Comparison with expert range polygons was possible for
-`r report_number(si_expert$n)` European-centred
-species, whose log~10~ MCP area correlated with expert range-polygon area
-[@hausharter2023] at r = `r report_number(si_expert$pearson_log10, 2)` (Appendix
-S2).
+range, the north–south and east–west distances (km) spanned by its localities
+(Appendix S2). Range area, the primary response, was the MCP area in a
+species-specific equal-area projection, and the two extents served as
+complementary measures. All three describe the extent of occurrence, which
+includes unoccupied ground within the range [@gaston2009]. We analysed species
+with at least ten unique cleaned localities, below which the cleaning protocol
+flagged range estimates as data-poor. For the `r report_number(si_expert$n)`
+European-centred species with expert range polygons [@hausharter2023], MCP and
+expert polygon areas were closely correlated on a log~10~ scale (r =
+`r report_number(si_expert$pearson_log10, 2)`; Appendix S2).
 
-## Comparative models
+## Range-size models
 
 For each range measure, we fitted a taxonomic linear mixed model of log~10~
 range size with interaction type as a fixed effect and, to account for the
@@ -953,14 +972,12 @@ influenced than arithmetic means by a few very large ranges. Pairwise type
 contrasts, all reported for the main models, used *emmeans* with
 Tukey adjustment within each model [@lenth2026]. We describe effects with
 p < 0.05 as supported or clear, without adjusting for the three range measures
-or the sensitivity analyses. Instead, inference rests on range area and on
-the consistency and precision of estimates across complementary analyses.
-Intervals treat fitted covariance parameters and, in phylogenetic models, the
-chosen tree as known, and non-normal residual tails and few parasitic genera
-make model-based uncertainty approximate (Appendices S3–S5).
+or the sensitivity analyses. Because model-based intervals are also approximate
+(Appendices S3–S5), inference rests instead on range area and on the consistency
+and precision of estimates across complementary analyses.
 Appendix S3 gives model diagnostics, R² [@barton2026] and a Box–Cox check of
 sensitivity to the log transformation (Table S3c). Analyses were conducted in R
-[@rcore2023], developed iteratively and not preregistered.
+[@rcore2023].
 
 ## Sensitivity analyses
 
@@ -1010,10 +1027,11 @@ compared cleaning treatments and used modelled native ranges from a global
 butterfly database [@daru2024], which combine occurrences with environmental
 data and include poorly recorded species (Appendices S2, S6).
 
-*Further checks.* We added wingspan, and for non-parasites larval carnivory, as
-covariates, reclassified obligate species under alternative codings and compared each species' range with
-the modelled ranges of co-occurring butterflies of all families (Appendices
-S4–S6).
+*Further checks.* We separately added three covariates: wingspan, larval
+carnivory (among non-parasites) and the regional butterfly background, the
+average modelled range size of co-occurring butterflies of all families. We also
+refitted the models with obligate species reclassified under alternative
+codings (Appendices S4–S6).
 
 # Results
 
@@ -1033,7 +1051,7 @@ and non-associated species occurred across major regions, whereas the recorded
 obligate mutualists and parasites were confined to Afro-Eurasia and Australasia.
 Parasites formed the highest proportions of classified species in southern Africa
 (Fig. 1D), which also contained many small-ranged lycaenids (Fig. 1E), so
-interaction strategy and range size share geographic structure. Mean recorded
+interaction strategy and range size shared geographic structure. Mean recorded
 partner breadth varied among regions (Fig. 1F). Apparent regional absences
 may partly reflect uneven recording and incomplete classification (Fig. S4).
 
@@ -1151,7 +1169,7 @@ and dashed where fewer than five species of that type have at least that many
 recorded genera. Breadth slopes within facultative and within obligate species
 are reported in Appendix S6.
 
-## Robustness to spatial, phylogenetic and sampling structure
+## Robustness to space, ancestry, lineages and range estimation
 
 Facultative associates had clearly larger ranges than parasites in
 `r core_support("f-p")` core analyses (Fig. 4; range-area ratios `r span("f-p")`),
@@ -1202,17 +1220,18 @@ PGLS) and in the 90% and 95% range-stability subsets (Tables S8, S9, S12, S13c).
 
 Among species centred in southern Africa
 (`r reg_row("southern_Africa_only")$n_parasite` of the
-`r cnt("model_area_type_p")` parasites), parasites had smaller ranges than
-facultative and non-associated species in the taxonomic model and in PGLS on
-both trees (facultative–parasite ratio about
-`r report_number(reg_row("southern_Africa_only")$ratio, 0)` in the taxonomic
-model, with wide intervals). Obligate mutualists there did not differ clearly
+`r cnt("model_area_type_p")` parasites), parasites had clearly smaller ranges
+than facultative and non-associated species in the taxonomic model and in PGLS
+on both trees. In the taxonomic model, facultative associates' ranges were about
+`r report_number(reg_row("southern_Africa_only")$ratio, 0)` times those of
+parasites (95% CI `r report_number(reg_row("southern_Africa_only")$lower, 1)`–`r report_number(reg_row("southern_Africa_only")$upper, 0)`).
+Obligate mutualists there did not differ clearly
 from parasites and had smaller ranges than facultative associates in all three
 models (Table S13c). Species centred in Afro-Eurasia and Australasia, including
 all analysed parasites, gave a facultative–parasite contrast similar to the
 full-sample estimate (taxonomic model; Table S13c).
 
-The facultative–parasite ratio exceeded one and was supported under every
+Facultative associates had clearly larger ranges than parasites under every
 alternative range estimate.
 Rarefied and full ranges of the same species gave similar ratios
 (`r ratio("rarefied_k10", "f-p")` with ten localities against
@@ -1345,19 +1364,18 @@ geographically concentrated merits further research, and climate, ant
 assemblages, habitat and evolutionary history may help explain it
 [@pellissier2012; @piercedankowicz2022a].
 
-Uneven classification and occurrence sampling could also contribute. Outside
-southern Africa, species without an interaction type had smaller ranges than
-classified species, whereas within southern Africa, where most species are
-classified, the two differed less (Appendix S2). Classified facultative and
-non-associated species elsewhere may therefore be biased towards large ranges,
-inflating their contrasts with parasites. Yet among species centred in southern
-Africa, parasites also had smaller ranges than facultative and non-associated
-species (Table S13c), suggesting that the contrast is not only a difference
-between regions or in classification coverage. The facultative–parasite
-difference also held with rarefied, modelled and differently cleaned ranges
-(Fig. 4; Tables S13b, S14a). These checks draw partly on the same public records
-and cannot exclude every sampling bias, but they show that the association does
-not depend on one way of estimating ranges.
+Uneven sampling could also contribute, through which species are classified and
+how well their ranges are recorded. Outside southern Africa, unclassified
+species had smaller ranges than classified ones, whereas within southern Africa,
+where most species are classified, the two differed less (Appendix S2).
+Classified facultative and non-associated species elsewhere may therefore be
+biased towards large ranges, inflating their contrasts with parasites. Yet
+within southern Africa, parasites had clearly smaller ranges than both groups in
+all three models, with larger ratios than in the full sample (Table S13c), so
+uneven classification does not explain the contrast. Both parasite contrasts
+also held with rarefied, modelled and differently cleaned ranges (Fig. 4;
+Tables S13b, S14a), so the association does not depend on one way of estimating
+ranges.
 
 Species age offers an alternative explanation. *Lepidochrysops*, with
 `r n_par_genus("Lepidochrysops")` of the `r cnt("model_area_type_p")` analysed
@@ -1375,16 +1393,12 @@ three species-level models retained the facultative–parasite contrast without
 in `r num_word(orig("schar_2018")$n_parasite_subfamilies)` subfamilies
 (Appendix S5), so the association is unlikely to rest on the few transitions
 that can make comparative associations appear strong
-[@maddison2015; @uyeda2018].
+[@maddison2015; @uyeda2018]. Because parasitism arose repeatedly, these
+independent origins offer natural replicates for testing whether, and why,
+ranges contracted afterwards, for example by combining dated
+transitions with species ages, host-ant distributions and colony compatibility.
 
-These origins offer natural replicates for testing whether ranges
-shrank after parasitism arose, and why, by combining dated transitions with
-species ages, host distributions and colony compatibility. Small present-day
-ranges need not imply faster declines. A regional study found no
-greater long-term occupancy decline in obligately ant-associated lycaenids
-[@engelhardt2025].
-
-## Mutualist contrasts are weaker
+## Mutualistic associations show weaker range-size differences
 
 Facultative associates rarely differed clearly from non-associated species,
 giving limited support for the range-expanding benefits often reported for
@@ -1394,7 +1408,7 @@ into larger ranges.
 
 Obligate mutualists had intermediate ranges, compatible with partner dependence
 constraining distributions while mutualistic benefits partly offset it
-[@fowler2022; @stephan2021]. Because mutualists and parasites both depend on
+[@stephan2021; @fowler2022]. Because mutualists and parasites both depend on
 ants, whereas only parasites exploit them, comparing the two could separate
 dependence from exploitation. Parasites had smaller estimated ranges than
 mutualists in every core analysis, clearly so in `r core_k("m-p")` (Fig. S8).
@@ -1408,7 +1422,7 @@ of the `r num_word(length(setdiff(unique(si_alternative$decision), "main")))`
 alternative codings. Shared habitat or lineage effects could produce the
 intermediate pattern, so we treat the mutualist comparisons as secondary.
 
-## Recorded partner breadth covaries with range size
+## Species with more recorded ant partners have larger ranges
 
 Niche breadth is among the most consistent correlates of range size, but it is
 usually measured through climate, habitat or diet [@slatyer2013]. Our results,
@@ -1425,7 +1439,7 @@ Because the association held in every analysis, including spatial, phylogenetic,
 rarefied-range and modelled-range models (Table S12), it is unlikely to reflect only
 regional ant diversity or research effort, shared ancestry or occurrence
 sampling. Three processes could still produce it. First, using more ant genera
-may let butterflies persist in more places, as increasing use of a widespread
+may let butterflies occupy more places, just as greater use of a widespread
 host plant allowed the lycaenid *Aricia agestis* to expand its range
 [@pateman2012]. Second, wide-ranging species encounter more potential partners
 [@hurtado2024]. Among Lycaeninae, the ant genera associated with most butterfly
@@ -1448,20 +1462,19 @@ flexibility.
 
 # Conclusions
 
-Lycaenid range size varied with the type of ant interaction. Obligate parasites,
-which arose at least `r orig("schar_2018")$changes` times, had consistently small
-ranges, whereas mutualist contrasts were weaker. Species with more recorded
-partner genera had larger ranges in every analysis. Although geographic
-structure, the concentration of parasites in a few lineages and uneven
-documentation qualify them, these results justify treating ant-interaction
-strategy as a dimension of comparative range-size research, alongside the
-climatic, habitat and resource niches that dominate such work. Testing whether other partner-dependent clades show a
-similar pattern, strongest where interactions become parasitic, would reveal
-how generally the biotic niche is reflected in range size.
+Lycaenid range size varied with how, rather than whether, species interact with
+ants. Obligate parasites, which arose at least `r orig("schar_2018")$changes`
+times, consistently had the smallest ranges, and species with more recorded
+partner genera had larger ranges. Comparative explanations of range size have
+centred on climatic, habitat and resource niches; our results suggest that the
+type of biotic interaction belongs alongside them. Testing whether other
+partner-dependent clades show a similar pattern, strongest where interactions
+become parasitic, would reveal how generally the biotic niche is reflected in
+range size.
 
 # Acknowledgements
 
-We thank Sämi Schär for providing the phylogeny from Schär et al. (2018).
+We thank Sämi Schär for providing the phylogeny from @schar2018.
 ChatGPT (OpenAI) and Claude (Anthropic) were used in 2024–2026 to assist with
 writing and revising analysis code and with refining the manuscript text; their
 use in compiling the interaction data is described in the Methods. The authors
@@ -1551,7 +1564,7 @@ and *Satyrium* following @pelham2008; and *Epamera*, *Argiolaus* and
 which they do not belong were moved to their current genus when this was
 supported by the names used in the modelled range maps [@daru2024] or in the
 published phylogenies [@schar2018; @kawahara2023; @yumnam2025], together with
-regional checklists [@wiemers2018; @pelham2008; @robbins2004; @warren2024boa].
+regional checklists [@robbins2004; @pelham2008; @wiemers2018; @warren2024boa].
 Examples are American hairstreaks still combined with the Palaearctic genus
 *Thecla*, *Lycaena ortygia* (= *Lepidochrysops ortygia*), *Lycaena arionides*
 and *Glaucopsyche alcon* (= *Phengaris*), *Thestor callimachus* (= *Tomares
@@ -1642,7 +1655,7 @@ corrections left interaction types and range estimates unchanged.
 **Use of AI tools.** The interaction data were first compiled manually by the
 first author. The rebuilt dataset was then extended with the help of ChatGPT
 (OpenAI) and Claude (Anthropic) in 2024–2026, which helped to locate, extract
-and cross-check literature records and to take some coding decisions under the
+and cross-check literature records and to make some classification decisions under the
 first author's direction. The decision register records whether each decision was
 taken by the first author or with AI assistance, and the database links each
 retained claim to its source location. Not every extraction was independently
@@ -1743,9 +1756,9 @@ threshold at which the cleaning protocol flags a range estimate as data-poor,
 were not analysed (Table S2). Fig. 2 shows the range sizes of all analysed
 species by interaction type.
 
-**Validation.** For the `r report_number(si_expert$n)`
-European-centred species with expert range polygons [@hausharter2023], log~10~
-MCP area correlated closely with expert polygon area (r =
+**Comparison with expert ranges.** For the `r report_number(si_expert$n)`
+European-centred species with expert range polygons [@hausharter2023], MCP and
+expert polygon areas were closely correlated on a log~10~ scale (r =
 `r report_number(si_expert$pearson_log10, 2)`; Fig. S1). MCP areas were on
 average `r report_number(si_expert$geometric_ratio, 2)` times the expert areas,
 as expected because convex hulls include unoccupied ground. On these species,
@@ -2145,7 +2158,7 @@ m2 <- data.frame(
 report_table(rbind(m1, m2), escape = FALSE, row.names = FALSE)
 ```
 
-## Appendix S5. Phylogenetic analyses
+## Appendix S5. Phylogenetic and lineage analyses
 
 **Trees and matching.** We used two published phylogenies as alternative
 hypotheses: the time-calibrated Lycaenidae phylogeny of @yumnam2025, used for
@@ -2269,7 +2282,7 @@ depends on the placement of grafted species, which reflects taxonomy alone.
 `r cnt("model_area_type_p")` analysed parasites (see *Sample and regional
 concentration* below).
 
-**Phylogeny and geography together.** Phylogenetic adjustment alone left the
+**Space and ancestry combined.** Phylogenetic adjustment alone left the
 residuals spatially autocorrelated (Moran's I within 500 km =
 `r pgm("pgls_normalised_residuals")` for the normalised PGLS residuals on the
 Yumnam tree; Table S6), so we combined both adjustments in a phylogenetic
@@ -2292,7 +2305,7 @@ both trees (Table S12), but its residuals remained spatially autocorrelated (Mor
 I = `r pgm("pgls_background_normalised_residuals")` on the Yumnam tree; Table
 S6), so we treat it as descriptive.
 
-**Sample and regional concentration.** Three further tests asked whether the
+**Matched species, lineages and regions.** Three further tests asked whether the
 parasite contrasts depend on grafted species, on the two largest parasitic
 genera or on southern Africa (Table S13c). First, with tree-matched species
 only, PGLS supported the facultative–parasite range area contrast on both
@@ -2460,7 +2473,7 @@ report_table(t6, escape = FALSE, row.names = FALSE)
 <w:p><w:pPr><w:sectPr><w:footerReference w:type="default" r:id="rId9"/><w:pgSz w:w="15840" w:h="12240" w:orient="landscape"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720" w:gutter="0"/><w:cols w:space="720"/></w:sectPr></w:pPr></w:p>
 ```
 
-## Appendix S6. Robustness to data decisions
+## Appendix S6. Robustness to data decisions and covariates
 
 **Range stability.** Restricting the models to species with stable range
 estimates, at the 90% threshold of @gupta2020 or at the looser 80% and stricter
@@ -2623,7 +2636,7 @@ t7 <- do.call(rbind, lapply(seq_len(nrow(keys7)), function(i) {
 report_table(t7, escape = FALSE, row.names = FALSE)
 ```
 
-## Appendix S7. Core and supplementary sensitivity results
+## Appendix S7. Core and additional sensitivity results
 
 This appendix collects the sensitivity results: the core analyses of Fig. 4 and
 `r num_word(length(setdiff(names(analysis_labels), core_analyses)))` further

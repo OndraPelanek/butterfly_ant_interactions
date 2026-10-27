@@ -13,7 +13,7 @@ if (!rmarkdown::pandoc_available() && .Platform$OS.type == "windows") {
 }
 if (!rmarkdown::pandoc_available()) stop("Pandoc is required; set RSTUDIO_PANDOC to its directory.")
 
-report <- here::here("writing", "lycaenidae_methods_results.Rmd")
+report <- here::here("writing", "lycaenidae_manuscript.Rmd")
 for (format in c("bookdown::html_document2", "bookdown::word_document2")) {
   output <- rmarkdown::render(report, output_format = format, quiet = TRUE,
                               envir = new.env(parent = globalenv()))

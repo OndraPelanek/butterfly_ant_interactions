@@ -2,7 +2,7 @@
 # stay with the next paragraph, table column widths, cell margins and font sizes fit the page
 # (layouts registered by report_table()), paragraphs after tables get space before them, and the
 # contents are updated with the text marked as British English. Used by code/render_report.R and
-# the knit hook of writing/lycaenidae_methods_results.Rmd.
+# the knit hook of writing/lycaenidae_manuscript.Rmd.
 finalise_publication_docx <- function(path, layouts = getOption("report_table_layouts", list())) {
   for (p in c("xml2", "zip"))
     if (!requireNamespace(p, quietly = TRUE)) stop("Missing Word layout dependency: ", p)

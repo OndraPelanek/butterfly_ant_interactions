@@ -13,7 +13,7 @@ Six R Markdown notebooks in `code/` are run in numerical order:
 5.  [`s05_check_robustness.Rmd`](code/s05_check_robustness.Rmd) runs the robustness and sensitivity checks reported in the Supporting Information.
 6.  [`s06_summarise_results.Rmd`](code/s06_summarise_results.Rmd) assembles the report tables and draws the report figures.
 
-Each notebook documents its analysis steps beside the code, reads the raw data and the outputs of earlier notebooks, and writes its outputs to its own folder in `data/intermediate`. The manuscript ([`writing/lycaenidae_methods_results.Rmd`](writing/lycaenidae_methods_results.Rmd)) reads these outputs and the report figures in `results/`. The [code README](code/README.md) describes the notebooks and the shared functions in `code/R`, the [data README](data/README.md) the raw and generated data, and the [writing README](writing/README.md) the manuscript files.
+Each notebook documents its analysis steps beside the code, reads the raw data and the outputs of earlier notebooks, and writes its outputs to its own folder in `data/intermediate`. The manuscript ([`writing/lycaenidae_manuscript.Rmd`](writing/lycaenidae_manuscript.Rmd)) reads these outputs and the report figures in `results/`. The [code README](code/README.md) describes the notebooks and the shared functions in `code/R`, the [data README](data/README.md) the raw and generated data, and the [writing README](writing/README.md) the manuscript files.
 
 ## Reproducing the analysis
 
@@ -92,7 +92,7 @@ Close the Word document if it is open, then run from the repository root
 Rscript code/render_report.R
 ```
 
-or knit `writing/lycaenidae_methods_results.Rmd` in RStudio. This writes the HTML and Word documents to `writing/`. Every number in the text is computed from the notebook outputs, and checks in the manuscript stop the rendering if a worded claim no longer matches the results; a stopped rendering therefore points to a sentence that needs revising. The notebooks `s05` and `s06` copy the report figures to `results/`, from where the manuscript includes them ([`code/R/report_figures.R`](code/R/report_figures.R)).
+or knit `writing/lycaenidae_manuscript.Rmd` in RStudio. This writes the HTML and Word documents to `writing/`. Every number in the text is computed from the notebook outputs, and checks in the manuscript stop the rendering if a worded claim no longer matches the results; a stopped rendering therefore points to a sentence that needs revising. The notebooks `s05` and `s06` copy the report figures to `results/`, from where the manuscript includes them ([`code/R/report_figures.R`](code/R/report_figures.R)).
 
 ## Repository contents
 
