@@ -1420,13 +1420,13 @@ of log~10~ range area and type and recorded breadth together
 `r report_number(100 * main_metadata$marginal_r2[main_metadata$measure == "area" & main_metadata$predictors == "breadth"], 1)`%
 among species with recorded partners (marginal R²; Table S3a). The association
 is consistent with the suggestion that ant associations form an additional
-niche dimension in Lycaenidae [@hausharter2023]. We could not include climatic,
-habitat and plant-diet breadth as covariates, because comparable estimates
-exist mainly for European-centred species, which include few obligate
-associates, and occurrence-derived climatic breadth would partly reflect range
-extent. Whether ant interactions act independently of these dimensions, and
-whether they explain the negative plant-diet relationship within the family,
-therefore remains to be tested.
+niche dimension in Lycaenidae [@hausharter2023]. Climatic, habitat and
+plant-diet breadths are available mainly for European-centred species, which
+include few obligate associates, and climatic breadth derived from our
+occurrences would partly reflect range extent itself. Family-wide estimates of
+these breadths, combined with our interaction data, could show whether ant
+associations complement them and explain the mostly negative relationship
+between plant-diet breadth and range size in European-centred lycaenids.
 
 ## Obligate parasites have consistently small ranges
 
