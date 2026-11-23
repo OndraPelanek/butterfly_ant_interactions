@@ -41,3 +41,10 @@ writing/*.pdf
 writing/*_files/
 results/**/*.html
 results/**/*_files/
+
+## Claude Code local state (the skills in .claude/skills are tracked)
+## .agents/skills holds local links to them for Codex (junctions with absolute paths)
+.agents/
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+.claude/settings.local.json
